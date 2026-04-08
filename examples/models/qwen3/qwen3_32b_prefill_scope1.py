@@ -9,35 +9,48 @@
 """Qwen3-32B prefill Scope 1 — input RMSNorm + Q/K/V projection.
 
 Standalone test for the RMSNorm + projection scope of the Qwen3-32B prefill layer,
-with parameters aligned to qwen3_32b_prefill_tilelet.py.
+with model dimensions from Qwen3-32B. BATCH/MAX_SEQ reduced for device
+memory debugging (full: BATCH=16, MAX_SEQ=4096).
 
-For each batch element with seq_len_b tokens (processed in TOK_TILE=4 chunks):
+For each batch element with seq_len_b tokens (processed in TOK_TILE=16 chunks):
   1. Compute RMSNorm of the input hidden states token tile.
   2. Project to Q (hidden_size), K (kv_hidden), V (kv_hidden).
 
-a2a3 separation: every pl.incore() contains either vector-only or cube-only ops.
-  - RMSNorm (sq_sum, rsqrt, gamma multiply) is vector-only.
-  - Q/K/V projections use chained matmul + matmul_acc (cube-only).
-  - Output tensors are FP32 to avoid pl.cast (vector op) inside cube incore.
+TOK_TILE=16 is the minimum value that satisfies both hardware constraints:
+  - Vector tilelet: [1, TOK_TILE] FP32 >= 32 B (1 block) -> TOK_TILE >= 8
+  - Cube fractal:   matmul M-dim must be a multiple of 16  -> TOK_TILE >= 16
+This matches decode's BATCH_TILE=16 exactly.
 
-Hardware TILELET / TILE sizing:
-  * RMSNorm accumulator [TOK_TILE, 1]        FP32 = [4,1]*4 = 16 B
-  * Normed tile chunk   [TOK_TILE, K_CHUNK]   BF16 = [4,128]*2 = 1 KB
-  * Q/K/V accumulator   [TOK_TILE, OUT_CHUNK] FP32 = [4,64]*4 = 1 KB
+API alignment: this file mirrors qwen3_32b_decode_scope1.py as closely as
+possible so that the only remaining difference is the 3D-tensor / variable-
+length token loop.  Specifically:
+  - RMSNorm uses pl.incore() (not pl.auto_incore()) with the same
+    [1, TOK_TILE] -> reshape [TOK_TILE, 1] layout for partial_sq, and the
+    same variance-based (not rsqrt-based) norm factor.
+  - Q/K/V projections use pl.matmul + pl.matmul_acc (not pl.add + pl.matmul).
+  - Zero-init uses pl.full (not pl.create_tensor + pl.mul(x, 0.0)).
+
+Hardware TILELET / TILE sizing (identical to decode_scope1 at BATCH_TILE=16):
+  * RMSNorm accumulator [1, TOK_TILE]        FP32 = [1,16]*4  = 64 B (1xTILELET)
+  * Normed tile chunk   [TOK_TILE, K_CHUNK]   BF16 = [16,128]*2 = 4 KB
+  * Q/K/V accumulator   [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (2xTILELET)
   * Weight tiles         [K_CHUNK, OUT_CHUNK]  BF16 = [128,64]*2 = 16 KB = MAX
 """
 from __future__ import annotations
 
 import pypto.language as pl
 
+
+# Reduced from full Qwen3-32B (BATCH=16, MAX_SEQ=4096) for device memory limits.
 BATCH = 16
-MAX_SEQ = 4096
-NUM_HEADS = 64
+MAX_SEQ = 96
+NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
-HIDDEN = NUM_HEADS * HEAD_DIM  # 8192
-KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM
+HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
+KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
 INTERMEDIATE = 25600
+
 
 EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
@@ -46,7 +59,7 @@ HIDDEN_INV = 1.0 / HIDDEN
 K_CHUNK = 128
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
-TOK_TILE = 4
+TOK_TILE = 16
 
 
 def build_prefill_projection_program(
@@ -93,12 +106,13 @@ def build_prefill_projection_program(
                         [TOK_TILE, hidden], dtype=pl.BF16
                     )
 
-                    # Vector-only incore: RMSNorm — two-pass column-chunked.
-                    with pl.auto_incore():
-                        sq_sum = pl.create_tensor(
-                            [TOK_TILE, 1], dtype=pl.FP32
+                    # Stage 1: RMSNorm (vector ops only in pl.incore).
+                    # Mirrors decode_scope1: accumulate in [1, TOK_TILE],
+                    # then reshape to [TOK_TILE, 1] for row_expand_mul.
+                    with pl.incore():
+                        partial_sq = pl.full(
+                            [1, TOK_TILE], dtype=pl.FP32, value=0.0
                         )
-                        sq_sum = pl.mul(sq_sum, 0.0)
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
                             x_chunk = pl.reshape(
@@ -113,13 +127,21 @@ def build_prefill_projection_program(
                                 ),
                                 [TOK_TILE, K_CHUNK],
                             )
-                            sq_sum = pl.add(
-                                sq_sum,
-                                pl.row_sum(pl.mul(x_chunk, x_chunk)),
+                            partial_sq = pl.add(
+                                partial_sq,
+                                pl.reshape(
+                                    pl.row_sum(pl.mul(x_chunk, x_chunk)),
+                                    [1, TOK_TILE],
+                                ),
                             )
 
-                        inv_rms = pl.rsqrt(
-                            pl.add(pl.mul(sq_sum, hidden_inv), EPS)
+                        # Compute variance in [1, TOK_TILE], then reshape to
+                        # [TOK_TILE, 1] for row_expand_mul broadcasting.
+                        variance = pl.reshape(
+                            pl.add(
+                                pl.mul(partial_sq, hidden_inv), EPS
+                            ),
+                            [TOK_TILE, 1],
                         )
 
                         for kb in pl.range(hidden_blocks):
@@ -140,7 +162,7 @@ def build_prefill_projection_program(
                                 input_rms_weight, [1, K_CHUNK], [0, k0]
                             )
                             normed = pl.col_expand_mul(
-                                pl.row_expand_mul(x_chunk, inv_rms), gamma
+                                pl.row_expand_mul(x_chunk, variance), gamma
                             )
                             normed_tile = pl.assemble(
                                 normed_tile,
@@ -148,8 +170,7 @@ def build_prefill_projection_program(
                                 [0, k0],
                             )
 
-                    # Cube-only incore: Q projection (chained matmul_acc).
-                    # Output is FP32 — no pl.cast inside cube incore.
+                    # Stage 2: Q projection (matmul + matmul_acc, cube only).
                     for ob in pl.range(q_out_blocks):
                         q0 = ob * Q_OUT_CHUNK
                         with pl.incore():
@@ -183,7 +204,7 @@ def build_prefill_projection_program(
                                 q_proj, q_acc, [b, p0, q0]
                             )
 
-                    # Cube-only incore: K projection (chained matmul_acc).
+                    # Stage 3: K projection (matmul + matmul_acc, cube only).
                     for ob in pl.range(kv_out_blocks):
                         kv0 = ob * KV_OUT_CHUNK
                         with pl.incore():
@@ -219,7 +240,7 @@ def build_prefill_projection_program(
                                 k_proj, k_acc, [b, p0, kv0]
                             )
 
-                    # Cube-only incore: V projection (chained matmul_acc).
+                    # Stage 4: V projection (matmul + matmul_acc, cube only).
                     for ob in pl.range(kv_out_blocks):
                         kv0 = ob * KV_OUT_CHUNK
                         with pl.incore():
@@ -350,7 +371,8 @@ def build_tensor_specs(
 def golden_prefill_projection(tensors, params):
     """PyTorch reference matching kernel precision path.
 
-    RMSNorm in FP32, then cast normed to BF16.
+    RMSNorm uses variance (not rsqrt) to match the kernel's
+    row_expand_mul(x_chunk, variance) path.
     Projections: BF16 matmul with FP32 accumulation, final FP32 output.
     """
     import torch
@@ -376,14 +398,14 @@ def golden_prefill_projection(tensors, params):
             valid_tok = min(TOK_TILE, seq_len_b - p0)
             x_tile = hidden_states[b, p0 : p0 + valid_tok, :].float()
 
-            # RMSNorm: chunked squared sum.
+            # RMSNorm: chunked squared sum, variance-based (matches kernel).
             sq_sum = torch.zeros(valid_tok, 1, dtype=torch.float32)
             for k0 in range(0, hidden_size, K_CHUNK):
                 x_chunk = x_tile[:, k0 : k0 + K_CHUNK]
                 sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
-            inv_rms = torch.rsqrt(sq_sum / hidden_size + EPS)
+            variance = sq_sum / hidden_size + EPS
             normed = (
-                x_tile * inv_rms * input_rms_weight.float()
+                x_tile * variance * input_rms_weight.float()
             ).bfloat16()
 
             # Q/K/V projection: BF16 matmul, FP32 output.
@@ -404,7 +426,7 @@ def compile_and_run(
     hidden_size: int = HIDDEN,
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
-    platform: str = "a2a3",
+    platform: str = "a5",
     device_id: int = 0,
     dump_passes: bool = True,
     enable_profiling: bool = False,
@@ -460,7 +482,7 @@ if __name__ == "__main__":
         "-p",
         "--platform",
         type=str,
-        default="a2a3",
+        default="a5",
         choices=["a2a3", "a2a3sim", "a5", "a5sim"],
     )
     parser.add_argument("-d", "--device", type=int, default=0)
