@@ -9,8 +9,7 @@
 """Qwen3-32B prefill Scope 1 — input RMSNorm + Q/K/V projection.
 
 Standalone test for the RMSNorm + projection scope of the Qwen3-32B prefill layer,
-with model dimensions from Qwen3-32B. BATCH/MAX_SEQ reduced for device
-memory debugging (full: BATCH=16, MAX_SEQ=4096).
+with full Qwen3-32B model dimensions (BATCH=16, MAX_SEQ=4096).
 
 For each batch element with seq_len_b tokens (processed in TOK_TILE=16 chunks):
   1. Compute RMSNorm of the input hidden states token tile.
@@ -45,9 +44,9 @@ from __future__ import annotations
 import pypto.language as pl
 
 
-# Reduced from full Qwen3-32B (BATCH=16, MAX_SEQ=4096) for device memory limits.
+# Full Qwen3-32B model dimensions.
 BATCH = 16
-MAX_SEQ = 96
+MAX_SEQ = 4096
 NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128

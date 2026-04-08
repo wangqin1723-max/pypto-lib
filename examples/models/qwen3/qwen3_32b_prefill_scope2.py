@@ -51,7 +51,7 @@ from __future__ import annotations
 import pypto.language as pl
 
 BATCH = 16
-MAX_SEQ = 96
+MAX_SEQ = 4096
 NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
