@@ -15,6 +15,8 @@ memory debugging (full: BATCH=16, MAX_SEQ=4096).
 For each batch element with seq_len_b tokens (processed in TOK_TILE=16 chunks):
   1. Compute RMSNorm of the input hidden states token tile.
   2. Project to Q (hidden_size), K (kv_hidden), V (kv_hidden).
+     Projection results are cast from FP32 accumulation to BF16 output,
+     aligned to the prefill_tilelet convention and reducing GM bandwidth.
 
 TOK_TILE=16 is the minimum value that satisfies both hardware constraints:
   - Vector tilelet: [1, TOK_TILE] FP32 >= 32 B (1 block) -> TOK_TILE >= 8
@@ -27,13 +29,15 @@ length token loop.  Specifically:
   - RMSNorm uses pl.incore() (not pl.auto_incore()) with the same
     [1, TOK_TILE] -> reshape [TOK_TILE, 1] layout for partial_sq, and the
     same variance-based (not rsqrt-based) norm factor.
-  - Q/K/V projections use pl.matmul + pl.matmul_acc (not pl.add + pl.matmul).
+  - Q/K/V projections use pl.matmul + pl.matmul_acc (not pl.add + pl.matmul),
+    with FP32 accumulation cast to BF16 output (matching tilelet convention).
   - Zero-init uses pl.full (not pl.create_tensor + pl.mul(x, 0.0)).
 
 Hardware TILELET / TILE sizing (identical to decode_scope1 at BATCH_TILE=16):
   * RMSNorm accumulator [1, TOK_TILE]        FP32 = [1,16]*4  = 64 B (1xTILELET)
   * Normed tile chunk   [TOK_TILE, K_CHUNK]   BF16 = [16,128]*2 = 4 KB
   * Q/K/V accumulator   [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (2xTILELET)
+  * Q/K/V output        [TOK_TILE, OUT_CHUNK] BF16 = [16,64]*2 = 2 KB (cast from acc)
   * Weight tiles         [K_CHUNK, OUT_CHUNK]  BF16 = [128,64]*2 = 16 KB = MAX
 """
 from __future__ import annotations
@@ -87,13 +91,13 @@ def build_prefill_projection_program(
             wq: pl.Tensor[[hidden, hidden], pl.BF16],
             wk: pl.Tensor[[hidden, kv_hidden], pl.BF16],
             wv: pl.Tensor[[hidden, kv_hidden], pl.BF16],
-            q_proj: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.FP32]],
-            k_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32]],
-            v_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32]],
+            q_proj: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.BF16]],
+            k_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16]],
+            v_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16]],
         ) -> tuple[
-            pl.Tensor[[batch, max_seq, hidden], pl.FP32],
-            pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
-            pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
+            pl.Tensor[[batch, max_seq, hidden], pl.BF16],
+            pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
+            pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
         ]:
             for b in pl.range(0, batch):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
@@ -201,7 +205,9 @@ def build_prefill_projection_program(
                                     q_acc, tile_a_i, tile_w_i
                                 )
                             q_proj = pl.assemble(
-                                q_proj, q_acc, [b, p0, q0]
+                                q_proj,
+                                pl.cast(q_acc, target_type=pl.BF16),
+                                [b, p0, q0],
                             )
 
                     # Stage 3: K projection (matmul + matmul_acc, cube only).
@@ -237,7 +243,9 @@ def build_prefill_projection_program(
                                     k_acc, tile_a_i, tile_wk_i
                                 )
                             k_proj = pl.assemble(
-                                k_proj, k_acc, [b, p0, kv0]
+                                k_proj,
+                                pl.cast(k_acc, target_type=pl.BF16),
+                                [b, p0, kv0],
                             )
 
                     # Stage 4: V projection (matmul + matmul_acc, cube only).
@@ -273,7 +281,9 @@ def build_prefill_projection_program(
                                     v_acc, tile_a_i, tile_wv_i
                                 )
                             v_proj = pl.assemble(
-                                v_proj, v_acc, [b, p0, kv0]
+                                v_proj,
+                                pl.cast(v_acc, target_type=pl.BF16),
+                                [b, p0, kv0],
                             )
 
             return q_proj, k_proj, v_proj
@@ -350,19 +360,19 @@ def build_tensor_specs(
         TensorSpec(
             "q_proj",
             [batch, max_seq, hidden_size],
-            torch.float32,
+            torch.bfloat16,
             is_output=True,
         ),
         TensorSpec(
             "k_proj",
             [batch, max_seq, kv_hidden],
-            torch.float32,
+            torch.bfloat16,
             is_output=True,
         ),
         TensorSpec(
             "v_proj",
             [batch, max_seq, kv_hidden],
-            torch.float32,
+            torch.bfloat16,
             is_output=True,
         ),
     ]
@@ -373,7 +383,8 @@ def golden_prefill_projection(tensors, params):
 
     RMSNorm uses variance (not rsqrt) to match the kernel's
     row_expand_mul(x_chunk, variance) path.
-    Projections: BF16 matmul with FP32 accumulation, final FP32 output.
+    Projections: BF16 matmul with FP32 accumulation, cast to BF16 output
+    (aligned to prefill_tilelet).
     """
     import torch
 
@@ -408,16 +419,16 @@ def golden_prefill_projection(tensors, params):
                 x_tile * variance * input_rms_weight.float()
             ).bfloat16()
 
-            # Q/K/V projection: BF16 matmul, FP32 output.
+            # Q/K/V projection: BF16 matmul, FP32 acc, cast to BF16 output.
             q_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wq.float()
-            ).float()
+            ).bfloat16()
             k_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wk.float()
-            ).float()
+            ).bfloat16()
             v_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wv.float()
-            ).float()
+            ).bfloat16()
 
 
 def compile_and_run(

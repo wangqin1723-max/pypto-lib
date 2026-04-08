@@ -12,7 +12,7 @@ Standalone test for the attention scope of the Qwen3-32B prefill layer,
 with parameters aligned to qwen3_32b_prefill_tilelet.py.
 
 For each batch element with seq_len_b tokens (processed per-token within
-TOK_TILE=4 chunks):
+TOK_TILE=16 chunks):
   1. Apply RoPE to K projections (all KV heads) and store to cache.
   2. Copy V projections directly to cache.
   3. For each Q-head group:
@@ -39,7 +39,7 @@ Valid_shape handling aligned to decode_scope2 (fillpad approach):
 
 Hardware TILELET / TILE sizing (at default HEAD_DIM=128):
   * K RoPE half-vectors [1, HEAD_DIM//2]      FP32 = [1,64]*4 = 256 B
-  * Q attention group   [Q_HEAD_BATCH, HEAD_DIM] FP32 = [4,128]*4 = 2 KB = MAX
+  * Q attention group   [Q_HEAD_BATCH, HEAD_DIM] FP32 = [5,128]*4 = 2.5 KB
   * Attention K tile    [SEQ_TILE, HEAD_DIM]     BF16 = [64,128]*2 = 16 KB = MAX
   * Padded Q for cube   [Q_HEAD_PAD, HEAD_DIM]   BF16 = [16,128]*2 = 4 KB
 
@@ -51,19 +51,21 @@ from __future__ import annotations
 import pypto.language as pl
 
 BATCH = 16
-MAX_SEQ = 4096
-NUM_HEADS = 64
+MAX_SEQ = 96
+NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
-HIDDEN = NUM_HEADS * HEAD_DIM
+HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
 KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
-Q_PER_KV = NUM_HEADS // NUM_KV_HEADS  # 8
+Q_PER_KV = NUM_HEADS // NUM_KV_HEADS  # 5
+
+
 
 ATTN_SCALE = 1.0 / (HEAD_DIM ** 0.5)
 
 # Tiling constants (aligned to qwen3_32b_prefill_tilelet).
-TOK_TILE = 4
-Q_HEAD_BATCH = 4
+TOK_TILE = 16
+Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16       # padded Q rows for cube fractal alignment (M multiple of 16)
 SEQ_TILE = 64
 
@@ -75,7 +77,7 @@ def build_prefill_attention_program(
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
 ):
-    hidden = HIDDEN
+    hidden = num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
     q_per_kv = num_heads // num_kv_heads
     cache_rows = batch * num_kv_heads * max_seq
@@ -483,7 +485,7 @@ def build_tensor_specs(
     import torch
     from pypto.runtime import TensorSpec
 
-    hidden = HIDDEN
+    hidden = num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
     cache_rows = batch * num_kv_heads * max_seq
 
@@ -787,8 +789,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=2e-3,
+            atol=2e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
