@@ -51,7 +51,7 @@ from __future__ import annotations
 import pypto.language as pl
 
 BATCH = 16
-MAX_SEQ = 4096
+MAX_SEQ = 512
 NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
@@ -68,6 +68,10 @@ TOK_TILE = 16
 Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16       # padded Q rows for cube fractal alignment (M multiple of 16)
 SEQ_TILE = 64
+# A2/A3 FP32 vector tiles require 32-byte alignment for row/col vectors.
+# Keep an internal padded softmax state and gather only logical rows via GM.
+# Use 16 rows so both vector and cube tiles satisfy A2/A3 layout rules.
+SOFTMAX_ROWS = Q_HEAD_PAD
 
 
 def build_prefill_attention_program(
@@ -223,10 +227,6 @@ def build_prefill_attention_program(
                             qg = gi - kvh * q_groups
                             q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
 
-                            q_padded = pl.create_tensor(
-                                [Q_HEAD_PAD, head_dim], dtype=pl.BF16
-                            )
-
                             # Vector-only: Q gather from GM into q_group.
                             q_group = pl.create_tensor(
                                 [Q_HEAD_BATCH, head_dim], dtype=pl.FP32
@@ -290,6 +290,14 @@ def build_prefill_attention_program(
                             # Vector-only: assemble Q from GM into
                             # q_padded + init accumulators.
                             with pl.incore():
+                                q_padded = pl.cast(
+                                    pl.full(
+                                        [Q_HEAD_PAD, head_dim],
+                                        dtype=pl.FP32,
+                                        value=0.0,
+                                    ),
+                                    target_type=pl.BF16,
+                                )
                                 for qi in pl.range(Q_HEAD_BATCH):
                                     q_padded = pl.assemble(
                                         q_padded,
@@ -302,25 +310,25 @@ def build_prefill_attention_program(
                                     )
 
                                 oi = pl.full(
-                                    [Q_HEAD_BATCH, head_dim],
+                                    [SOFTMAX_ROWS, head_dim],
                                     dtype=pl.FP32,
                                     value=0.0,
                                 )
                                 li_flat = pl.full(
-                                    [1, Q_HEAD_BATCH],
+                                    [1, SOFTMAX_ROWS],
                                     dtype=pl.FP32,
                                     value=0.0,
                                 )
                                 li = pl.reshape(
-                                    li_flat, [Q_HEAD_BATCH, 1]
+                                    li_flat, [SOFTMAX_ROWS, 1]
                                 )
                                 mi_flat = pl.full(
-                                    [1, Q_HEAD_BATCH],
+                                    [1, SOFTMAX_ROWS],
                                     dtype=pl.FP32,
                                     value=0.0,
                                 )
                                 mi = pl.reshape(
-                                    mi_flat, [Q_HEAD_BATCH, 1]
+                                    mi_flat, [SOFTMAX_ROWS, 1]
                                 )
 
                             for sb in pl.range(ctx_blocks):
@@ -353,14 +361,10 @@ def build_prefill_attention_program(
                                     )
 
                                 # Vector-only: softmax with fillpad + BF16 round-trip.
-                                exp_padded = pl.create_tensor(
-                                    [Q_HEAD_PAD, SEQ_TILE],
-                                    dtype=pl.BF16,
-                                )
                                 with pl.incore():
-                                    scores_valid = pl.slice(
+                                    scores_work = pl.slice(
                                         raw_scores_pad,
-                                        [Q_HEAD_BATCH, SEQ_TILE],
+                                        [SOFTMAX_ROWS, SEQ_TILE],
                                         [0, 0],
                                         valid_shape=[
                                             Q_HEAD_BATCH,
@@ -368,7 +372,7 @@ def build_prefill_attention_program(
                                         ],
                                     )
                                     scores_padded = pl.fillpad(
-                                        scores_valid,
+                                        scores_work,
                                         pad_value=pl.PadValue.min,
                                     )
                                     scores = pl.mul(
@@ -391,15 +395,10 @@ def build_prefill_attention_program(
                                     cur_li = pl.row_sum(
                                         exp_scores_fp32
                                     )
-                                    exp_padded = pl.assemble(
-                                        exp_padded,
-                                        exp_scores_bf16,
-                                        [0, 0],
-                                    )
 
                                 # Cube-only: SV matmul.
-                                oi_tmp_pad = pl.create_tensor(
-                                    [Q_HEAD_PAD, head_dim],
+                                oi_tmp = pl.create_tensor(
+                                    [SOFTMAX_ROWS, head_dim],
                                     dtype=pl.FP32,
                                 )
                                 with pl.incore():
@@ -408,19 +407,14 @@ def build_prefill_attention_program(
                                         [SEQ_TILE, head_dim],
                                         [cache_row0, 0],
                                     )
-                                    oi_tmp_pad = pl.matmul(
-                                        exp_padded,
+                                    oi_tmp = pl.matmul(
+                                        exp_scores_bf16,
                                         v_tile,
                                         out_dtype=pl.FP32,
                                     )
 
                                 # Vector-only: online rescale.
                                 with pl.incore():
-                                    oi_tmp = pl.slice(
-                                        oi_tmp_pad,
-                                        [Q_HEAD_BATCH, head_dim],
-                                        [0, 0],
-                                    )
                                     if sb == 0:
                                         oi = oi_tmp
                                         li = cur_li
@@ -449,21 +443,30 @@ def build_prefill_attention_program(
                                         )
                                         mi = mi_new
 
-                            # Vector-only: ctx = oi/li, scatter into attn_row.
+                            # Vector-only: ctx = oi/li.
+                            ctx_full_gm = pl.create_tensor(
+                                [SOFTMAX_ROWS, head_dim], dtype=pl.FP32
+                            )
                             with pl.incore():
-                                ctx = pl.row_expand_div(oi, li)
-                                ctx_flat = pl.reshape(
-                                    ctx,
-                                    [1, Q_HEAD_BATCH * head_dim],
-                                )
-                                attn_row = pl.assemble(
-                                    attn_row,
-                                    pl.cast(
-                                        ctx_flat,
-                                        target_type=pl.BF16,
-                                    ),
-                                    [0, q_base * head_dim],
-                                )
+                                ctx_full_gm = pl.row_expand_div(oi, li)
+
+                            # Vector-only: gather logical Q_HEAD_BATCH rows from
+                            # GM to avoid A2/A3 vec-side textract on UB tiles.
+                            with pl.incore():
+                                for qi in pl.range(Q_HEAD_BATCH):
+                                    q_col = (q_base + qi) * head_dim
+                                    attn_row = pl.assemble(
+                                        attn_row,
+                                        pl.cast(
+                                            pl.slice(
+                                                ctx_full_gm,
+                                                [1, head_dim],
+                                                [qi, 0],
+                                            ),
+                                            target_type=pl.BF16,
+                                        ),
+                                        [0, q_col],
+                                    )
 
                         # Write attn_row into attn_out GM tensor.
                         attn_out = pl.assemble(
@@ -590,8 +593,6 @@ def golden_prefill_attention(tensors, params):
     seq_lens = tensors["seq_lens"]
     rope_cos = tensors["rope_cos"]
     rope_sin = tensors["rope_sin"]
-    k_cache = tensors["k_cache"].clone()
-    v_cache = tensors["v_cache"].clone()
 
     batch = q_proj.shape[0]
     hidden = q_proj.shape[2]
@@ -602,146 +603,173 @@ def golden_prefill_attention(tensors, params):
     num_heads = hidden // head_dim
     q_per_kv = num_heads // num_kv_heads
     q_groups = q_per_kv // Q_HEAD_BATCH
+    covered_q_per_kv = q_groups * Q_HEAD_BATCH
+    total_q_groups = num_kv_heads * q_groups
     half = head_dim // 2
     scale = 1.0 / math.sqrt(head_dim)
+    neg_inf = torch.finfo(torch.float32).min
+    device = q_proj.device
 
-    attn_out = torch.zeros(batch, max_seq, hidden, dtype=torch.float32)
+    attn_out = torch.zeros(
+        batch, max_seq, hidden, dtype=torch.float32, device=device
+    )
+    group_kvh = (
+        torch.arange(total_q_groups, device=device) // q_groups
+        if q_groups > 0
+        else None
+    )
 
     for b in range(batch):
         seq_len_b = seq_lens[b].item()
-        for p0 in range(0, seq_len_b, TOK_TILE):
-            valid_tok = min(TOK_TILE, seq_len_b - p0)
-            for ti in range(valid_tok):
-                pos = p0 + ti
-                ctx_len = pos + 1
-                ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+        if seq_len_b <= 0 or covered_q_per_kv == 0:
+            continue
 
-                cos_row = rope_cos[pos : pos + 1, :]
-                sin_row = rope_sin[pos : pos + 1, :]
-                cos_lo, cos_hi = cos_row[:, :half], cos_row[:, half:]
-                sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
+        # Precompute RoPE for the full prefill prefix of this batch element.
+        cos_row = rope_cos[:seq_len_b, :]
+        sin_row = rope_sin[:seq_len_b, :]
+        cos_lo = cos_row[:, :half].unsqueeze(1)
+        cos_hi = cos_row[:, half:].unsqueeze(1)
+        sin_lo = sin_row[:, :half].unsqueeze(1)
+        sin_hi = sin_row[:, half:].unsqueeze(1)
 
-                # K RoPE: per KV head — cast BF16→FP32 for arithmetic.
-                k_row = k_proj[b, pos, :].float().view(num_kv_heads, head_dim)
-                k_lo, k_hi = k_row[:, :half], k_row[:, half:]
-                k_rot = torch.cat(
-                    [
-                        k_lo * cos_lo - k_hi * sin_lo,
-                        k_hi * cos_hi + k_lo * sin_hi,
-                    ],
-                    dim=-1,
+        # K RoPE (all tokens, all KV heads): BF16 cache layout [KV_H, S, D].
+        k_row = k_proj[b, :seq_len_b, :].float().view(
+            seq_len_b, num_kv_heads, head_dim
+        )
+        k_lo, k_hi = k_row[:, :, :half], k_row[:, :, half:]
+        k_rot = torch.cat(
+            [
+                k_lo * cos_lo - k_hi * sin_lo,
+                k_hi * cos_hi + k_lo * sin_hi,
+            ],
+            dim=-1,
+        ).to(torch.bfloat16)
+        k_hist = k_rot.permute(1, 0, 2).contiguous()
+
+        # V cache view [KV_H, S, D] (already BF16).
+        v_hist = (
+            v_proj[b, :seq_len_b, :]
+            .view(seq_len_b, num_kv_heads, head_dim)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+
+        # Q RoPE (all tokens, all Q heads): keep both FP32 and BF16 views.
+        q_row = q_proj[b, :seq_len_b, :].float().view(
+            seq_len_b, num_heads, head_dim
+        )
+        q_lo, q_hi = q_row[:, :, :half], q_row[:, :, half:]
+        q_rot_bf16 = torch.cat(
+            [
+                q_lo * cos_lo - q_hi * sin_lo,
+                q_hi * cos_hi + q_lo * sin_hi,
+            ],
+            dim=-1,
+        ).to(torch.bfloat16)
+
+        for pos in range(seq_len_b):
+            ctx_len = pos + 1
+            ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+
+            # [KV_H, q_groups, Q_HEAD_BATCH, D] -> [total_q_groups, Q_HEAD_BATCH, D]
+            q_heads = q_rot_bf16[pos].view(num_kv_heads, q_per_kv, head_dim)[
+                :, :covered_q_per_kv, :
+            ]
+            q_grp_bf16 = q_heads.view(
+                num_kv_heads, q_groups, Q_HEAD_BATCH, head_dim
+            ).reshape(total_q_groups, Q_HEAD_BATCH, head_dim)
+            q_grp_fp32 = q_grp_bf16.float()
+
+            oi = torch.zeros(
+                total_q_groups,
+                Q_HEAD_BATCH,
+                head_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            li = torch.zeros(
+                total_q_groups,
+                Q_HEAD_BATCH,
+                1,
+                dtype=torch.float32,
+                device=device,
+            )
+            mi = torch.zeros(
+                total_q_groups,
+                Q_HEAD_BATCH,
+                1,
+                dtype=torch.float32,
+                device=device,
+            )
+
+            for sb in range(ctx_blocks):
+                s0 = sb * SEQ_TILE
+                valid_len = min(SEQ_TILE, ctx_len - s0)
+
+                # Select K/V tiles for each attention group by KV-head mapping.
+                k_tile = k_hist[:, s0 : s0 + valid_len, :]
+                v_tile = v_hist[:, s0 : s0 + valid_len, :]
+                k_tile_g = k_tile.index_select(0, group_kvh)
+                v_tile_g = v_tile.index_select(0, group_kvh)
+
+                # QK matmul: BF16 * BF16 -> FP32 (simulated by float matmul).
+                raw_scores = torch.matmul(
+                    q_grp_fp32, k_tile_g.float().transpose(-1, -2)
                 )
 
-                # Update caches.
-                for ki in range(num_kv_heads):
-                    cr = (
-                        b * num_kv_heads * max_seq
-                        + ki * max_seq
-                        + pos
+                # fillpad semantics on scores before softmax.
+                if valid_len < SEQ_TILE:
+                    scores = torch.full(
+                        (total_q_groups, Q_HEAD_BATCH, SEQ_TILE),
+                        neg_inf,
+                        dtype=torch.float32,
+                        device=device,
                     )
-                    k_cache[cr, :] = k_rot[ki].to(torch.bfloat16)
-                    v_cache[cr, :] = v_proj[
-                        b, pos, ki * head_dim : (ki + 1) * head_dim
-                    ]
+                    scores[..., :valid_len] = raw_scores
+                else:
+                    scores = raw_scores
+                scores = scores * scale
 
-                # Q RoPE: per Q head — cast BF16→FP32 for arithmetic.
-                q_row = q_proj[b, pos, :].float().view(num_heads, head_dim)
-                q_lo, q_hi = q_row[:, :half], q_row[:, half:]
-                q_rot = torch.cat(
-                    [
-                        q_lo * cos_lo - q_hi * sin_lo,
-                        q_hi * cos_hi + q_lo * sin_hi,
-                    ],
-                    dim=-1,
+                cur_mi = scores.max(dim=-1, keepdim=True).values
+                exp_scores = torch.exp(scores - cur_mi)
+                exp_scores_bf16 = exp_scores.to(torch.bfloat16)
+                cur_li = exp_scores_bf16.float().sum(
+                    dim=-1, keepdim=True
                 )
 
-                # Grouped-query attention (tiled online softmax).
-                for kvh in range(num_kv_heads):
-                    for qg in range(q_groups):
-                        q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
-                        q_grp = q_rot[
-                            q_base : q_base + Q_HEAD_BATCH, :
-                        ]
-                        # Match kernel: Q cast to BF16 for QK matmul.
-                        q_grp_bf16 = q_grp.to(torch.bfloat16)
+                # SV matmul only needs valid columns.
+                exp_valid = (
+                    exp_scores_bf16[..., :valid_len]
+                    if valid_len < SEQ_TILE
+                    else exp_scores_bf16
+                )
+                oi_tmp = torch.matmul(exp_valid.float(), v_tile_g.float())
 
-                        oi = torch.zeros(
-                            Q_HEAD_BATCH,
-                            head_dim,
-                            dtype=torch.float32,
-                        )
-                        li = torch.zeros(
-                            Q_HEAD_BATCH, 1, dtype=torch.float32
-                        )
-                        mi = torch.zeros(
-                            Q_HEAD_BATCH, 1, dtype=torch.float32
-                        )
+                if sb == 0:
+                    oi = oi_tmp
+                    li = cur_li
+                    mi = cur_mi
+                else:
+                    mi_new = torch.maximum(mi, cur_mi)
+                    alpha = torch.exp(mi - mi_new)
+                    beta = torch.exp(cur_mi - mi_new)
+                    li = alpha * li + beta * cur_li
+                    oi = oi * alpha + oi_tmp * beta
+                    mi = mi_new
 
-                        for sb in range(ctx_blocks):
-                            s0 = sb * SEQ_TILE
-                            valid_len = min(SEQ_TILE, ctx_len - s0)
-                            cb = (
-                                b * num_kv_heads * max_seq
-                                + kvh * max_seq
-                                + s0
-                            )
+            # [total_q_groups, Q_HEAD_BATCH, D] -> [num_heads, D]
+            ctx = oi / li
+            ctx_by_kv = ctx.view(
+                num_kv_heads, q_groups, Q_HEAD_BATCH, head_dim
+            ).reshape(num_kv_heads, covered_q_per_kv, head_dim)
+            attn_heads = torch.zeros(
+                num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            for kvh in range(num_kv_heads):
+                h0 = kvh * q_per_kv
+                attn_heads[h0 : h0 + covered_q_per_kv, :] = ctx_by_kv[kvh]
 
-                            # Full SEQ_TILE K/V tiles as BF16.
-                            k_tile = k_cache[cb : cb + SEQ_TILE, :]
-                            v_tile = v_cache[cb : cb + SEQ_TILE, :]
-
-                            # QK matmul: BF16 * BF16 → FP32.
-                            raw_scores = (
-                                q_grp_bf16.float() @ k_tile.float().T
-                            )
-
-                            # Fillpad invalid positions.
-                            if valid_len < SEQ_TILE:
-                                raw_scores[:, valid_len:] = (
-                                    torch.finfo(torch.float32).min
-                                )
-                            scores = raw_scores * scale
-
-                            # Online softmax with BF16 round-trip.
-                            cur_mi = scores.max(
-                                dim=-1, keepdim=True
-                            ).values
-                            exp_scores = torch.exp(scores - cur_mi)
-                            exp_scores_bf16 = exp_scores.to(
-                                torch.bfloat16
-                            )
-                            cur_li = (
-                                exp_scores_bf16.float().sum(
-                                    dim=-1, keepdim=True
-                                )
-                            )
-
-                            # SV matmul: BF16 * BF16 → FP32.
-                            oi_tmp = (
-                                exp_scores_bf16.float()
-                                @ v_tile.float()
-                            )
-
-                            if sb == 0:
-                                oi = oi_tmp
-                                li = cur_li
-                                mi = cur_mi
-                            else:
-                                mi_new = torch.maximum(mi, cur_mi)
-                                alpha = torch.exp(mi - mi_new)
-                                beta = torch.exp(cur_mi - mi_new)
-                                li = alpha * li + beta * cur_li
-                                oi = oi * alpha + oi_tmp * beta
-                                mi = mi_new
-
-                        ctx = oi / li
-                        for qi in range(Q_HEAD_BATCH):
-                            qh = q_base + qi
-                            attn_out[
-                                b,
-                                pos,
-                                qh * head_dim : (qh + 1) * head_dim,
-                            ] = ctx[qi]
+            attn_out[b, pos, :] = attn_heads.reshape(hidden)
 
     tensors["attn_out"][:] = attn_out.to(torch.bfloat16)
 
