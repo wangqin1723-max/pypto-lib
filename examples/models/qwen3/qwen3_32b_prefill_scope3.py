@@ -25,9 +25,9 @@ from __future__ import annotations
 import pypto.language as pl
 
 BATCH = 16
-MAX_SEQ = 256
+MAX_SEQ = 128
 HIDDEN = 1024      
-INTERMEDIATE = 2048 
+INTERMEDIATE = 12800
 
 EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN

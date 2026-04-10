@@ -613,7 +613,7 @@ def compile_and_run(
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
-            enable_profiling=enable_profiling,
+            runtime_profiling=enable_profiling,
         ),
     )
     return result

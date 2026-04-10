@@ -9,7 +9,7 @@
 """Qwen3-32B prefill Scope 1 — input RMSNorm + Q/K/V projection.
 
 Standalone test for the RMSNorm + projection scope of the Qwen3-32B prefill layer,
-with full Qwen3-32B model dimensions (BATCH=16, MAX_SEQ=4096).
+with current example defaults (BATCH=16, MAX_SEQ=128).
 
 For each batch element with seq_len_b tokens (processed in TOK_TILE=16 chunks):
   1. Compute RMSNorm of the input hidden states token tile.
@@ -23,7 +23,8 @@ Hardware TILELET / TILE sizing (identical to decode_scope1 at BATCH_TILE=16):
   * RMSNorm accumulator [1, TOK_TILE]        FP32 = [1,16]*4  = 64 B (1xTILELET)
   * Normed tile chunk   [TOK_TILE, K_CHUNK]   BF16 = [16,128]*2 = 4 KB
   * Q/K/V accumulator   [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (2xTILELET)
-  * Q/K/V output        [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (FP32, no cast)
+  * Q/K/V FP32 buffer   [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (per-chunk intermediate)
+  * Q/K/V output        [TOK_TILE, OUT_CHUNK] BF16 = [16,64]*2 = 2 KB
   * Weight tiles         [K_CHUNK, OUT_CHUNK]  BF16 = [128,64]*2 = 16 KB = MAX
 """
 from __future__ import annotations
@@ -76,13 +77,13 @@ def build_prefill_projection_program(
             wq: pl.Tensor[[hidden, hidden], pl.BF16],
             wk: pl.Tensor[[hidden, kv_hidden], pl.BF16],
             wv: pl.Tensor[[hidden, kv_hidden], pl.BF16],
-            q_proj: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.FP32]],
-            k_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32]],
-            v_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32]],
+            q_proj: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.BF16]],
+            k_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16]],
+            v_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16]],
         ) -> tuple[
-            pl.Tensor[[batch, max_seq, hidden], pl.FP32],
-            pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
-            pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
+            pl.Tensor[[batch, max_seq, hidden], pl.BF16],
+            pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
+            pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
         ]:
             for b in pl.range(0, batch):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
@@ -131,9 +132,11 @@ def build_prefill_projection_program(
                             normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                             normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
-                    # Stage 2: Q projection (matmul + matmul_acc, cube only).
+                    # Stage 2: Q projection — cube matmul into a small FP32 buffer,
+                    # then vector cast/store to BF16 output.
                     for ob in pl.range(q_out_blocks):
                         q0 = ob * Q_OUT_CHUNK
+                        q_buf = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
                         with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
@@ -143,11 +146,17 @@ def build_prefill_projection_program(
                                 tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                 tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                                 q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
-                            q_proj = pl.assemble(q_proj, q_acc, [b, p0, q0])
+                            q_buf = pl.assemble(q_buf, q_acc, [0, 0])
+                        with pl.incore():
+                            q_tile = pl.slice(q_buf, [TOK_TILE, Q_OUT_CHUNK], [0, 0])
+                            q_proj = pl.assemble(
+                                q_proj, pl.cast(q_tile, target_type=pl.BF16), [b, p0, q0])
 
-                    # Stage 3: K projection (matmul + matmul_acc, cube only).
+                    # Stage 3: K projection — cube matmul into a small FP32 buffer,
+                    # then vector cast/store to BF16 output.
                     for ob in pl.range(kv_out_blocks):
                         kv0 = ob * KV_OUT_CHUNK
+                        k_buf = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
                         with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
@@ -157,11 +166,17 @@ def build_prefill_projection_program(
                                 tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                 tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                                 k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                            k_proj = pl.assemble(k_proj, k_acc, [b, p0, kv0])
+                            k_buf = pl.assemble(k_buf, k_acc, [0, 0])
+                        with pl.incore():
+                            k_tile = pl.slice(k_buf, [TOK_TILE, KV_OUT_CHUNK], [0, 0])
+                            k_proj = pl.assemble(
+                                k_proj, pl.cast(k_tile, target_type=pl.BF16), [b, p0, kv0])
 
-                    # Stage 4: V projection (matmul + matmul_acc, cube only).
+                    # Stage 4: V projection — cube matmul into a small FP32 buffer,
+                    # then vector cast/store to BF16 output.
                     for ob in pl.range(kv_out_blocks):
                         kv0 = ob * KV_OUT_CHUNK
+                        v_buf = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
                         with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
@@ -171,7 +186,11 @@ def build_prefill_projection_program(
                                 tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                 tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                                 v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
-                            v_proj = pl.assemble(v_proj, v_acc, [b, p0, kv0])
+                            v_buf = pl.assemble(v_buf, v_acc, [0, 0])
+                        with pl.incore():
+                            v_tile = pl.slice(v_buf, [TOK_TILE, KV_OUT_CHUNK], [0, 0])
+                            v_proj = pl.assemble(
+                                v_proj, pl.cast(v_tile, target_type=pl.BF16), [b, p0, kv0])
 
             return q_proj, k_proj, v_proj
 
@@ -222,9 +241,9 @@ def build_tensor_specs(
                    init_value=init_wk),
         TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16,
                    init_value=init_wv),
-        TensorSpec("q_proj", [batch, max_seq, hidden_size], torch.float32, is_output=True),
-        TensorSpec("k_proj", [batch, max_seq, kv_hidden], torch.float32, is_output=True),
-        TensorSpec("v_proj", [batch, max_seq, kv_hidden], torch.float32, is_output=True),
+        TensorSpec("q_proj", [batch, max_seq, hidden_size], torch.bfloat16, is_output=True),
+        TensorSpec("k_proj", [batch, max_seq, kv_hidden], torch.bfloat16, is_output=True),
+        TensorSpec("v_proj", [batch, max_seq, kv_hidden], torch.bfloat16, is_output=True),
     ]
 
 
@@ -233,8 +252,8 @@ def golden_prefill_projection(tensors, params):
 
     RMSNorm uses variance (not rsqrt) to match the kernel's
     row_expand_mul(x_chunk, inv_rms) path.
-    Projections: BF16 matmul with FP32 accumulation, FP32 output
-    (aligned to decode_scope1).
+    Projections: BF16 matmul with FP32 accumulation, BF16 output
+    (aligned to prefill_scope2 inputs).
     """
     import torch
 
@@ -250,9 +269,9 @@ def golden_prefill_projection(tensors, params):
     hidden_size = hidden_states.shape[2]
     kv_hidden = wk.shape[1]
 
-    q_proj = torch.zeros(batch, max_seq, hidden_size, dtype=torch.float32)
-    k_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.float32)
-    v_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.float32)
+    q_proj = torch.zeros(batch, max_seq, hidden_size, dtype=torch.bfloat16)
+    k_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.bfloat16)
+    v_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.bfloat16)
 
     for b in range(batch):
         seq_len_b = seq_lens[b].item()
@@ -271,16 +290,16 @@ def golden_prefill_projection(tensors, params):
                 x_tile * inv_rms * input_rms_weight.float()
             ).bfloat16()
 
-            # Q/K/V projection: BF16 matmul, FP32 acc, FP32 output.
+            # Q/K/V projection: BF16 matmul, FP32 acc, BF16 output.
             q_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wq.float()
-            ).float()
+            ).bfloat16()
             k_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wk.float()
-            ).float()
+            ).bfloat16()
             v_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wv.float()
-            ).float()
+            ).bfloat16()
 
     tensors["q_proj"][:] = q_proj
     tensors["k_proj"][:] = k_proj
@@ -326,8 +345,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=2e-3,
+            atol=2e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
