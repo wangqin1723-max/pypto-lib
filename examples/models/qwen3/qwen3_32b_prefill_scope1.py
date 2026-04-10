@@ -64,7 +64,6 @@ def build_prefill_projection_program(
     hidden_blocks = hidden // K_CHUNK
     q_out_blocks = hidden // Q_OUT_CHUNK
     kv_out_blocks = kv_hidden // KV_OUT_CHUNK
-    hidden_inv = 1.0 / hidden
 
     @pl.program
     class PrefillProjectionProgram:
@@ -113,7 +112,7 @@ def build_prefill_projection_program(
                         # Compute variance in [1, TOK_TILE], then reshape to [TOK_TILE, 1]
                         # for row_expand_mul broadcasting.
                         variance = pl.reshape(
-                            pl.add(pl.mul(partial_sq, hidden_inv), EPS),
+                            pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS),
                             [TOK_TILE, 1],
                         )
                         inv_rms = pl.recip(pl.sqrt(variance))
@@ -203,13 +202,13 @@ def build_tensor_specs(
         return torch.rand(1, hidden_size) - 0.5
 
     def init_wq():
-        return torch.randn(hidden_size, hidden_size) / hidden_size ** 0.5
+        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
     def init_wk():
-        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     def init_wv():
-        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     return [
         TensorSpec("hidden_states", [batch, max_seq, hidden_size], torch.bfloat16,
@@ -247,12 +246,13 @@ def golden_prefill_projection(tensors, params):
     wv = tensors["wv"]
 
     batch = hidden_states.shape[0]
+    max_seq = hidden_states.shape[1]
     hidden_size = hidden_states.shape[2]
     kv_hidden = wk.shape[1]
 
-    q_proj = tensors["q_proj"]
-    k_proj = tensors["k_proj"]
-    v_proj = tensors["v_proj"]
+    q_proj = torch.zeros(batch, max_seq, hidden_size, dtype=torch.float32)
+    k_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.float32)
+    v_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.float32)
 
     for b in range(batch):
         seq_len_b = seq_lens[b].item()
@@ -281,6 +281,10 @@ def golden_prefill_projection(tensors, params):
             v_proj[b, p0 : p0 + valid_tok, :] = (
                 normed.float() @ wv.float()
             ).float()
+
+    tensors["q_proj"][:] = q_proj
+    tensors["k_proj"][:] = k_proj
+    tensors["v_proj"][:] = v_proj
 
 
 def compile_and_run(
@@ -327,7 +331,7 @@ def compile_and_run(
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
-            enable_profiling=enable_profiling,
+            runtime_profiling=enable_profiling,
         ),
     )
     return result
