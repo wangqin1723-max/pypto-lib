@@ -8,49 +8,58 @@
 # -----------------------------------------------------------------------------------------------------------
 """Qwen3-32B prefill Scope 1 — input RMSNorm + Q/K/V projection.
 
-Standalone test for the RMSNorm + projection scope of the Qwen3-32B prefill layer,
-with current example defaults (BATCH=16, MAX_SEQ=128).
+Standalone test for the RMSNorm + projection scope of the Qwen3-32B prefill layer.
 
-For each batch element with seq_len_b tokens (processed in TOK_TILE=16 chunks):
+For each batch element with seq_len_b tokens (processed in TOK_TILE-sized chunks):
   1. Compute RMSNorm of the input hidden states token tile.
   2. Project to Q (hidden_size), K (kv_hidden), V (kv_hidden).
 
-TOK_TILE=16 is the minimum value that satisfies both hardware constraints:
+TOK_TILE must satisfy both hardware constraints:
   - Vector tilelet: [1, TOK_TILE] FP32 >= 32 B (1 block) -> TOK_TILE >= 8
   - Cube fractal:   matmul M-dim must be a multiple of 16  -> TOK_TILE >= 16
+Larger TOK_TILE reduces total task count (tok_blocks = MAX_SEQ / TOK_TILE).
 
-Hardware TILELET / TILE sizing (identical to decode_scope1 at BATCH_TILE=16):
-  * RMSNorm accumulator [1, TOK_TILE]        FP32 = [1,16]*4  = 64 B (1xTILELET)
-  * Normed tile chunk   [TOK_TILE, K_CHUNK]   BF16 = [16,128]*2 = 4 KB
-  * Q/K/V accumulator   [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (2xTILELET)
-  * Q/K/V FP32 buffer   [TOK_TILE, OUT_CHUNK] FP32 = [16,64]*4 = 4 KB (per-chunk intermediate)
-  * Q/K/V output        [TOK_TILE, OUT_CHUNK] BF16 = [16,64]*2 = 2 KB
-  * Weight tiles         [K_CHUNK, OUT_CHUNK]  BF16 = [128,64]*2 = 16 KB = MAX
+Input hidden states are BF16; weights are BF16; projections output FP32.
+This aligns with decode_scope1 so that scope 2 receives FP32 projections
+for RoPE, avoiding an extra BF16 round-trip.
+
+Tile sizing at current defaults (TOK_TILE=64, K_CHUNK=128, Q_OUT_CHUNK=64):
+  * RMSNorm accumulator [1, TOK_TILE]          FP32 = [1,64]*4   = 256 B
+  * Normed tile chunk   [TOK_TILE, K_CHUNK]     BF16 = [64,128]*2 = 16 KB
+  * Q/K/V accumulator   [TOK_TILE, Q_OUT_CHUNK] FP32 = [64,64]*4  = 16 KB
+  * Q/K/V accumulator   [TOK_TILE, KV_OUT_CHUNK]FP32 = [64,64]*4  = 16 KB
+  * Weight tile (Q)     [K_CHUNK, Q_OUT_CHUNK]   BF16 = [128,64]*2 = 16 KB
+  * Weight tile (K/V)   [K_CHUNK, KV_OUT_CHUNK]  BF16 = [128,64]*2 = 16 KB
+
+Task count per (batch, token_block):
+  1 (RMSNorm) + HIDDEN/Q_OUT_CHUNK (Q) + 2*KV_HIDDEN/KV_OUT_CHUNK (K+V)
+  = 1 + 128 + 32 = 161
+Total tasks: BATCH * (MAX_SEQ/TOK_TILE) * 161 = 16 * 64 * 161 = 164,864
 """
 from __future__ import annotations
 
 import pypto.language as pl
 
 
-# Full Qwen3-32B model dimensions.
+# Qwen3-32B model dimensions.
 BATCH = 16
-MAX_SEQ = 128
-NUM_HEADS = 40
-NUM_KV_HEADS = 8
+MAX_SEQ = 4096
+NUM_HEADS = 64          # Q attention heads
+NUM_KV_HEADS = 8        # K/V attention heads (GQA: 8:1 ratio)
 HEAD_DIM = 128
-HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
-KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
-INTERMEDIATE = 25600
+HIDDEN = NUM_HEADS * HEAD_DIM      # 8192 — Q projection output width
+KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024 — K/V projection output width
+INTERMEDIATE = 25600    # FFN intermediate (unused in scope 1)
 
-
+# RMSNorm constants.
 EPS = 1e-6
-HIDDEN_INV = 1.0 / HIDDEN
+HIDDEN_INV = 1.0 / HIDDEN  # reciprocal for variance mean computation
 
-# Tiling constants (aligned to qwen3_32b_prefill_tilelet).
-K_CHUNK = 128
-Q_OUT_CHUNK = 64
-KV_OUT_CHUNK = 64
-TOK_TILE = 16
+# Tiling constants.
+K_CHUNK = 128       # hidden-dim chunk for matmul reduction (K dimension)
+Q_OUT_CHUNK = 64    # Q output-dim chunk  -> q_out_blocks = HIDDEN/64 = 128
+KV_OUT_CHUNK = 64   # K/V output-dim chunk -> kv_out_blocks = KV_HIDDEN/64 = 16
+TOK_TILE = 64       # token-dim tile -> tok_blocks = MAX_SEQ/64 = 64
 
 
 def build_prefill_projection_program(
@@ -77,13 +86,13 @@ def build_prefill_projection_program(
             wq: pl.Tensor[[hidden, hidden], pl.BF16],
             wk: pl.Tensor[[hidden, kv_hidden], pl.BF16],
             wv: pl.Tensor[[hidden, kv_hidden], pl.BF16],
-            q_proj: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.BF16]],
-            k_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16]],
-            v_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16]],
+            q_proj: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.FP32]],
+            k_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32]],
+            v_proj: pl.Out[pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32]],
         ) -> tuple[
-            pl.Tensor[[batch, max_seq, hidden], pl.BF16],
-            pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
-            pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
+            pl.Tensor[[batch, max_seq, hidden], pl.FP32],
+            pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
+            pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
         ]:
             for b in pl.range(0, batch):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
@@ -93,7 +102,7 @@ def build_prefill_projection_program(
                     valid_tok = pl.min(TOK_TILE, seq_len_b - p0)
                     normed_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
 
-                    # Stage 1: RMSNorm + apply weights (vector ops only).
+                    # Stage 1: RMSNorm — squared-sum reduction, then scale + gamma (vector ops).
                     with pl.incore():
                         partial_sq = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(hidden_blocks):
@@ -132,11 +141,11 @@ def build_prefill_projection_program(
                             normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                             normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
-                    # Stage 2: Q projection — cube matmul into a small FP32 buffer,
-                    # then vector cast/store to BF16 output.
+                    # Stage 2: Q projection — matmul [TOK_TILE, K_CHUNK] x [K_CHUNK, Q_OUT_CHUNK],
+                    # accumulated over hidden_blocks, FP32 output.
                     for ob in pl.range(q_out_blocks):
                         q0 = ob * Q_OUT_CHUNK
-                        q_buf = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+
                         with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
@@ -146,17 +155,13 @@ def build_prefill_projection_program(
                                 tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                 tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                                 q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
-                            q_buf = pl.assemble(q_buf, q_acc, [0, 0])
-                        with pl.incore():
-                            q_tile = pl.slice(q_buf, [TOK_TILE, Q_OUT_CHUNK], [0, 0])
-                            q_proj = pl.assemble(
-                                q_proj, pl.cast(q_tile, target_type=pl.BF16), [b, p0, q0])
 
-                    # Stage 3: K projection — cube matmul into a small FP32 buffer,
-                    # then vector cast/store to BF16 output.
+                            q_proj = pl.assemble(q_proj, q_acc, [b, p0, q0])
+
+                    # Stage 3: K projection — same matmul pattern, KV_OUT_CHUNK width.
                     for ob in pl.range(kv_out_blocks):
                         kv0 = ob * KV_OUT_CHUNK
-                        k_buf = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+
                         with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
@@ -166,17 +171,13 @@ def build_prefill_projection_program(
                                 tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                 tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                                 k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                            k_buf = pl.assemble(k_buf, k_acc, [0, 0])
-                        with pl.incore():
-                            k_tile = pl.slice(k_buf, [TOK_TILE, KV_OUT_CHUNK], [0, 0])
-                            k_proj = pl.assemble(
-                                k_proj, pl.cast(k_tile, target_type=pl.BF16), [b, p0, kv0])
 
-                    # Stage 4: V projection — cube matmul into a small FP32 buffer,
-                    # then vector cast/store to BF16 output.
+                            k_proj = pl.assemble(k_proj, k_acc, [b, p0, kv0])
+
+                    # Stage 4: V projection — same matmul pattern, KV_OUT_CHUNK width.
                     for ob in pl.range(kv_out_blocks):
                         kv0 = ob * KV_OUT_CHUNK
-                        v_buf = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+
                         with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
@@ -186,11 +187,8 @@ def build_prefill_projection_program(
                                 tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                                 tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                                 v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
-                            v_buf = pl.assemble(v_buf, v_acc, [0, 0])
-                        with pl.incore():
-                            v_tile = pl.slice(v_buf, [TOK_TILE, KV_OUT_CHUNK], [0, 0])
-                            v_proj = pl.assemble(
-                                v_proj, pl.cast(v_tile, target_type=pl.BF16), [b, p0, kv0])
+
+                            v_proj = pl.assemble(v_proj, v_acc, [b, p0, kv0])
 
             return q_proj, k_proj, v_proj
 
@@ -241,9 +239,9 @@ def build_tensor_specs(
                    init_value=init_wk),
         TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16,
                    init_value=init_wv),
-        TensorSpec("q_proj", [batch, max_seq, hidden_size], torch.bfloat16, is_output=True),
-        TensorSpec("k_proj", [batch, max_seq, kv_hidden], torch.bfloat16, is_output=True),
-        TensorSpec("v_proj", [batch, max_seq, kv_hidden], torch.bfloat16, is_output=True),
+        TensorSpec("q_proj", [batch, max_seq, hidden_size], torch.float32, is_output=True),
+        TensorSpec("k_proj", [batch, max_seq, kv_hidden], torch.float32, is_output=True),
+        TensorSpec("v_proj", [batch, max_seq, kv_hidden], torch.float32, is_output=True),
     ]
 
 
@@ -252,8 +250,8 @@ def golden_prefill_projection(tensors, params):
 
     RMSNorm uses variance (not rsqrt) to match the kernel's
     row_expand_mul(x_chunk, inv_rms) path.
-    Projections: BF16 matmul with FP32 accumulation, BF16 output
-    (aligned to prefill_scope2 inputs).
+    Projections: BF16 matmul with FP32 accumulation, FP32 output
+    (aligned to decode_scope1 and prefill_scope2 FP32 inputs).
     """
     import torch
 
@@ -268,38 +266,29 @@ def golden_prefill_projection(tensors, params):
     max_seq = hidden_states.shape[1]
     hidden_size = hidden_states.shape[2]
     kv_hidden = wk.shape[1]
+    input_rms_weight_f = input_rms_weight.float()
+    wq_f = wq.float()
+    wk_f = wk.float()
+    wv_f = wv.float()
 
-    q_proj = torch.zeros(batch, max_seq, hidden_size, dtype=torch.bfloat16)
-    k_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.bfloat16)
-    v_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.bfloat16)
+    q_proj = torch.zeros(batch, max_seq, hidden_size, dtype=torch.float32)
+    k_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.float32)
+    v_proj = torch.zeros(batch, max_seq, kv_hidden, dtype=torch.float32)
 
     for b in range(batch):
         seq_len_b = seq_lens[b].item()
-        for p0 in range(0, seq_len_b, TOK_TILE):
-            valid_tok = min(TOK_TILE, seq_len_b - p0)
-            x_tile = hidden_states[b, p0 : p0 + valid_tok, :].float()
+        x = hidden_states[b, :seq_len_b, :].float()
 
-            # RMSNorm: chunked squared sum, variance-based (matches kernel).
-            sq_sum = torch.zeros(valid_tok, 1, dtype=torch.float32)
-            for k0 in range(0, hidden_size, K_CHUNK):
-                x_chunk = x_tile[:, k0 : k0 + K_CHUNK]
-                sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
-            variance = sq_sum / hidden_size + EPS
-            inv_rms = 1.0 / torch.sqrt(variance)
-            normed = (
-                x_tile * inv_rms * input_rms_weight.float()
-            ).bfloat16()
+        # The CPU golden does not need tile-sized loops; full-sequence vectorization
+        # avoids repeated small GEMMs and dtype conversions.
+        variance = x.square().mean(dim=-1, keepdim=True) + EPS
+        inv_rms = 1.0 / torch.sqrt(variance)
+        normed_f = x * inv_rms * input_rms_weight_f
 
-            # Q/K/V projection: BF16 matmul, FP32 acc, BF16 output.
-            q_proj[b, p0 : p0 + valid_tok, :] = (
-                normed.float() @ wq.float()
-            ).bfloat16()
-            k_proj[b, p0 : p0 + valid_tok, :] = (
-                normed.float() @ wk.float()
-            ).bfloat16()
-            v_proj[b, p0 : p0 + valid_tok, :] = (
-                normed.float() @ wv.float()
-            ).bfloat16()
+        # Q/K/V projection: FP32 matmul, FP32 output (no BF16 cast).
+        q_proj[b, :seq_len_b, :] = (normed_f @ wq_f).float()
+        k_proj[b, :seq_len_b, :] = (normed_f @ wk_f).float()
+        v_proj[b, :seq_len_b, :] = (normed_f @ wv_f).float()
 
     tensors["q_proj"][:] = q_proj
     tensors["k_proj"][:] = k_proj
@@ -345,8 +334,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=2e-3,
-            atol=2e-3,
+            rtol=1e-3,
+            atol=1e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,

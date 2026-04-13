@@ -9,34 +9,28 @@
 """Qwen3-32B prefill Scope 3 — output projection + residual + post RMSNorm + MLP.
 
 For each batch element with variable-length tokens (processed in TOK_TILE chunks):
-  1. Output projection: attn_out x wo, tiled by Q_OUT_CHUNK, + first residual.
-  2. Post-attention RMSNorm over resid1.
-  3. MLP: gate/up projections -> SiLU activation -> down projection.
+  1. Output projection: attn_out x wo + first residual.
+  2. Post-attention RMSNorm.
+  3. MLP gate/up projections -> SiLU -> down projection.
   4. Final residual addition -> BF16 output.
-
-Implementation pattern (follows decode_scope3):
-  - Cube blocks: matmul chain + assemble directly to GM target tensor.
-  - Vector blocks: read back from GM target, do add/norm/SiLU, write back.
-  - Down projection: cube matmul + vector accumulate per hidden chunk.
-  - Uses auto_incore() for pure-vector stages and parallel init where possible.
 """
 from __future__ import annotations
 
 import pypto.language as pl
 
 BATCH = 16
-MAX_SEQ = 128
-HIDDEN = 1024      
-INTERMEDIATE = 12800
+MAX_SEQ = 4096
+HIDDEN = 8192      
+INTERMEDIATE = 25600
 
 EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 # Tiling constants.
-K_CHUNK = 128
-Q_OUT_CHUNK = 64
-MLP_OUT_CHUNK = 64
-TOK_TILE = 16
+K_CHUNK = 128           # hidden-dim reduction chunk (K dimension)
+Q_OUT_CHUNK = 64        # output projection output-dim chunk
+MLP_OUT_CHUNK = 128     # MLP gate/up output-dim chunk
+TOK_TILE = 64           # token-dim tile size
 
 
 def build_prefill_scope3_program(
@@ -78,7 +72,7 @@ def build_prefill_scope3_program(
                     resid1_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
                     attn_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
 
-                    # --- Stage 1a: Copy attn_out 3D -> attn_tile 2D ---
+                    # --- Stage 1: Copy attn_out 3D -> attn_tile 2D ---
                     with pl.incore():
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -93,14 +87,14 @@ def build_prefill_scope3_program(
                             a_chunk_bf16 = pl.cast(a_chunk_fp32, target_type=pl.BF16)
                             attn_tile = pl.assemble(attn_tile, a_chunk_bf16, [0, k0])
 
-                    # Stage 1b: Initialize resid1_tile accumulator.
+                    # Stage 2: Initialize resid1_tile accumulator.
                     with pl.auto_incore():
                         for ob in pl.parallel(0, q_out_blocks, chunk=8):
                             o0 = ob * Q_OUT_CHUNK
                             zero_resid1 = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                             resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
 
-                    # --- Stage 2: Output projection + first residual ---
+                    # --- Stage 3: Output projection + first residual ---
                     for ob in pl.range(q_out_blocks):
                         o0 = ob * Q_OUT_CHUNK
 
@@ -117,7 +111,7 @@ def build_prefill_scope3_program(
 
                             resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
 
-                        # Vector: read back matmul result, add residual.
+                        # Vector: add residual.
                         with pl.incore():
                             resid_chunk = pl.reshape(
                                 pl.cast(
@@ -131,7 +125,7 @@ def build_prefill_scope3_program(
                             resid_sum = pl.add(mm_out, resid_chunk)
                             resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
 
-                    # --- Stage 3/4/5: Post-attention RMSNorm + normalize + init down_proj ---
+                    # --- Stage 4: Post-attention RMSNorm + init down_proj ---
                     post_norm_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
                     down_fp32_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
                     with pl.auto_incore():
@@ -145,7 +139,7 @@ def build_prefill_scope3_program(
                             )
                         inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, hidden_inv), EPS)))
 
-                        # Normalize, apply gamma, and zero-init down_proj accumulator.
+                        # Normalize, apply gamma, zero-init down_proj accumulator.
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
                             x_chunk = pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, k0])
@@ -160,11 +154,11 @@ def build_prefill_scope3_program(
                             down_zero_chunk = pl.full([TOK_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
                             down_fp32_tile = pl.assemble(down_fp32_tile, down_zero_chunk, [0, k0])
 
-                    # --- Stage 6: MLP gate/up + SiLU + down projection ---
+                    # --- Stage 5: MLP gate/up + SiLU + down projection ---
                     for ob in pl.range(mlp_out_blocks):
                         o0 = ob * MLP_OUT_CHUNK
 
-                        # Stage 6a: Gate matmul chain.
+                        # Gate matmul chain.
                         with pl.incore():
                             pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
@@ -175,7 +169,7 @@ def build_prefill_scope3_program(
                                 wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                                 gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
 
-                        # Stage 6b: Up matmul chain.
+                        # Up matmul chain.
                         with pl.incore():
                             pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
@@ -186,13 +180,13 @@ def build_prefill_scope3_program(
                                 wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                                 up_acc = pl.matmul_acc(up_acc, pci, wui)
 
-                        # Stage 6c: SiLU activation and cast to BF16.
+                        # SiLU activation.
                         with pl.auto_incore():
                             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                        # Stage 7: Down projection, cube matmul + vector accumulate per chunk.
+                        # Down projection: cube matmul + vector accumulate.
                         for dob in pl.range(hidden_blocks):
                             d0 = dob * K_CHUNK
 
@@ -205,7 +199,7 @@ def build_prefill_scope3_program(
                                 accum = pl.add(down_prev, down_next)
                                 down_fp32_tile = pl.assemble(down_fp32_tile, accum, [0, d0])
 
-                    # --- Stage 8: Final residual add, write BF16 output ---
+                    # --- Stage 6: Final residual add -> BF16 output ---
                     for ob in pl.range(hidden_blocks):
                         o0 = ob * K_CHUNK
                         with pl.incore():
@@ -225,45 +219,49 @@ def golden_prefill_scope3(tensors, params):
     """Reference computation for Scope 3 (prefill)."""
     import torch
 
-    attn_out_t = tensors["attn_out"]       # [B, S, H], BF16
-    seq_lens = tensors["seq_lens"]          # [B], INT32
-    hidden_states = tensors["hidden_states"]  # [B, S, H], BF16
-    wo = tensors["wo"]                       # [H, H], BF16
-    post_rms_weight = tensors["post_rms_weight"]  # [1, H], FP32
-    w_gate = tensors["w_gate"]               # [H, I], BF16
-    w_up = tensors["w_up"]                   # [H, I], BF16
-    w_down = tensors["w_down"]               # [I, H], BF16
+    attn_out_t = tensors["attn_out"]
+    seq_lens = tensors["seq_lens"]
+    hidden_states = tensors["hidden_states"]
+    wo = tensors["wo"]
+    post_rms_weight = tensors["post_rms_weight"]
+    w_gate = tensors["w_gate"]
+    w_up = tensors["w_up"]
+    w_down = tensors["w_down"]
 
-    batch = attn_out_t.shape[0]
-    hidden_size = attn_out_t.shape[2]
     eps = EPS
-
     out_t = tensors["out"]
 
-    for b in range(batch):
+    # Pre-convert weights to FP32.
+    wo_f = wo.float()
+    post_rms_f = post_rms_weight.float()
+    w_gate_f = w_gate.float()
+    w_up_f = w_up.float()
+    w_down_f = w_down.float()
+
+    for b in range(attn_out_t.shape[0]):
         seq_len_b = seq_lens[b].item()
-        for p0 in range(0, seq_len_b, TOK_TILE):
-            valid_tok = min(TOK_TILE, seq_len_b - p0)
+        sl = slice(0, seq_len_b)
 
-            attn_tile = attn_out_t[b, p0 : p0 + valid_tok, :]
+        attn = attn_out_t[b, sl, :].float()
+        hs = hidden_states[b, sl, :].float()
 
-            # 1. Output projection (BF16 inputs, FP32 accumulation) + residual.
-            o_proj = torch.matmul(attn_tile.float(), wo.float())
-            resid1 = o_proj + hidden_states[b, p0 : p0 + valid_tok, :].float()
+        # 1. Output projection + first residual.
+        resid1 = torch.matmul(attn, wo_f) + hs
 
-            # 2. Post-attention RMSNorm.
-            variance = resid1.pow(2).mean(dim=-1, keepdim=True)
-            inv_rms = torch.rsqrt(variance + eps)
-            normed_bf16 = (resid1 * inv_rms * post_rms_weight.float()).bfloat16()
+        # 2. Post-attention RMSNorm.
+        variance = resid1.pow(2).mean(dim=-1, keepdim=True)
+        inv_rms = torch.rsqrt(variance + eps)
+        normed_bf16 = (resid1 * inv_rms * post_rms_f).bfloat16()
 
-            # 3. SwiGLU MLP: gate/up projections, silu activation, down projection.
-            gate = torch.matmul(normed_bf16.float(), w_gate.float())
-            up = torch.matmul(normed_bf16.float(), w_up.float())
-            mlp_bf16 = (gate * torch.sigmoid(gate) * up).bfloat16()
-            down = torch.matmul(mlp_bf16.float(), w_down.float())
+        # 3. SwiGLU MLP.
+        normed_f = normed_bf16.float()
+        gate = torch.matmul(normed_f, w_gate_f)
+        up = torch.matmul(normed_f, w_up_f)
+        mlp_bf16 = (gate * torch.sigmoid(gate) * up).bfloat16()
+        down = torch.matmul(mlp_bf16.float(), w_down_f)
 
-            # 4. Final residual + cast to BF16.
-            out_t[b, p0 : p0 + valid_tok, :] = (down + resid1).bfloat16()
+        # 4. Final residual -> BF16.
+        out_t[b, sl, :] = (down + resid1).bfloat16()
 
 
 def build_tensor_specs(
