@@ -9,10 +9,10 @@
 """Qwen3-32B prefill Scope 3 — output projection + residual + post RMSNorm + MLP.
 
 For each batch element with variable-length tokens (processed in TOK_TILE chunks):
-  1. Output projection: attn_out x wo + first residual.
-  2. Post-attention RMSNorm.
-  3. MLP gate/up projections -> SiLU -> down projection.
-  4. Final residual addition -> BF16 output.
+  1. Output projection: attn_out x wo + first residual
+  2. Post-attention RMSNorm
+  3. MLP gate/up projections, SiLU activation, down projection
+  4. Final residual addition -> BF16 output
 """
 from __future__ import annotations
 
@@ -20,17 +20,17 @@ import pypto.language as pl
 
 BATCH = 16
 MAX_SEQ = 4096
-HIDDEN = 8192      
+HIDDEN = 8192
 INTERMEDIATE = 25600
 
 EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 # Tiling constants.
-K_CHUNK = 128           # hidden-dim reduction chunk (K dimension)
-Q_OUT_CHUNK = 64        # output projection output-dim chunk
-MLP_OUT_CHUNK = 128     # MLP gate/up output-dim chunk
-TOK_TILE = 64           # token-dim tile size
+K_CHUNK = 128
+Q_OUT_CHUNK = 64
+MLP_OUT_CHUNK = 128
+TOK_TILE = 64
 
 
 def build_prefill_scope3_program(
@@ -72,7 +72,7 @@ def build_prefill_scope3_program(
                     resid1_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
                     attn_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
 
-                    # --- Stage 1: Copy attn_out 3D -> attn_tile 2D ---
+                    # Stage 1: Copy attn_out 3D -> attn_tile 2D.
                     with pl.incore():
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -94,11 +94,11 @@ def build_prefill_scope3_program(
                             zero_resid1 = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                             resid1_tile = pl.assemble(resid1_tile, zero_resid1, [0, o0])
 
-                    # --- Stage 3: Output projection + first residual ---
+                    # Stage 3: Output projection + first residual.
                     for ob in pl.range(q_out_blocks):
                         o0 = ob * Q_OUT_CHUNK
 
-                        # Cube: chained matmul, assemble to GM.
+                        # Cube: chained matmul.
                         with pl.incore():
                             tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
@@ -125,7 +125,7 @@ def build_prefill_scope3_program(
                             resid_sum = pl.add(mm_out, resid_chunk)
                             resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
 
-                    # --- Stage 4: Post-attention RMSNorm + init down_proj ---
+                    # Stage 4: Post-attention RMSNorm.
                     post_norm_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
                     down_fp32_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
                     with pl.auto_incore():
@@ -154,7 +154,7 @@ def build_prefill_scope3_program(
                             down_zero_chunk = pl.full([TOK_TILE, K_CHUNK], dtype=pl.FP32, value=0.0)
                             down_fp32_tile = pl.assemble(down_fp32_tile, down_zero_chunk, [0, k0])
 
-                    # --- Stage 5: MLP gate/up + SiLU + down projection ---
+                    # Stage 5: MLP gate/up + SiLU + down projection.
                     for ob in pl.range(mlp_out_blocks):
                         o0 = ob * MLP_OUT_CHUNK
 
@@ -199,7 +199,7 @@ def build_prefill_scope3_program(
                                 accum = pl.add(down_prev, down_next)
                                 down_fp32_tile = pl.assemble(down_fp32_tile, accum, [0, d0])
 
-                    # --- Stage 6: Final residual add -> BF16 output ---
+                    # Stage 6: Final residual add -> BF16 output.
                     for ob in pl.range(hidden_blocks):
                         o0 = ob * K_CHUNK
                         with pl.incore():
@@ -216,7 +216,14 @@ def build_prefill_scope3_program(
 
 
 def golden_prefill_scope3(tensors, params):
-    """Reference computation for Scope 3 (prefill)."""
+    """Reference computation for Scope 3 (prefill).
+
+    Steps:
+      1. Output projection: attn_out x wo + residual
+      2. Post-attention RMSNorm
+      3. SwiGLU MLP: gate/up projections, silu(gate) * up, down projection
+      4. Final residual addition -> BF16 output
+    """
     import torch
 
     attn_out_t = tensors["attn_out"]
