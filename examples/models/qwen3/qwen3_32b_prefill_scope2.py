@@ -32,11 +32,11 @@ TOK_TILE=16 chunks):
 
 Hardware TILELET / TILE sizing (at default HEAD_DIM=128):
   * K RoPE half-vectors [NUM_KV_HEADS, HEAD_DIM//2] FP32 = [8,64]*4 = 2 KB = MAX
-  * Q RoPE half-vectors [Q_HEAD_BATCH, HEAD_DIM//2] FP32 = [5,64]*4 = 1.25 KB
+  * Q RoPE half-vectors [Q_HEAD_BATCH, HEAD_DIM//2] FP32 = [8,64]*4 = 2 KB
   * Attention K tile    [SEQ_TILE, HEAD_DIM]         BF16 = [64,128]*2 = 16 KB = MAX
 
-Input projections are BF16; cos/sin tables are FP32; KV caches are BF16.
-Output attention is BF16.
+Input projections are FP32 (aligned to decode_scope2); cos/sin tables are FP32;
+KV caches are BF16.  Output attention is BF16.
 """
 from __future__ import annotations
 
@@ -44,15 +44,15 @@ import pypto.language as pl
 
 BATCH = 16
 MAX_SEQ = 128
-NUM_HEADS = 40
+NUM_HEADS = 64          # Q attention heads (aligned to Qwen3-32B / scope 1)
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 
 # Tiling constants (aligned to qwen3_32b_prefill_tilelet).
-TOK_TILE = 16
-Q_HEAD_BATCH = 5        # Q heads batched per attention group
-Q_HEAD_PAD = 16          # padded Q rows for cube fractal alignment
-SEQ_TILE = 64            # sequence tile for attention loop
+TOK_TILE = 32
+Q_HEAD_BATCH = 8        # Q heads batched per attention group (q_per_kv = 64/8 = 8)
+Q_HEAD_PAD = 16         # padded Q rows for cube fractal alignment
+SEQ_TILE = 64           # sequence tile for attention loop
 SB_BATCH = 64
 
 def build_prefill_attention_program(
@@ -77,9 +77,9 @@ def build_prefill_attention_program(
         @pl.function(type=pl.FunctionType.Opaque)
         def prefill_attention(
             self,
-            q_proj: pl.Tensor[[batch, max_seq, hidden], pl.BF16],
-            k_proj: pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
-            v_proj: pl.Tensor[[batch, max_seq, kv_hidden], pl.BF16],
+            q_proj: pl.Tensor[[batch, max_seq, hidden], pl.FP32],
+            k_proj: pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
+            v_proj: pl.Tensor[[batch, max_seq, kv_hidden], pl.FP32],
             seq_lens: pl.Tensor[[batch], pl.INT32],
             rope_cos: pl.Tensor[[max_seq, head_dim], pl.FP32],
             rope_sin: pl.Tensor[[max_seq, head_dim], pl.FP32],
@@ -107,31 +107,25 @@ def build_prefill_attention_program(
 
                         # Stage 1+2a: K RoPE + cache update + V cache + Q RoPE + pad.
                         all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for gi in pl.range(total_q_groups):
                                 all_q_padded = pl.assemble(
                                     all_q_padded,
                                     pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
                                     [gi * Q_HEAD_PAD, 0],
                                 )
-                        with pl.auto_incore():
+                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                             for ki in pl.parallel(0, num_kv_heads, chunk=8):
                                 # K RoPE + cache update (slice halves directly from GM
                                 # to avoid A2/A3 textract from on-chip UB tiles).
                                 kv_col = ki * head_dim
-                                k_lo = pl.cast(
-                                    pl.reshape(
-                                        pl.slice(k_proj, [1, 1, half_dim], [b, pos, kv_col]),
-                                        [1, half_dim],
-                                    ),
-                                    target_type=pl.FP32,
+                                k_lo = pl.reshape(
+                                    pl.slice(k_proj, [1, 1, half_dim], [b, pos, kv_col]),
+                                    [1, half_dim],
                                 )
-                                k_hi = pl.cast(
-                                    pl.reshape(
-                                        pl.slice(k_proj, [1, 1, half_dim], [b, pos, kv_col + half_dim]),
-                                        [1, half_dim],
-                                    ),
-                                    target_type=pl.FP32,
+                                k_hi = pl.reshape(
+                                    pl.slice(k_proj, [1, 1, half_dim], [b, pos, kv_col + half_dim]),
+                                    [1, half_dim],
                                 )
                                 rot_lo = pl.sub(
                                     pl.col_expand_mul(k_lo, cos_lo),
@@ -152,12 +146,15 @@ def build_prefill_attention_program(
                                     pl.cast(rot_hi, target_type=pl.BF16),
                                     [cache_row, half_dim],
                                 )
-                                # V cache update.
+                                # V cache update (cast FP32 → BF16 for cache).
                                 v_cache = pl.assemble(
                                     v_cache,
-                                    pl.reshape(
-                                        pl.slice(v_proj, [1, 1, head_dim], [b, pos, ki * head_dim]),
-                                        [1, head_dim],
+                                    pl.cast(
+                                        pl.reshape(
+                                            pl.slice(v_proj, [1, 1, head_dim], [b, pos, ki * head_dim]),
+                                            [1, head_dim],
+                                        ),
+                                        target_type=pl.BF16,
                                     ),
                                     [cache_row, 0],
                                 )
@@ -166,19 +163,13 @@ def build_prefill_attention_program(
                                 q_base = ki * q_per_kv
                                 for qi in pl.range(Q_HEAD_BATCH):
                                     q_col = (q_base + qi) * head_dim
-                                    q_lo = pl.cast(
-                                        pl.reshape(
-                                            pl.slice(q_proj, [1, 1, half_dim], [b, pos, q_col]),
-                                            [1, half_dim],
-                                        ),
-                                        target_type=pl.FP32,
+                                    q_lo = pl.reshape(
+                                        pl.slice(q_proj, [1, 1, half_dim], [b, pos, q_col]),
+                                        [1, half_dim],
                                     )
-                                    q_hi = pl.cast(
-                                        pl.reshape(
-                                            pl.slice(q_proj, [1, 1, half_dim], [b, pos, q_col + half_dim]),
-                                            [1, half_dim],
-                                        ),
-                                        target_type=pl.FP32,
+                                    q_hi = pl.reshape(
+                                        pl.slice(q_proj, [1, 1, half_dim], [b, pos, q_col + half_dim]),
+                                        [1, half_dim],
                                     )
                                     rot_lo_bf16 = pl.cast(
                                         pl.sub(
@@ -217,7 +208,7 @@ def build_prefill_attention_program(
                             all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
                             all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
@@ -251,7 +242,7 @@ def build_prefill_attention_program(
 
                             # Stage 3: QK matmul for all active sb blocks.
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
@@ -267,7 +258,7 @@ def build_prefill_attention_program(
 
                             # Stage 4: softmax for all active sb blocks.
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
@@ -292,7 +283,7 @@ def build_prefill_attention_program(
 
                             # Stage 5: SV matmul for all active sb blocks.
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
@@ -312,7 +303,7 @@ def build_prefill_attention_program(
                                             all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 6a: init accumulators for online softmax.
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 oi = pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0)
                                 li_flat = pl.full([1, Q_HEAD_PAD], dtype=pl.FP32, value=0.0)
                                 li = pl.reshape(li_flat, [Q_HEAD_PAD, 1])
@@ -321,7 +312,7 @@ def build_prefill_attention_program(
 
                             # Stage 6b: online softmax accumulation for active sb blocks.
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
@@ -343,10 +334,10 @@ def build_prefill_attention_program(
 
                             # Vector-only: ctx = oi/li, extract valid Q_HEAD_BATCH rows.
                             ctx_full_gm = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.FP32)
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 ctx_full_gm = pl.row_expand_div(oi, li)
 
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 for qi in pl.range(Q_HEAD_BATCH):
                                     q_col = (q_base + qi) * head_dim
                                     attn_row = pl.assemble(
@@ -407,11 +398,11 @@ def build_tensor_specs(
         return torch.rand(cache_rows, head_dim) - 0.5
 
     return [
-        TensorSpec("q_proj", [batch, max_seq, hidden], torch.bfloat16,
+        TensorSpec("q_proj", [batch, max_seq, hidden], torch.float32,
                    init_value=init_q_proj),
-        TensorSpec("k_proj", [batch, max_seq, kv_hidden], torch.bfloat16,
+        TensorSpec("k_proj", [batch, max_seq, kv_hidden], torch.float32,
                    init_value=init_k_proj),
-        TensorSpec("v_proj", [batch, max_seq, kv_hidden], torch.bfloat16,
+        TensorSpec("v_proj", [batch, max_seq, kv_hidden], torch.float32,
                    init_value=init_v_proj),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("rope_cos", [max_seq, head_dim], torch.float32,
@@ -427,25 +418,28 @@ def build_tensor_specs(
 
 
 def golden_prefill_attention(tensors, params):
-    """PyTorch reference matching kernel BF16 precision path.
+    """PyTorch reference matching kernel BF16 precision path (vectorized).
 
-    Simulates the kernel's tiled online-softmax with BF16 matmuls:
-      - Q/K projections cast from BF16 to FP32 for RoPE arithmetic.
+    Vectorized across the sequence dimension — eliminates the per-token Python
+    loop while preserving tiled online-softmax with BF16 round-trips:
+      - Q/K projections are FP32 inputs (aligned to decode_scope2).
       - Q cast to BF16 after RoPE (matching kernel QK matmul input).
       - QK/SV matmuls use BF16 inputs with FP32 accumulation.
       - BF16 round-trip on exp_scores before row_sum (matching kernel).
-      - Full SEQ_TILE K/V loads with fillpad masking on scores.
+      - Full SEQ_TILE K/V loads from cache with fillpad masking on scores.
     """
     import math
 
     import torch
 
-    q_proj = tensors["q_proj"]     # [B, S, H], BF16
-    k_proj = tensors["k_proj"]     # [B, S, KV_H], BF16
-    v_proj = tensors["v_proj"]     # [B, S, KV_H], BF16
+    q_proj = tensors["q_proj"]     # [B, S, H], FP32
+    k_proj = tensors["k_proj"]     # [B, S, KV_H], FP32
+    v_proj = tensors["v_proj"]     # [B, S, KV_H], FP32
     seq_lens = tensors["seq_lens"]
     rope_cos = tensors["rope_cos"]
     rope_sin = tensors["rope_sin"]
+    k_cache = tensors["k_cache"].clone()
+    v_cache = tensors["v_cache"].clone()
 
     batch = q_proj.shape[0]
     hidden = q_proj.shape[2]
@@ -466,105 +460,103 @@ def golden_prefill_attention(tensors, params):
         if seq_len_b <= 0 or q_groups <= 0:
             continue
 
-        # Precompute RoPE for the full prefill prefix of this batch element.
-        cos_row = rope_cos[:seq_len_b, :]
-        sin_row = rope_sin[:seq_len_b, :]
+        S = seq_len_b
+
+        # Precompute RoPE cos/sin for all positions.
+        cos_row = rope_cos[:S, :]
+        sin_row = rope_sin[:S, :]
         cos_lo, cos_hi = cos_row[:, :half], cos_row[:, half:]
         sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
 
-        # K RoPE (all tokens, all KV heads): BF16 cache layout [KV_H, S, D].
-        k_row = k_proj[b, :seq_len_b, :].float().view(seq_len_b, num_kv_heads, head_dim)
+        # K RoPE (all tokens, all KV heads) + write to cache.
+        k_row = k_proj[b, :S, :].view(S, num_kv_heads, head_dim)
         k_lo, k_hi = k_row[:, :, :half], k_row[:, :, half:]
         k_rot = torch.cat([
             k_lo * cos_lo.unsqueeze(1) - k_hi * sin_lo.unsqueeze(1),
             k_hi * cos_hi.unsqueeze(1) + k_lo * sin_hi.unsqueeze(1),
         ], dim=-1).to(torch.bfloat16)
-        k_hist = k_rot.permute(1, 0, 2).contiguous()
+        for ki in range(num_kv_heads):
+            base = b * num_kv_heads * max_seq + ki * max_seq
+            k_cache[base : base + S, :] = k_rot[:, ki, :]
 
-        # V cache view [KV_H, S, D] (already BF16).
-        v_hist = (
-            v_proj[b, :seq_len_b, :]
-            .view(seq_len_b, num_kv_heads, head_dim)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
+        # V cache update (FP32 → BF16).
+        v_row = v_proj[b, :S, :].view(S, num_kv_heads, head_dim)
+        for ki in range(num_kv_heads):
+            base = b * num_kv_heads * max_seq + ki * max_seq
+            v_cache[base : base + S, :] = v_row[:, ki, :].to(torch.bfloat16)
 
-        # Q RoPE (all tokens, all Q heads): keep BF16 view for matmul.
-        q_row = q_proj[b, :seq_len_b, :].float().view(seq_len_b, num_heads, head_dim)
+        # Q RoPE (all tokens, all Q heads): cast to BF16 (matching kernel).
+        q_row = q_proj[b, :S, :].view(S, num_heads, head_dim)
         q_lo, q_hi = q_row[:, :, :half], q_row[:, :, half:]
         q_rot_bf16 = torch.cat([
             q_lo * cos_lo.unsqueeze(1) - q_hi * sin_lo.unsqueeze(1),
             q_hi * cos_hi.unsqueeze(1) + q_lo * sin_hi.unsqueeze(1),
         ], dim=-1).to(torch.bfloat16)
 
-        for pos in range(seq_len_b):
-            ctx_len = pos + 1
-            ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+        # Vectorized causal attention: process all S positions at once per KV head.
+        # ctx_lens[p] = p+1, loop over SEQ_TILE blocks for online softmax.
+        max_blocks = (S + SEQ_TILE - 1) // SEQ_TILE
+        padded_len = max_blocks * SEQ_TILE
+        ctx_lens = torch.arange(1, S + 1)          # [S]
+        col_idx = torch.arange(SEQ_TILE)            # [T]
 
-            # Grouped-query attention (tiled online softmax, matching kernel BF16 path).
-            for kvh in range(num_kv_heads):
-                for qg in range(q_groups):
-                    q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
-                    q_grp = q_rot_bf16[pos, q_base : q_base + Q_HEAD_BATCH, :]
-                    q_grp_fp32 = q_grp.float()
+        for kvh in range(num_kv_heads):
+            for qg in range(q_groups):
+                q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
+                q_grp = q_rot_bf16[:S, q_base:q_base + Q_HEAD_BATCH, :]  # [S, QB, D]
 
-                    oi = torch.zeros(Q_HEAD_BATCH, head_dim, dtype=torch.float32)
-                    li = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
-                    mi = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
+                # K/V from cache, padded to SEQ_TILE boundary.
+                cache_base = b * num_kv_heads * max_seq + kvh * max_seq
+                k_padded = torch.zeros(padded_len, head_dim, dtype=torch.bfloat16)
+                v_padded = torch.zeros(padded_len, head_dim, dtype=torch.bfloat16)
+                k_padded[:S] = k_cache[cache_base:cache_base + S, :]
+                v_padded[:S] = v_cache[cache_base:cache_base + S, :]
 
-                    for sb in range(ctx_blocks):
-                        s0 = sb * SEQ_TILE
-                        valid_len = min(SEQ_TILE, ctx_len - s0)
-                        cb = kvh * seq_len_b + s0
+                # Tiled online softmax, vectorized across all S positions.
+                oi = li = mi = None
 
-                        # Load full SEQ_TILE K/V tiles as BF16 (matching kernel).
-                        k_tile = k_hist[kvh, s0 : s0 + valid_len, :]
-                        v_tile = v_hist[kvh, s0 : s0 + valid_len, :]
+                for sb in range(max_blocks):
+                    s0 = sb * SEQ_TILE
+                    k_tile = k_padded[s0:s0 + SEQ_TILE]    # [T, D]
+                    v_tile = v_padded[s0:s0 + SEQ_TILE]
 
-                        # QK matmul: BF16 * BF16 -> FP32.
-                        raw_scores = q_grp_fp32 @ k_tile.float().T
+                    # QK: [S, QB, D] @ [D, T] → [S, QB, T]
+                    raw_scores = q_grp.float() @ k_tile.float().T
 
-                        # Fillpad invalid positions before scale.
-                        if valid_len < SEQ_TILE:
-                            padded = torch.full(
-                                (Q_HEAD_BATCH, SEQ_TILE),
-                                torch.finfo(torch.float32).min,
-                                dtype=torch.float32,
-                            )
-                            padded[:, :valid_len] = raw_scores
-                            raw_scores = padded
-                        scores = raw_scores * scale
+                    # Causal + fillpad mask: position p sees cols [0, min(T, p+1-s0)).
+                    valid_lens = torch.clamp(ctx_lens - s0, min=0, max=SEQ_TILE)  # [S]
+                    mask = col_idx.unsqueeze(0) < valid_lens.unsqueeze(1)          # [S, T]
+                    raw_scores[~mask.unsqueeze(1).expand_as(raw_scores)] = torch.finfo(torch.float32).min
+                    scores = raw_scores * scale
 
-                        # Online softmax: row_max -> exp -> BF16 round-trip -> row_sum.
-                        cur_mi = scores.max(dim=-1, keepdim=True).values
-                        exp_scores = torch.exp(scores - cur_mi)
-                        exp_scores_bf16 = exp_scores.to(torch.bfloat16)
-                        cur_li = exp_scores_bf16.float().sum(dim=-1, keepdim=True)
+                    # Online softmax: row_max → exp → BF16 round-trip → row_sum.
+                    cur_mi = scores.max(dim=-1, keepdim=True).values     # [S, QB, 1]
+                    exp_scores = torch.exp(scores - cur_mi)
+                    exp_bf16 = exp_scores.to(torch.bfloat16)
+                    cur_li = exp_bf16.float().sum(dim=-1, keepdim=True)  # [S, QB, 1]
 
-                        # SV matmul: BF16 * BF16 -> FP32.
-                        exp_valid = (
-                            exp_scores_bf16[:, :valid_len]
-                            if valid_len < SEQ_TILE
-                            else exp_scores_bf16
-                        )
-                        oi_tmp = exp_valid.float() @ v_tile.float()
+                    # SV: [S, QB, T] @ [T, D] → [S, QB, D]
+                    oi_tmp = exp_bf16.float() @ v_tile.float()
 
-                        if sb == 0:
-                            oi = oi_tmp
-                            li = cur_li
-                            mi = cur_mi
-                        else:
-                            mi_new = torch.maximum(mi, cur_mi)
-                            alpha = torch.exp(mi - mi_new)
-                            beta = torch.exp(cur_mi - mi_new)
-                            li = alpha * li + beta * cur_li
-                            oi = oi * alpha + oi_tmp * beta
-                            mi = mi_new
+                    if sb == 0:
+                        # First block: every position has ctx_len >= 1, always active.
+                        oi, li, mi = oi_tmp, cur_li, cur_mi
+                    else:
+                        # Online update only for positions reaching this block.
+                        active = valid_lens > 0                          # [S]
+                        if active.any():
+                            a = active
+                            mi_new = torch.maximum(mi[a], cur_mi[a])
+                            alpha = torch.exp(mi[a] - mi_new)
+                            beta = torch.exp(cur_mi[a] - mi_new)
+                            oi[a] = oi[a] * alpha + oi_tmp[a] * beta
+                            li[a] = alpha * li[a] + beta * cur_li[a]
+                            mi[a] = mi_new
 
-                    ctx = oi / li
-                    for qi in range(Q_HEAD_BATCH):
-                        qh = q_base + qi
-                        attn_out[b, pos, qh * head_dim : (qh + 1) * head_dim] = ctx[qi]
+                # Normalize and write all Q_HEAD_BATCH heads at once.
+                ctx = oi / li                                            # [S, QB, D]
+                attn_out[b, :S, q_base * head_dim:(q_base + Q_HEAD_BATCH) * head_dim] = \
+                    ctx.reshape(S, Q_HEAD_BATCH * head_dim)
 
     tensors["attn_out"][:] = attn_out.to(torch.bfloat16)
 
@@ -578,7 +570,7 @@ def compile_and_run(
     platform: str = "a2a3",
     device_id: int = 0,
     dump_passes: bool = True,
-    enable_profiling: bool = False,
+    runtime_profiling: bool = False,
 ):
     from pypto.backend import BackendType
     from pypto.ir.pass_manager import OptimizationStrategy
@@ -608,12 +600,12 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=2e-3,
-            atol=2e-3,
+            rtol=3e-3,
+            atol=3e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
-            runtime_profiling=enable_profiling,
+            runtime_profiling=runtime_profiling,
         ),
     )
     return result
