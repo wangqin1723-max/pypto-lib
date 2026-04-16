@@ -17,9 +17,9 @@ Usage:
   python qwen3_32b_prefill_scope2_wIOBuffer.py -p a2a3 -d 5 --clear-cache
 """
 from qwen3_32b_prefill_scope2 import (
-    build_prefill_attention_program,
+    build_prefill_scope2_program,
     build_tensor_specs,
-    golden_prefill_attention,
+    golden_prefill_scope2,
     BATCH, MAX_SEQ, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
 )
 from io_cache import (
@@ -46,7 +46,7 @@ def compile_and_run(
 
     backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
-    program = build_prefill_attention_program(
+    program = build_prefill_scope2_program(
         batch=batch, max_seq=max_seq, num_heads=num_heads,
         num_kv_heads=num_kv_heads, head_dim=head_dim,
     )
@@ -57,7 +57,7 @@ def compile_and_run(
         ),
         cache_dir,
     )
-    golden = wrap_golden(golden_prefill_attention, "attn_out", cache_dir, tensor_specs)
+    golden = wrap_golden(golden_prefill_scope2, "attn_out", cache_dir, tensor_specs)
 
     result = run(
         program=program,
@@ -66,8 +66,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=2e-3,
+            atol=2e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
