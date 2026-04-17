@@ -83,7 +83,7 @@ def build_prefill_projection_program(
                     normed_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
 
                     # Stage 1: RMSNorm (vector ops).
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         partial_sq = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -122,10 +122,10 @@ def build_prefill_projection_program(
                             normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
                     # Stage 2: Q projection (matmul + matmul_acc, FP32 output).
-                    for ob in pl.range(q_out_blocks):
-                        q0 = ob * Q_OUT_CHUNK
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                        for ob in pl.parallel(q_out_blocks, chunk=4):
+                            q0 = ob * Q_OUT_CHUNK
 
-                        with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
                             q_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
@@ -137,11 +137,11 @@ def build_prefill_projection_program(
 
                             q_proj = pl.assemble(q_proj, q_acc, [b, p0, q0])
 
-                    # Stage 3: K projection (same pattern, KV_OUT_CHUNK width).
-                    for ob in pl.range(kv_out_blocks):
-                        kv0 = ob * KV_OUT_CHUNK
+                    # Stage 3: K/V projection (matmul + matmul_acc in single incore).
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                        for ob in pl.parallel(kv_out_blocks, chunk=4):
+                            kv0 = ob * KV_OUT_CHUNK
 
-                        with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                             k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
@@ -153,11 +153,6 @@ def build_prefill_projection_program(
 
                             k_proj = pl.assemble(k_proj, k_acc, [b, p0, kv0])
 
-                    # Stage 4: V projection (same pattern, KV_OUT_CHUNK width).
-                    for ob in pl.range(kv_out_blocks):
-                        kv0 = ob * KV_OUT_CHUNK
-
-                        with pl.incore():
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                             v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)

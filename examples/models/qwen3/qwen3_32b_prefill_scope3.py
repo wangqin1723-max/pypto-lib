@@ -73,7 +73,7 @@ def build_prefill_scope3_program(
                     attn_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
 
                     # Stage 1: Copy attn_out 3D -> attn_tile 2D.
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
                             a_chunk_fp32 = pl.reshape(
@@ -88,7 +88,7 @@ def build_prefill_scope3_program(
                             attn_tile = pl.assemble(attn_tile, a_chunk_bf16, [0, k0])
 
                     # Stage 2: Initialize resid1_tile accumulator.
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                         for ob in pl.parallel(0, q_out_blocks, chunk=8):
                             o0 = ob * Q_OUT_CHUNK
                             zero_resid1 = pl.full([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
@@ -99,7 +99,7 @@ def build_prefill_scope3_program(
                         o0 = ob * Q_OUT_CHUNK
 
                         # Cube: chained matmul.
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
                             o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
@@ -112,7 +112,7 @@ def build_prefill_scope3_program(
                             resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
 
                         # Vector: add residual.
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             resid_chunk = pl.reshape(
                                 pl.cast(
                                     pl.slice(hidden_states, [1, TOK_TILE, Q_OUT_CHUNK], [b, p0, o0],
@@ -128,7 +128,7 @@ def build_prefill_scope3_program(
                     # Stage 4: Post-attention RMSNorm.
                     post_norm_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
                     down_fp32_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                         sq_sum = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -159,7 +159,7 @@ def build_prefill_scope3_program(
                         o0 = ob * MLP_OUT_CHUNK
 
                         # Gate matmul chain.
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                             gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
@@ -170,7 +170,7 @@ def build_prefill_scope3_program(
                                 gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
 
                         # Up matmul chain.
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                             up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
@@ -181,7 +181,7 @@ def build_prefill_scope3_program(
                                 up_acc = pl.matmul_acc(up_acc, pci, wui)
 
                         # SiLU activation.
-                        with pl.auto_incore():
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
@@ -190,11 +190,11 @@ def build_prefill_scope3_program(
                         for dob in pl.range(hidden_blocks):
                             d0 = dob * K_CHUNK
 
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
                                 down_next = pl.matmul(mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
 
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 down_prev = pl.slice(down_fp32_tile, [TOK_TILE, K_CHUNK], [0, d0])
                                 accum = pl.add(down_prev, down_next)
                                 down_fp32_tile = pl.assemble(down_fp32_tile, accum, [0, d0])
@@ -202,7 +202,7 @@ def build_prefill_scope3_program(
                     # Stage 6: Final residual add -> BF16 output.
                     for ob in pl.range(hidden_blocks):
                         o0 = ob * K_CHUNK
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             final_sum = pl.add(
                                 pl.slice(down_fp32_tile, [TOK_TILE, K_CHUNK], [0, o0]),
                                 pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, o0]),
