@@ -23,6 +23,7 @@ class _CachePool:
     num_layers: int
     num_kv_heads: int
     head_dim: int
+    max_blocks_per_seq: int
     key_pages: torch.Tensor
     value_pages: torch.Tensor
     free_pages: list[int]
@@ -35,9 +36,9 @@ class KvCacheManager:
     def register_model(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
         if model_id in self._pools:
             return
+        max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
         num_pages = runtime.total_kv_pages
         if num_pages is None:
-            max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
             num_pages = runtime.max_batch_size * max_blocks_per_seq
         kv_dtype = getattr(torch, runtime.kv_dtype)
         key_pages = torch.zeros(
@@ -55,6 +56,7 @@ class KvCacheManager:
             num_layers=config.num_hidden_layers,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
+            max_blocks_per_seq=max_blocks_per_seq,
             key_pages=key_pages,
             value_pages=value_pages,
             free_pages=list(range(num_pages - 1, -1, -1)),
@@ -88,6 +90,26 @@ class KvCacheManager:
         for row, alloc in enumerate(allocations):
             if alloc.page_ids:
                 table[row, : len(alloc.page_ids)] = torch.tensor(alloc.page_ids, dtype=torch.int32)
+        return table
+
+    def block_table_for_batch_padded(self, allocations: list[KvAllocation]) -> torch.Tensor:
+        """Return a flat ``[B * max_blocks_per_seq]`` block table, -1 padded.
+
+        This matches the paged-attention layout the bundled fused decode kernel
+        expects: row ``b`` occupies ``[b * max_blocks_per_seq, (b+1) * max_blocks_per_seq)``,
+        with unused trailing slots set to -1.
+        """
+        if not allocations:
+            return torch.empty((0,), dtype=torch.int32)
+        pool = self._pool(allocations[0].model_id)
+        max_blocks = pool.max_blocks_per_seq
+        table = torch.full((len(allocations) * max_blocks,), -1, dtype=torch.int32)
+        for row, alloc in enumerate(allocations):
+            if alloc.page_ids:
+                row_start = row * max_blocks
+                table[row_start : row_start + len(alloc.page_ids)] = torch.tensor(
+                    alloc.page_ids, dtype=torch.int32,
+                )
         return table
 
     def slot_mapping_for_request(self, alloc: KvAllocation, token_index: int | None = None) -> int:

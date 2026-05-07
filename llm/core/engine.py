@@ -233,9 +233,9 @@ class LLMEngine:
                             device=runtime_model.runtime.device,
                         ),
                         kv_allocations=active_allocations,
-                        block_table=self._kv_cache_manager.block_table_for_batch(active_allocations).to(
-                            runtime_model.runtime.device
-                        ),
+                        block_table=self._kv_cache_manager.block_table_for_batch_padded(
+                            active_allocations
+                        ).to(runtime_model.runtime.device),
                         slot_mapping=self._kv_cache_manager.slot_mapping_for_batch(active_allocations).to(
                             runtime_model.runtime.device
                         ),
@@ -337,7 +337,7 @@ class LLMEngine:
                             device=runtime_model.runtime.device,
                         ),
                         kv_allocations=[alloc],
-                        block_table=self._kv_cache_manager.block_table_for_batch([alloc]).to(
+                        block_table=self._kv_cache_manager.block_table_for_batch_padded([alloc]).to(
                             runtime_model.runtime.device
                         ),
                         slot_mapping=self._kv_cache_manager.slot_mapping_for_batch([alloc]).to(

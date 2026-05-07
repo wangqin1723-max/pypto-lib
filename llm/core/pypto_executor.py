@@ -112,6 +112,7 @@ class _CompiledKernels:
     padded_vocab: int
     padded_lm_head_weight: torch.Tensor
     layers: list[_KernelLayerWeights]
+    decode_weights: dict[str, torch.Tensor]
 
 
 @dataclass
@@ -156,6 +157,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         compiled = self._compiled[model.config.model_id]
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
         hidden = prefill_inputs.hidden
+        t_prefill_start = time.perf_counter()
 
         for layer_idx, layer in enumerate(compiled.layers):
             k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
@@ -205,40 +207,44 @@ class PyptoQwen14BExecutor(ModelExecutor):
         return PrefillResult(last_hidden=last_hidden, logits=logits)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        # The fused decode kernel (qwen3_14b_decode_full.py) processes all
+        # layers in one call: weights are pre-stacked into [num_layers * ...]
+        # tensors at compile time and the KV cache is the full multi-layer
+        # buffer. Argument order mirrors the kernel signature in
+        # build_qwen3_decode_program.qwen3_decode.
         compiled = self._compiled[model.config.model_id]
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
+        dw = compiled.decode_weights
 
-        for layer_idx, layer in enumerate(compiled.layers):
-            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
-                model.config.model_id,
-                layer_idx,
-            )
-            out = torch.zeros_like(hidden)
-            compiled.decode(
-                hidden,
-                layer.input_rms_weight,
-                layer.wq,
-                layer.wk,
-                layer.wv,
-                layer.q_norm_weight,
-                layer.k_norm_weight,
-                decode_inputs.seq_lens,
-                decode_inputs.block_table,
-                decode_inputs.slot_mapping,
-                compiled.rope_cos,
-                compiled.rope_sin,
-                k_cache,
-                v_cache,
-                layer.wo,
-                layer.post_rms_weight,
-                layer.w_gate,
-                layer.w_up,
-                layer.w_down,
-                out,
-                config=self._run_config(codegen_only=False),
-            )
-            hidden = out
+        k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
+            model.config.model_id,
+        )
+        out = torch.zeros_like(hidden)
+
+        compiled.decode(
+            hidden,
+            dw["decode_input_rms_weight"],
+            dw["decode_wq"],
+            dw["decode_wk"],
+            dw["decode_wv"],
+            dw["decode_q_norm_weight"],
+            dw["decode_k_norm_weight"],
+            decode_inputs.seq_lens,
+            decode_inputs.block_table,
+            decode_inputs.slot_mapping,
+            compiled.rope_cos,
+            compiled.rope_sin,
+            k_cache,
+            v_cache,
+            dw["decode_wo"],
+            dw["decode_post_rms_weight"],
+            dw["decode_w_gate"],
+            dw["decode_w_up"],
+            dw["decode_w_down"],
+            out,
+            config=self._run_config(codegen_only=False),
+        )
 
         final_hidden = out.float()
         logits = self._project_logits(model, final_hidden)
@@ -320,7 +326,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             self._release_layer_weights(layer)
         final_norm_weight = model.final_norm_weight.view(1, -1).float().cpu()
 
-        decode_weights = self._stack_decode_weights(model)
+        decode_weights = self._stack_decode_weights(layers)
 
         return _CompiledKernels(
             prefill=prefill,
@@ -333,35 +339,32 @@ class PyptoQwen14BExecutor(ModelExecutor):
             padded_vocab=padded_vocab,
             padded_lm_head_weight=padded_lm_head_weight,
             layers=layers,
+            decode_weights=decode_weights,
         )
 
-    def _stack_decode_weights(self, model: RuntimeModel) -> dict[str, torch.Tensor]:
-        layers = model.layers
-
-        def stack_kernel_weight(attr: str) -> torch.Tensor:
-            return torch.cat(
-                [self._kernel_weight(getattr(layer, attr)) for layer in layers],
-                dim=0,
-            )
-
-        def stack_norm_weight(attr: str) -> torch.Tensor:
-            return torch.cat(
-                [getattr(layer, attr).view(1, -1).float().cpu() for layer in layers],
-                dim=0,
-            ).contiguous()
+    @staticmethod
+    def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
+        # Stack from already-prepared per-layer kernel weights. Each
+        # _KernelLayerWeights field is already in the kernel-ready shape/dtype
+        # (transposed bf16 cpu for projections, [1, N] float cpu for norms),
+        # so a plain cat along dim 0 is all that's left. Reading from the
+        # original model.layers here would crash because _release_layer_weights
+        # has already replaced those tensors with torch.empty(0).
+        def cat(attr: str) -> torch.Tensor:
+            return torch.cat([getattr(l, attr) for l in layers], dim=0)
 
         return {
-            "decode_input_rms_weight": stack_norm_weight("input_rms_weight"),
-            "decode_wq": stack_kernel_weight("wq"),
-            "decode_wk": stack_kernel_weight("wk"),
-            "decode_wv": stack_kernel_weight("wv"),
-            "decode_q_norm_weight": stack_norm_weight("q_norm_weight"),
-            "decode_k_norm_weight": stack_norm_weight("k_norm_weight"),
-            "decode_wo": stack_kernel_weight("wo"),
-            "decode_post_rms_weight": stack_norm_weight("post_rms_weight"),
-            "decode_w_gate": stack_kernel_weight("w_gate"),
-            "decode_w_up": stack_kernel_weight("w_up"),
-            "decode_w_down": stack_kernel_weight("w_down"),
+            "decode_input_rms_weight": cat("input_rms_weight").contiguous(),
+            "decode_wq":               cat("wq"),
+            "decode_wk":               cat("wk"),
+            "decode_wv":               cat("wv"),
+            "decode_q_norm_weight":    cat("q_norm_weight").contiguous(),
+            "decode_k_norm_weight":    cat("k_norm_weight").contiguous(),
+            "decode_wo":               cat("wo"),
+            "decode_post_rms_weight":  cat("post_rms_weight").contiguous(),
+            "decode_w_gate":           cat("w_gate"),
+            "decode_w_up":             cat("w_up"),
+            "decode_w_down":           cat("w_down"),
         }
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
