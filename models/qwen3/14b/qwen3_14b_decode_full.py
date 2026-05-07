@@ -68,7 +68,7 @@ BATCH_TILE = 16
 # Qwen3-14B uses 40 Q heads and 8 KV heads, so q_per_kv = 5.
 Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16
-SEQ_TILE = 64
+SEQ_TILE = 256
 SB_BATCH = 64
 BLOCK_SIZE = SEQ_TILE
 
@@ -159,7 +159,7 @@ def build_qwen3_decode_program(
                         )
                         current_hidden = pl.assemble(current_hidden, hidden_chunk, [b0, k0])
 
-            for layer_idx in pl.unroll(num_layers):
+            for layer_idx in pl.range(num_layers):
                 layer_hidden_base = layer_idx * hidden
                 layer_inter_base = layer_idx * inter
                 layer_cache_base = layer_idx * layer_cache_rows
@@ -1034,7 +1034,7 @@ if __name__ == "__main__":
             max_seq=args.max_seq,
             num_layers=args.num_layers,
         ),
-        tensor_specs=build_tensor_specs(
+        specs=build_tensor_specs(
             batch=args.batch,
             max_seq=args.max_seq,
             num_layers=args.num_layers,
