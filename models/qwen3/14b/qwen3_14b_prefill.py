@@ -558,7 +558,7 @@ def build_tensor_specs(
     use_max_seq: bool = False,
 ):
     import torch
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     # Host allocates every batch-dependent tensor at the user-visible
     # batch (no host pad / no host trim). The kernel signature uses
