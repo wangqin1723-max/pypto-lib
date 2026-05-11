@@ -121,6 +121,26 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          # Layer-count sweep for qwen3-14b-decode_full: 1L is strict (catches
+          # single-layer kernel regressions), 10L medium, 40L permissive (the
+          # default --num-layers covers 40L via the `find models` loop above).
+          # Tighter pass_rate on small layer counts catches systematic bias
+          # before it gets diluted by the multi-layer average.
+          QWEN3_14B_FULL="models/qwen3/14b/qwen3_14b_decode_full.py"
+          for spec in "1:1.0" "10:0.999"; do
+            N="${spec%%:*}"; PR="${spec##*:}"
+            case_name="${QWEN3_14B_FULL}[num_layers=${N},pass_rate=${PR}]"
+            echo "::group::${case_name}"
+            if ! timeout --kill-after=10s 600s python "${QWEN3_14B_FULL}" \
+                -p ${{ matrix.platform }} --num-layers "${N}" --pass-rate "${PR}"; then
+              failed="$failed ${case_name}"
+              echo "::error file=${QWEN3_14B_FULL}::FAIL (num_layers=${N}, pass_rate=${PR})"
+              printf '%s\tfail\n' "${case_name}" >> results.tsv
+            else
+              printf '%s\tpass\n' "${case_name}" >> results.tsv
+            fi
+            echo "::endgroup::"
+          done
           if [ -n "$failed" ]; then
             echo "Failed cases:"
             for f in $failed; do echo "  - $f"; done
@@ -276,6 +296,26 @@ jobs:
             if ! timeout --kill-after=10s 600s python "${QWEN3_14B}" -p a2a3 -d $DEVICE_ID --batch "${B}"; then
               failed="$failed ${case_name}"
               echo "::error file=${QWEN3_14B}::FAIL (batch=${B})"
+              printf '%s\tfail\n' "${case_name}" >> results.tsv
+            else
+              printf '%s\tpass\n' "${case_name}" >> results.tsv
+            fi
+            echo "::endgroup::"
+          done
+          # Layer-count sweep for qwen3-14b-decode_full: 1L is strict (catches
+          # single-layer kernel regressions), 10L medium, 40L permissive (the
+          # default --num-layers covers 40L via the `find models` loop above).
+          # Tighter pass_rate on small layer counts catches systematic bias
+          # before it gets diluted by the multi-layer average.
+          QWEN3_14B_FULL="models/qwen3/14b/qwen3_14b_decode_full.py"
+          for spec in "1:1.0" "10:0.999"; do
+            N="${spec%%:*}"; PR="${spec##*:}"
+            case_name="${QWEN3_14B_FULL}[num_layers=${N},pass_rate=${PR}]"
+            echo "::group::${case_name}"
+            if ! timeout --kill-after=10s 600s python "${QWEN3_14B_FULL}" \
+                -p a2a3 -d $DEVICE_ID --num-layers "${N}" --pass-rate "${PR}"; then
+              failed="$failed ${case_name}"
+              echo "::error file=${QWEN3_14B_FULL}::FAIL (num_layers=${N}, pass_rate=${PR})"
               printf '%s\tfail\n' "${case_name}" >> results.tsv
             else
               printf '%s\tpass\n' "${case_name}" >> results.tsv
