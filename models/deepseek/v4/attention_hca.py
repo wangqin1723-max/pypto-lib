@@ -62,20 +62,10 @@ CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO  # matches compressor_ratio128 kv_cache 2nd-dim contract
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
-START_POS = 127      # ScalarSpec default; (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
-# Single-decode-step JIT specialization. The inline compressor bakes its
-# SCATTER_SLOT / APE_ROW from compile-time START_POS, so runtime start_pos
-# MUST equal START_POS, and (START_POS+1)%COMPRESS_RATIO MUST be 0. Caller
-# (engine) enforces both: re-JIT with fresh START_POS each compression step,
-# route non-compression steps to a SWA-style orchestration. The assert below
-# only checks the test fixture; pypto has no runtime branch/abort to enforce
-# the contract from the runtime start_pos.
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
-assert SHOULD_COMPRESS, (
-    f"Test fixture: START_POS={START_POS}, COMPRESS_RATIO={COMPRESS_RATIO}; "
-    "need (START_POS+1) % COMPRESS_RATIO == 0."
-)
-
+# Non-compression-step fixture: (START_POS + 1) % COMPRESS_RATIO != 0.
+# Warmup positions before the first compressed slot are supported; seqused_kv
+# bounds the valid compressed topk range.
+START_POS = 128
 # tiling
 Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
@@ -130,9 +120,10 @@ def attention_hca(
     cmp_rotate: pl.Scalar[pl.BOOL],  # always False on the ratio=128 path; threaded through for the compressor inline contract
 ):
     """HCA decode orchestration for compress_ratio=128. Caller contract:
-    runtime ``start_pos`` MUST equal compile-time ``START_POS`` AND
-    ``(START_POS+1) % COMPRESS_RATIO`` MUST be 0. See module header.
+    runtime ``start_pos`` MUST equal compile-time ``START_POS``.
     """
+    compress_rem = (start_pos + 1) % COMPRESS_RATIO
+
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -163,21 +154,30 @@ def attention_hca(
         rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
         rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
 
-    # Compressor RoPE row at start_pos + 1 - ratio; half-vector layout.
-    # Module-level `assert SHOULD_COMPRESS` guarantees (start_pos+1) is a positive multiple
-    # of COMPRESS_RATIO, so cmp_pos = start_pos + 1 - ratio is always >= 0.
+    # Compressor RoPE is only consumed on compression steps. Warmup positions
+    # before the first compressed slot keep a zero placeholder to avoid a
+    # negative table row.
     cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
-        cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
-        cmp_cos = pl.col_expand(
-            pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
-        )
-        cmp_sin = pl.col_expand(
-            pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
-        )
+    if start_pos + 1 >= COMPRESS_RATIO:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
+            cmp_cos_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+            cmp_sin_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos = pl.col_expand(
+                cmp_cos_base,
+                pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
+            )
+            cmp_sin = pl.col_expand(
+                cmp_sin_base,
+                pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
+            )
+    else:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope_zero"):
+            zero_cos = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
+            zero_sin = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
+            cmp_cos = pl.sub(zero_cos, zero_cos)
+            cmp_sin = pl.sub(zero_sin, zero_sin)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -205,9 +205,9 @@ def attention_hca(
     # ori_kv scatter at slot = start_pos % WIN.
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_scatter_ori"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_ori"):
         ori_slot = start_pos % WIN
-        for b in pl.parallel(0, B, 1, chunk=1):
+        for b in pl.parallel(0, B, 1):
             blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
             dst_row = blk_id * BLOCK_SIZE + ori_slot
             kv_cache_flat = pl.assemble(
@@ -244,30 +244,29 @@ def attention_hca(
         cmp_rotate,
     )
 
-    # cmp_kv scatter — emitted unconditionally because the module-level
-    # `assert SHOULD_COMPRESS` constrains this orchestration to compression-step
-    # invocations only; non-compression steps must dispatch elsewhere.
-    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
-    cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_scatter_cmp"):
-        cmp_slot_rel = start_pos // COMPRESS_RATIO
-        cmp_intra = cmp_slot_rel % BLOCK_SIZE
-        cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
-        for b in pl.parallel(0, B, 1, chunk=1):
-            cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
-            cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-            cmp_src_row = b * IDX_KV_LEN + cmp_slot_rel
-            cmp_kv_flat = pl.assemble(
-                cmp_kv_flat,
-                cmp_kv_buf_flat[cmp_src_row:cmp_src_row + 1, 0:HEAD_DIM],
-                [cmp_dst_row, 0],
-            )
-    cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+    # cmp_kv scatter only happens on compression steps. Non-compression steps
+    # update compressor state but keep the existing compressed cache intact.
+    if compress_rem == 0:
+        cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+        cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
+        cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_cmp"):
+            cmp_slot_rel = start_pos // COMPRESS_RATIO
+            cmp_intra = cmp_slot_rel % BLOCK_SIZE
+            cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
+            for b in pl.parallel(0, B, 1):
+                cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
+                cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+                cmp_src_row = b * IDX_KV_LEN + cmp_slot_rel
+                cmp_kv_flat = pl.assemble(
+                    cmp_kv_flat,
+                    cmp_kv_buf_flat[cmp_src_row:cmp_src_row + 1, 0:HEAD_DIM],
+                    [cmp_dst_row, 0],
+                )
+        cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
-    # topk_idxs: [0..WIN) window ⧺ [WIN..WIN+CMP_TOPK) deterministic compressed.
+    # topk_idxs: [0..WIN) window plus deterministic compressed slots.
     # sparse_attn's static TOPK contract is SPARSE_TOPK (= WIN+IDX_TOPK = 640 in demo);
-    # HCA only fills the first WIN+CMP_TOPK=160 slots and pads the rest with -1.
     # The actual valid count is bounded by seqused_kv inside sparse_attn.
     topk_idxs = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_topk"):
@@ -409,9 +408,6 @@ def golden_attention_hca(tensors):
     rd = ROPE_HEAD_DIM
     should_compress = ((start_pos + 1) % ratio) == 0
 
-    if start_pos == 0:
-        return  # prefill — decode-only orchestration skips
-
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
     step_cos = freqs_cos[start_pos:start_pos + 1]                            # [1, rd]
@@ -419,8 +415,12 @@ def golden_attention_hca(tensors):
     rope_cos_T = step_cos.expand(T, rd).contiguous()
     rope_sin_T = step_sin.expand(T, rd).contiguous()
     half_rd = rd // 2
-    cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
-    cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]
+    if start_pos + 1 >= ratio:
+        cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
+        cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]
+    else:
+        cmp_cos = torch.zeros(1, half_rd, dtype=torch.bfloat16)
+        cmp_sin = torch.zeros(1, half_rd, dtype=torch.bfloat16)
 
     # q + win kv (W8A8 q_proj)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)

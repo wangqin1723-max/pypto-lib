@@ -101,15 +101,10 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 ROTATE_MAIN = False
 ROTATE_INNER = True
 
-# Use a full-window compression-step fixture so sparse_attn exercises both the
-# window and compressed paths without partial-window special casing.
+# Keep the default fixture on a full-window compression step so sparse_attn
+# exercises both the window and compressed paths. Warmup positions before the
+# first compressed slot are also supported when START_POS is lowered.
 START_POS = 127
-SHOULD_COMPRESS = ((START_POS + 1) % COMPRESS_RATIO) == 0
-assert SHOULD_COMPRESS and START_POS >= WIN - 1, (
-    f"CSA fixture requires a full-window compression step; got START_POS={START_POS}, "
-    f"COMPRESS_RATIO={COMPRESS_RATIO}, WIN={WIN}."
-)
-CSA_CMP_VALID_TOPK = min(IDX_TOPK, (START_POS + S) // COMPRESS_RATIO)
 
 @pl.jit.inline
 def attention_csa(
@@ -161,6 +156,8 @@ def attention_csa(
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],
 ):
+    compress_rem = (start_pos + 1) % COMPRESS_RATIO
+
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -182,7 +179,6 @@ def attention_csa(
     cmp_sin = pl.create_tensor([1, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         pos = pl.cast(start_pos, pl.INDEX)
-        cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
         cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
         sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
         rope_cos_fp32 = pl.col_expand(
@@ -203,14 +199,20 @@ def attention_csa(
             pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [pos, 0]), target_type=pl.FP32),
         )
-        cmp_cos = pl.col_expand(
-            pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
-        )
-        cmp_sin = pl.col_expand(
-            pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
-        )
+        cmp_cos_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
+        cmp_sin_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
+        cmp_cos = cmp_cos_base
+        cmp_sin = cmp_sin_base
+        if start_pos + 1 >= COMPRESS_RATIO:
+            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos = pl.col_expand(
+                cmp_cos_base,
+                pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
+            )
+            cmp_sin = pl.col_expand(
+                cmp_sin_base,
+                pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
+            )
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -269,18 +271,19 @@ def attention_csa(
         ROTATE_MAIN,
     )
 
-    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_cmp"):
-        cmp_slot_rel = start_pos // COMPRESS_RATIO
-        cmp_intra = cmp_slot_rel % BLOCK_SIZE
-        cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
-        for b in pl.parallel(B):
-            cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
-            cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-            cmp_row = pl.cast(pl.reshape(cmp_out[b:b + 1, 0:1, 0:HEAD_DIM], [1, HEAD_DIM]), target_type=pl.BF16)
-            cmp_kv_flat = pl.assemble(cmp_kv_flat, cmp_row, [cmp_dst_row, 0])
-    cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+    if compress_rem == 0:
+        cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+        cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_cmp"):
+            cmp_slot_rel = start_pos // COMPRESS_RATIO
+            cmp_intra = cmp_slot_rel % BLOCK_SIZE
+            cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
+            for b in pl.parallel(B):
+                cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
+                cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+                cmp_row = pl.cast(pl.reshape(cmp_out[b:b + 1, 0:1, 0:HEAD_DIM], [1, HEAD_DIM]), target_type=pl.BF16)
+                cmp_kv_flat = pl.assemble(cmp_kv_flat, cmp_row, [cmp_dst_row, 0])
+        cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
@@ -322,23 +325,8 @@ def attention_csa(
             invalid_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, invalid_row, [t_idx, 0])
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, window_row, [t_idx, 0])
-            # Indexer top-k order is tie-sensitive; sparse attention is not.
-            # Canonicalize the valid compressed tail so device/golden consume
-            # the same reduction order when they selected the same cache set.
-            cmp_topk_valid = pl.slice(idx_topk_flat, [1, CSA_CMP_VALID_TOPK], [t_idx, 0])
-            cmp_topk_sort_key = pl.neg(pl.cast(cmp_topk_valid, target_type=pl.FP32))
-            cmp_topk_sort_idx = pl.tensor.arange(0, [1, CSA_CMP_VALID_TOPK], dtype=pl.UINT32)
-            cmp_topk_sorted_pairs = pl.tensor.sort32(cmp_topk_sort_key, cmp_topk_sort_idx)
-            cmp_topk_sorted_neg = pl.tensor.gather(
-                cmp_topk_sorted_pairs,
-                mask_pattern=pl.tile.MaskPattern.P0101,
-            )
-            cmp_topk_sorted = pl.cast(
-                pl.neg(cmp_topk_sorted_neg),
-                target_type=pl.INT32,
-                mode="rint",
-            )
-            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk_sorted, [t_idx, WIN])
+            cmp_topk = pl.slice(idx_topk_flat, [1, IDX_TOPK], [t_idx, 0])
+            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk, [t_idx, WIN])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     attn_out = sparse_attn(
@@ -609,8 +597,6 @@ def golden_attention_csa(tensors):
     })
 
     start_pos = int(tensors["start_pos"])
-    if start_pos == 0:
-        return
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
@@ -618,8 +604,12 @@ def golden_attention_csa(tensors):
     rope_sin_t = freqs_sin[start_pos:start_pos + 1].expand(T, ROPE_HEAD_DIM).contiguous()
     step_cos = freqs_cos[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
     step_sin = freqs_sin[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
-    cmp_cos = freqs_cos[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
-    cmp_sin = freqs_sin[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+    if start_pos + 1 >= COMPRESS_RATIO:
+        cmp_cos = freqs_cos[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+        cmp_sin = freqs_sin[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+    else:
+        cmp_cos = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
+        cmp_sin = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
@@ -673,11 +663,12 @@ def golden_attention_csa(tensors):
         "start_pos": tensors["start_pos"],
         "rotate": False,
     })
-    cmp_slot_rel = start_pos // COMPRESS_RATIO
-    for b in range(B):
-        blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
-        intra = cmp_slot_rel % BLOCK_SIZE
-        cmp_kv[blk_id, intra, 0] = cmp_out[b, 0].to(torch.bfloat16)
+    if (start_pos + 1) % COMPRESS_RATIO == 0:
+        cmp_slot_rel = start_pos // COMPRESS_RATIO
+        for b in range(B):
+            blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
+            intra = cmp_slot_rel % BLOCK_SIZE
+            cmp_kv[blk_id, intra, 0] = cmp_out[b, 0].to(torch.bfloat16)
 
     idx_kv = torch.zeros(B, S, IDX_HEAD_DIM, dtype=torch.float32)
     idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
@@ -711,10 +702,7 @@ def golden_attention_csa(tensors):
 
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     sparse_topk[:, :WIN] = torch.arange(WIN, dtype=torch.int32)
-    sparse_topk[:, WIN:WIN + CSA_CMP_VALID_TOPK] = torch.sort(
-        idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :CSA_CMP_VALID_TOPK],
-        dim=-1,
-    ).values
+    sparse_topk[:, WIN:WIN + IDX_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :IDX_TOPK]
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_sparse_attn_online({
@@ -930,7 +918,9 @@ def build_tensor_specs():
         return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
 
     def init_seqused_kv():
-        return torch.full((B,), WIN + ((START_POS + 1) // COMPRESS_RATIO), dtype=torch.int32)
+        win_valid = min(WIN, START_POS + 1)
+        cmp_valid = (START_POS + 1) // COMPRESS_RATIO
+        return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
 
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
