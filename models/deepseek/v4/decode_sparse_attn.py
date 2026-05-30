@@ -220,7 +220,13 @@ def sparse_attn(
                 n_col = n_hh * HEAD_DIM
                 o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
-    # Inverse RoPE: deinterleave even/odd lanes, rotate with cos/sin, reinterleave.
+    # Inverse RoPE: gather even/odd lanes (HW native TGATHER<mask>) for de-interleave,
+    # rotate with cos/sin, then matmul-based re-interleave back to interleaved layout.
+    # Note: tried scatter index-form re-interleave (commit history) — it caused ~11%
+    # precision FAIL on attn_out vs the matmul re-interleave baseline, even with an
+    # explicit BF16 round-trip on the rotated values. ratio128's gather+scatter is
+    # safe because its golden compares FP32; sparse_attn's golden ends in BF16 cast
+    # which amplifies the scatter-vs-matmul precision delta. Keep matmul re-interleave.
     rope_even_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     rope_odd_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
@@ -230,12 +236,11 @@ def sparse_attn(
             r_row = r_t * H
 
             for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-                # Split interleaved rope lanes into even and odd halves.
-                r_tile = attn_rope_stage[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE]
-                r_even = pl.matmul(r_tile, even_select_local, out_dtype=pl.FP32)
-                r_odd = pl.matmul(r_tile, odd_select_local, out_dtype=pl.FP32)
+                # gather_mask requires FP/INT (not BF16): cast BF16 tile to FP32 first.
+                r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
+                r_even = pl.tensor.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+                r_odd = pl.tensor.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
 
-                # Rotate the even/odd halves with cos/sin.
                 r_cos = pl.cast(freqs_cos[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
                 r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
                 r_even_rot = pl.add(pl.col_expand_mul(r_even, r_cos), pl.col_expand_mul(r_odd, r_sin))
@@ -243,7 +248,8 @@ def sparse_attn(
                 r_even_bf16 = pl.cast(r_even_rot, target_type=pl.BF16, mode="rint")
                 r_odd_bf16 = pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint")
 
-                # Reinterleave the rotated halves back to rope-lane order.
+                # Re-interleave via matmul (precision-stable). Each writes half-zero;
+                # rope_pack adds them.
                 r_even_il = pl.matmul(r_even_bf16, even_select_local, b_trans=True, out_dtype=pl.FP32)
                 r_odd_il = pl.matmul(r_odd_bf16, odd_select_local, b_trans=True, out_dtype=pl.FP32)
                 rope_even_buf[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE] = r_even_il
@@ -259,6 +265,7 @@ def sparse_attn(
             rp_row = rp_t * H + rp_g * HEADS_PER_GROUP
 
             # Merge and write only this group's inverse-RoPE tail of o_packed.
+            # Merge two half-zero bufs from the matmul re-interleave and cast to BF16.
             rp_even = rope_even_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
             rp_odd = rope_odd_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
             rp_full = pl.cast(pl.add(rp_even, rp_odd), target_type=pl.BF16)

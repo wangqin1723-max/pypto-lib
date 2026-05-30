@@ -41,6 +41,11 @@ QUANT_TILE = 32
 T_TILE = 8
 QPROJ_T_TILE = 16
 KV_RMS_T_TILE = 16
+# Per-T-chunk for the fused gather-rotate-scatter scopes. Caps Vec UB usage:
+# rope_buf [TILE, ROPE_DIM] FP32 + 3 INT32 index tiles + working FP32 tiles fit
+# the 192 KB Vec UB only when TILE keeps the scope under ~150 KB at T=128.
+Q_ROPE_T_TILE = 32
+KV_ROPE_T_TILE = 32
 
 
 @pl.jit.inline
@@ -187,49 +192,51 @@ def qkv_proj_rope(
                 q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
                 q_flat[:, h0 + n0 : h0 + n0 + HEAD_TILE] = pl.cast(q_normed, target_type=pl.BF16, mode="rint")
 
-    q_rope_pair_stage = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.BF16)
-    for hg_idx in pl.spmd(H // 8, name_hint="q_head_rope"):
+    # Per-head RoPE rotation: gather-rotate-scatter into a per-head FP32 stage
+    # (mirrors compressor's normed_kv intermediate), then the original-style
+    # writeback scope casts FP32 -> BF16 and copies into q_flat.
+    q_rope_stage_fp32 = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.FP32)
+    for hg_idx in pl.spmd(H // 8, name_hint="q_head_rope_fused"):
         hg = hg_idx * 8
-        q_head_inv_rms_t = pl.create_tensor([T, 1], dtype=pl.FP32)
-        rope_cos_fp32 = pl.cast(rope_cos[:, :ROPE_HALF], target_type=pl.FP32)
-        rope_sin_fp32 = pl.cast(rope_sin[:, :ROPE_HALF], target_type=pl.FP32)
+        even_idx_row = pl.add(
+            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
+            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
+        )
+        odd_idx_row = pl.add(even_idx_row, pl.full([1, ROPE_HALF], dtype=pl.INT32, value=1))
+        idx_target = pl.full([Q_ROPE_T_TILE, ROPE_HALF], dtype=pl.INT32, value=0)
+        even_idx_full = pl.col_expand(idx_target, even_idx_row)
+        odd_idx_full = pl.col_expand(idx_target, odd_idx_row)
         for h_inner in pl.range(8):
-            q_head_inv_rms_t = pl.reshape(q_head_inv_rms_all[hg + h_inner : hg + h_inner + 1, :], [T, 1])
-            q_rope = q_proj_fp32[:, (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM]
-            q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
-            q_even = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-            q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
-            q_rot_even = pl.sub(pl.mul(q_even, rope_cos_fp32), pl.mul(q_odd, rope_sin_fp32))
-            q_rot_odd = pl.add(pl.mul(q_even, rope_sin_fp32), pl.mul(q_odd, rope_cos_fp32))
-            q_rot_even_bf16 = pl.cast(q_rot_even, target_type=pl.BF16, mode="rint")
-            q_rot_odd_bf16 = pl.cast(q_rot_odd, target_type=pl.BF16, mode="rint")
-            q_rope_pair_stage[(hg + h_inner) * T : (hg + h_inner) * T + T, :ROPE_HALF] = q_rot_even_bf16
-            q_rope_pair_stage[(hg + h_inner) * T : (hg + h_inner) * T + T, ROPE_HALF : ROPE_DIM] = q_rot_odd_bf16
+            h = hg + h_inner
+            h0 = h * HEAD_DIM
+            for tg_idx in pl.range(T // Q_ROPE_T_TILE):
+                tg = tg_idx * Q_ROPE_T_TILE
+                q_rope_inv_rms_chunk = pl.reshape(
+                    q_head_inv_rms_all[h : h + 1, tg : tg + Q_ROPE_T_TILE], [Q_ROPE_T_TILE, 1]
+                )
+                q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
+                q_rope_norm_chunk = pl.row_expand_mul(q_rope_chunk, q_rope_inv_rms_chunk)
+                q_rope_even = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+                q_rope_odd = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+                q_rope_cos_chunk = pl.cast(rope_cos[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+                q_rope_sin_chunk = pl.cast(rope_sin[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+                q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
+                q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
+                q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                q_rope_buf = pl.tensor.scatter(q_rope_buf, dim=-1, index=even_idx_full, src=q_rot_even)
+                q_rope_buf = pl.tensor.scatter(q_rope_buf, dim=-1, index=odd_idx_full, src=q_rot_odd)
+                q_rope_stage_fp32[h * T + tg : h * T + tg + Q_ROPE_T_TILE, :] = q_rope_buf
 
-    # Reassemble interleaved pairs (cube matmul) and write back to q_flat (vec cast).
-    q_rope_grp_fp32 = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.FP32)
-    for hg_idx in pl.spmd(H // 8, name_hint="q_rope_reassemble"):
+    # Writeback: cast FP32 stage -> BF16 and write into q_flat. Mirrors the
+    # original q_rope_write scope (spmd H//8 + pl.pipeline(8)).
+    for hg_idx in pl.spmd(H // 8, name_hint="q_rope_writeback"):
         hg = hg_idx * 8
         for h_inner in pl.pipeline(8, stage=2):
-            even_chunk = q_rope_pair_stage[(hg + h_inner) * T : (hg + h_inner) * T + T, :ROPE_HALF]
-            odd_chunk = q_rope_pair_stage[(hg + h_inner) * T : (hg + h_inner) * T + T, ROPE_HALF : ROPE_DIM]
-            rot = pl.matmul(
-                even_chunk,
-                even_select_t[:, :],
-                out_dtype=pl.FP32,
+            h = hg + h_inner
+            rot_fp32 = q_rope_stage_fp32[h * T : h * T + T, :]
+            q_flat[:, h * HEAD_DIM + NOPE_DIM : h * HEAD_DIM + NOPE_DIM + ROPE_DIM] = pl.cast(
+                rot_fp32, target_type=pl.BF16, mode="rint"
             )
-            rot = pl.matmul_acc(
-                rot,
-                odd_chunk,
-                odd_select_t[:, :],
-            )
-            q_rope_grp_fp32[(hg + h_inner) * T : (hg + h_inner) * T + T, :] = rot
-
-    for hg_idx in pl.spmd(H // 8, name_hint="q_rope_write"):
-        hg = hg_idx * 8
-        for h_inner in pl.pipeline(8, stage=2):
-            rot_fp32 = q_rope_grp_fp32[(hg + h_inner) * T : (hg + h_inner) * T + T, :]
-            q_flat[:, (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM] = pl.cast(rot_fp32, target_type=pl.BF16, mode="rint")
 
     q = pl.reshape(q_flat, [T, H, HEAD_DIM])
 
@@ -270,45 +277,40 @@ def qkv_proj_rope(
             kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
             kv[tg : tg + KV_RMS_T_TILE, n0 : n0 + KV_TILE] = pl.cast(kv_normed, target_type=pl.BF16, mode="rint")
 
-    kv_rot_even_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
-    kv_rot_odd_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_apply"):
-        kv_inv_rms_t = pl.reshape(kv_inv_rms_tensor[0:1, :], [T, 1])
-        kv_rope = kv_fp32[:, NOPE_DIM : NOPE_DIM + ROPE_DIM]
+    # Fused KV RoPE: rmsnorm-scaled rope slice, gather-rotate-scatter, write back.
+    # Inner T-chunk keeps Vec UB under the 192 KB cap at T=128.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_fused"):
+        even_idx_row = pl.add(
+            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
+            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
+        )
+        odd_idx_row = pl.add(even_idx_row, pl.full([1, ROPE_HALF], dtype=pl.INT32, value=1))
+        idx_target = pl.full([KV_ROPE_T_TILE, ROPE_HALF], dtype=pl.INT32, value=0)
+        even_idx_full = pl.col_expand(idx_target, even_idx_row)
+        odd_idx_full = pl.col_expand(idx_target, odd_idx_row)
         gamma_rope = pl.reshape(
             pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32),
             [1, ROPE_DIM],
         )
-        kv_rope_norm = pl.col_expand_mul(pl.row_expand_mul(kv_rope, kv_inv_rms_t), gamma_rope)
-        kv_even = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-        kv_odd = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
-        cos = pl.cast(rope_cos[:, :ROPE_HALF], target_type=pl.FP32)
-        sin = pl.cast(rope_sin[:, :ROPE_HALF], target_type=pl.FP32)
-        kv_rot_even = pl.sub(pl.mul(kv_even, cos), pl.mul(kv_odd, sin))
-        kv_rot_odd = pl.add(pl.mul(kv_even, sin), pl.mul(kv_odd, cos))
-        kv_rot_even_tmp[:, :] = pl.cast(kv_rot_even, target_type=pl.BF16, mode="rint")
-        kv_rot_odd_tmp[:, :] = pl.cast(kv_rot_odd, target_type=pl.BF16, mode="rint")
-
-    kv_rope_full = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_reassemble"):
-        for rope_col in pl.pipeline(0, ROPE_DIM, ROPE_TILE, stage=2):
-            pair_col = rope_col // 2
-            kv_rot_even_chunk = kv_rot_even_tmp[:, pair_col : pair_col + ROPE_PAIR_TILE]
-            kv_rot_odd_chunk = kv_rot_odd_tmp[:, pair_col : pair_col + ROPE_PAIR_TILE]
-            kv_rot_chunk = pl.matmul(
-                kv_rot_even_chunk,
-                even_select_t[pair_col : pair_col + ROPE_PAIR_TILE, rope_col : rope_col + ROPE_TILE],
-                out_dtype=pl.FP32,
+        for tg_idx in pl.range(T // KV_ROPE_T_TILE):
+            tg = tg_idx * KV_ROPE_T_TILE
+            kv_rope_inv_rms_chunk = pl.reshape(
+                kv_inv_rms_tensor[0:1, tg : tg + KV_ROPE_T_TILE], [KV_ROPE_T_TILE, 1]
             )
-            kv_rot_chunk = pl.matmul_acc(
-                kv_rot_chunk,
-                kv_rot_odd_chunk,
-                odd_select_t[pair_col : pair_col + ROPE_PAIR_TILE, rope_col : rope_col + ROPE_TILE],
+            kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
+            kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
+            kv_rope_even = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+            kv_rope_odd = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+            kv_rope_cos_chunk = pl.cast(rope_cos[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+            kv_rope_sin_chunk = pl.cast(rope_sin[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+            kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))
+            kv_rot_odd = pl.add(pl.mul(kv_rope_even, kv_rope_sin_chunk), pl.mul(kv_rope_odd, kv_rope_cos_chunk))
+            kv_rope_buf = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            kv_rope_buf = pl.tensor.scatter(kv_rope_buf, dim=-1, index=even_idx_full, src=kv_rot_even)
+            kv_rope_buf = pl.tensor.scatter(kv_rope_buf, dim=-1, index=odd_idx_full, src=kv_rot_odd)
+            kv[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
+                kv_rope_buf, target_type=pl.BF16, mode="rint"
             )
-            kv_rope_full[:, rope_col : rope_col + ROPE_TILE] = kv_rot_chunk
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_write"):
-        kv[:, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(kv_rope_full, target_type=pl.BF16, mode="rint")
 
     return q
 
