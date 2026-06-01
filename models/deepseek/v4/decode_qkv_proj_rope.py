@@ -196,8 +196,8 @@ def qkv_proj_rope(
     # (mirrors compressor's normed_kv intermediate), then the original-style
     # writeback scope casts FP32 -> BF16 and copies into q_flat.
     q_rope_stage_fp32 = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.FP32)
-    for hg_idx in pl.spmd(H // 8, name_hint="q_head_rope_fused"):
-        hg = hg_idx * 8
+    for hg_idx in pl.spmd(H // 4, name_hint="q_head_rope_fused"):
+        hg = hg_idx * 4
         even_idx_row = pl.add(
             pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
             pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
@@ -206,7 +206,7 @@ def qkv_proj_rope(
         idx_target = pl.full([Q_ROPE_T_TILE, ROPE_HALF], dtype=pl.INT32, value=0)
         even_idx_full = pl.col_expand(idx_target, even_idx_row)
         odd_idx_full = pl.col_expand(idx_target, odd_idx_row)
-        for h_inner in pl.range(8):
+        for h_inner in pl.range(4):
             h = hg + h_inner
             h0 = h * HEAD_DIM
             for tg_idx in pl.range(T // Q_ROPE_T_TILE):
