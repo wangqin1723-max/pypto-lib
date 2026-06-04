@@ -42,7 +42,7 @@ from decode_compressor_ratio4 import compressor_ratio4
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
-from decode_qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import qkv_proj_rope, Q_ROPE_T_TILE
 from decode_rmsnorm import attn_norm
 from decode_sparse_attn import sparse_attn
 
@@ -137,6 +137,10 @@ def attention_csa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.FP32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -182,8 +186,17 @@ def attention_csa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    # Interleave-duplicated cos/sin (cos_il[j]=cos[j>>1]) for the q-rope, assembled by
+    # the SAME plain slice+assemble as rope_cos_t (ordered, no gather -> no stale read)
+    # from the pre-interleaved freqs inputs. Lets qkv_proj_rope's rope scope skip the
+    # per-task cos/sin dup gathers (CANN A3 layout).
+    rope_cos_il_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_sin_il_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    # Interleave-duplicated step cos/sin for the indexer's qr_rope (A3 swap-gather).
+    step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    step_sin_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         for b in pl.range(B):
             start_pos_b = pl.read(start_pos, [b])
@@ -195,8 +208,14 @@ def attention_csa(
                 sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
                 rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16), [t, 0])
                 rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16), [t, 0])
+                cos_il_row = pl.cast(pl.slice(freqs_cos_il, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                sin_il_row = pl.cast(pl.slice(freqs_sin_il, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                rope_cos_il_t = pl.assemble(rope_cos_il_t, cos_il_row, [t, 0])
+                rope_sin_il_t = pl.assemble(rope_sin_il_t, sin_il_row, [t, 0])
             step_cos = pl.assemble(step_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
             step_sin = pl.assemble(step_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            step_cos_il = pl.assemble(step_cos_il, pl.cast(pl.slice(freqs_cos_il, [1, ROPE_HEAD_DIM], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            step_sin_il = pl.assemble(step_sin_il, pl.cast(pl.slice(freqs_sin_il, [1, ROPE_HEAD_DIM], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
 
     cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
     cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
@@ -224,6 +243,10 @@ def attention_csa(
         wkv,
         rope_cos_t,
         rope_sin_t,
+        rope_cos_il_t,
+        rope_sin_il_t,
+        rope_swap_idx,
+        rope_sign,
         gamma_cq,
         gamma_ckv,
         q,
@@ -276,6 +299,10 @@ def attention_csa(
         weights_proj,
         step_cos,
         step_sin,
+        step_cos_il,
+        step_sin_il,
+        rope_swap_idx,
+        rope_sign,
         hadamard_idx,
         idx_kv_unused,
         inner_compress_state,
@@ -342,6 +369,10 @@ def attention_csa_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.FP32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -386,6 +417,10 @@ def attention_csa_test(
         gamma_ckv,
         freqs_cos,
         freqs_sin,
+        freqs_cos_il,
+        freqs_sin_il,
+        rope_swap_idx,
+        rope_sign,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -806,6 +841,19 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_cos.clone()),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_sin.clone()),
+        # Pre-interleaved freqs (cos_il[j]=cos[j>>1]) so qkv_proj_rope's rope scope reads
+        # cos/sin directly (no per-task dup gather; CANN A3 layout). Assembled the same
+        # plain way as freqs_cos -> ordered cross-scope read, no stale (the cos_il_gm trap).
+        TensorSpec("freqs_cos_il", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16,
+                   init_value=lambda: shared_freqs_cos[:, (torch.arange(ROPE_HEAD_DIM) >> 1)].contiguous()),
+        TensorSpec("freqs_sin_il", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16,
+                   init_value=lambda: shared_freqs_sin[:, (torch.arange(ROPE_HEAD_DIM) >> 1)].contiguous()),
+        # Static rotate swap index (j^1) + sign (+-1) for the interleaved q-rope; inputs
+        # so the rope scope never builds them in-task (avoids the AIV UB-OOB hang).
+        TensorSpec("rope_swap_idx", [Q_ROPE_T_TILE, ROPE_HEAD_DIM], torch.int32,
+                   init_value=lambda: (torch.arange(ROPE_HEAD_DIM) ^ 1).to(torch.int32).unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()),
+        TensorSpec("rope_sign", [Q_ROPE_T_TILE, ROPE_HEAD_DIM], torch.float32,
+                   init_value=lambda: (2 * (torch.arange(ROPE_HEAD_DIM) % 2) - 1).float().unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),

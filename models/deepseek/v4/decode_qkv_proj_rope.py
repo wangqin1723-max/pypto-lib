@@ -53,6 +53,10 @@ def qkv_proj_rope(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_sin_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -166,34 +170,40 @@ def qkv_proj_rope(
                 q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
                 q_flat[:, h0 + n0 : h0 + n0 + HEAD_TILE] = pl.cast(q_normed, target_type=pl.BF16, mode="rint")
 
-    # Per-head RoPE rotation: gather-rotate-scatter, then cast FP32 -> BF16 and
-    # write the rope columns directly into q_flat. Mirrors the q_head_rms_nope
-    # column write above; folding the writeback in here drops the [H*T, ROPE_DIM]
-    # FP32 stage (2 MB GM round-trip) and the writeback barrier that previously
-    # waited on the full rope tail.
+    # Per-head RoPE (CANN A3 rotate_interleaved): stay on the interleaved layout and
+    # rotate via index-gather i^1 swap + sign mask. No de-interleave, scatter, matmul
+    # or transpose. cos/sin arrive ALREADY interleave-duplicated (cos_il[j]=cos[j>>1])
+    # as FP32 kernel INPUTS -- matching the AscendC reference, which pre-lays cos/sin
+    # in the interleaved layout and just DataCopies them (no per-task dup gather). This
+    # drops the 2 cos/sin dup-gathers per tg that previously made this scope AIV-bound
+    # (~97us); only the single swap gather (j^1) stays on-chip. swap_idx (j^1) + sign
+    # (+-1) are also clean INPUTS, not rebuilt in-task (an in-task index tile gets
+    # buffer-reuse clobbered -> tgather UB-OOB -> AIV VEC exception -> 507018 hang).
+    # A host-materialized input GM has no in-kernel producer to race; internal
+    # CORE_GROUP staging does NOT substitute (staged-GM read races the producer).
+    #   swapped = gather(x, j^1) = [x1,x0,x3,x2,...]; sign = [-1,+1,...]
+    #   out = inv_rms * (x*cos_il + swapped*sign*sin_il)
     for hg_idx in pl.spmd(H // 2, name_hint="q_head_rope_fused"):
         hg = hg_idx * 2
-        for h_inner in pl.range(2):
-            h = hg + h_inner
-            h0 = h * HEAD_DIM
-            for tg_idx in pl.range(T // Q_ROPE_T_TILE):
-                tg = tg_idx * Q_ROPE_T_TILE
+        swap_idx = rope_swap_idx
+        sign = rope_sign[:, :]   # slice -> materialize a UB tile for the elementwise mul
+        # tg-outer / head-inner: the interleaved cos/sin slice is head-independent, so
+        # read it once per tg and reuse for both heads (no per-task gather at all now).
+        for tg_idx in pl.range(T // Q_ROPE_T_TILE):
+            tg = tg_idx * Q_ROPE_T_TILE
+            cos_il = rope_cos_il[tg : tg + Q_ROPE_T_TILE, :]
+            sin_il = rope_sin_il[tg : tg + Q_ROPE_T_TILE, :]
+            for h_inner in pl.range(2):
+                h = hg + h_inner
+                h0 = h * HEAD_DIM
                 q_rope_inv_rms_chunk = pl.reshape(
                     q_head_inv_rms_all[h : h + 1, tg : tg + Q_ROPE_T_TILE], [Q_ROPE_T_TILE, 1]
                 )
                 q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
-                q_rope_norm_chunk = pl.row_expand_mul(q_rope_chunk, q_rope_inv_rms_chunk)
-                q_rope_even = pl.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-                q_rope_odd = pl.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
-                q_rope_cos_chunk = pl.cast(rope_cos[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-                q_rope_sin_chunk = pl.cast(rope_sin[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-                q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
-                q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
-                q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                q_rope_buf = pl.tensor.scatter(q_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_buf)
-                q_rope_buf = pl.tensor.scatter(q_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_buf)
+                q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=swap_idx)
+                q_rope_rot = pl.add(pl.mul(q_rope_chunk, cos_il), pl.mul(pl.mul(q_rope_swapped, sign), sin_il))
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = pl.cast(
-                    q_rope_buf, target_type=pl.BF16, mode="rint"
+                    pl.row_expand_mul(q_rope_rot, q_rope_inv_rms_chunk), target_type=pl.BF16, mode="rint"
                 )
 
     q = pl.reshape(q_flat, [T, H, HEAD_DIM])
@@ -250,19 +260,23 @@ def qkv_proj_rope(
             kv_inv_rms_tensor[0:1, tg : tg + KV_ROPE_T_TILE], [KV_ROPE_T_TILE, 1]
         )
         kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
+        # A3 interleaved swap-gather (same form as q_head_rope_fused), replacing the
+        # de-interleave gather + rotate + re-interleave scatter. gamma is folded into
+        # kv_rope_norm_chunk BEFORE the swap, so the swapped lane n[j^1] correctly carries
+        # gamma[j^1]; inv_rms is per-row so it commutes either way. Reuses the q-rope
+        # pre-interleaved cos/sin + swap/sign INPUTS (cos_il[j]=cos[j>>1]); KV_ROPE_T_TILE
+        # == Q_ROPE_T_TILE so the [tile, ROPE_DIM] shapes match. out[j] = n[j]*cos_il[j]
+        # + n[j^1]*sign[j]*sin_il[j].
         kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
-        kv_rope_even = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-        kv_rope_odd = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
-        kv_rope_cos_chunk = pl.cast(rope_cos[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-        kv_rope_sin_chunk = pl.cast(rope_sin[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-        kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))
-        kv_rot_odd = pl.add(pl.mul(kv_rope_even, kv_rope_sin_chunk), pl.mul(kv_rope_odd, kv_rope_cos_chunk))
-        kv_rope_buf = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-        # Mask-form scatter: inverse of the P0101/P1010 gathers above.
-        kv_rope_buf = pl.tensor.scatter(kv_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=kv_rope_buf)
-        kv_rope_buf = pl.tensor.scatter(kv_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=kv_rope_buf)
+        kv_cos_il = rope_cos_il[tg : tg + KV_ROPE_T_TILE, :]
+        kv_sin_il = rope_sin_il[tg : tg + KV_ROPE_T_TILE, :]
+        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=rope_swap_idx)
+        kv_rope_rot = pl.add(
+            pl.mul(kv_rope_norm_chunk, kv_cos_il),
+            pl.mul(pl.mul(kv_swapped, rope_sign[:, :]), kv_sin_il),
+        )
         kv[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
-            kv_rope_buf, target_type=pl.BF16, mode="rint"
+            kv_rope_rot, target_type=pl.BF16, mode="rint"
         )
 
     return q
@@ -277,6 +291,10 @@ def qkv_proj_rope_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_sin_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
@@ -292,6 +310,10 @@ def qkv_proj_rope_test(
         wkv,
         rope_cos,
         rope_sin,
+        rope_cos_il,
+        rope_sin_il,
+        rope_swap_idx,
+        rope_sign,
         gamma_cq,
         gamma_ckv,
         q,
@@ -406,6 +428,23 @@ def build_tensor_specs():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
+    # q-rope inputs (passed in so the rope scope never builds them in-task; see
+    # q_head_rope_fused). cos/sin arrive ALREADY interleave-duplicated in FP32:
+    # cos_il[t, j] = float(bf16(cos[t, j>>1])) -- bit-identical to the old on-device
+    # "cast BF16->FP32 then dup-gather", but with the dup folded into the host input
+    # so the rope scope does zero cos/sin gathers (CANN A3 reference layout).
+    def init_rope_cos_il():
+        dup = (torch.arange(ROPE_DIM) >> 1)
+        return init_cos().to(torch.bfloat16).float()[:, dup].contiguous()
+    def init_rope_sin_il():
+        dup = (torch.arange(ROPE_DIM) >> 1)
+        return init_sin().to(torch.bfloat16).float()[:, dup].contiguous()
+    def init_rope_swap_idx():
+        j = torch.arange(ROPE_DIM)
+        return (j ^ 1).to(torch.int32).unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()
+    def init_rope_sign():
+        j = torch.arange(ROPE_DIM)
+        return (2 * (j % 2) - 1).float().unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
@@ -419,6 +458,10 @@ def build_tensor_specs():
         TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
+        TensorSpec("rope_cos_il",   [T, ROPE_DIM],             torch.float32, init_value=init_rope_cos_il),
+        TensorSpec("rope_sin_il",   [T, ROPE_DIM],             torch.float32, init_value=init_rope_sin_il),
+        TensorSpec("rope_swap_idx", [Q_ROPE_T_TILE, ROPE_DIM], torch.int32,   init_value=init_rope_swap_idx),
+        TensorSpec("rope_sign",     [Q_ROPE_T_TILE, ROPE_DIM], torch.float32, init_value=init_rope_sign),
         TensorSpec("gamma_cq",  [Q_LORA],               torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM],             torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16, is_output=True),

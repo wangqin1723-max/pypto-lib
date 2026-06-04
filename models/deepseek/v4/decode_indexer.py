@@ -71,6 +71,10 @@ def indexer(
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    qr_swap_idx: pl.Tensor[[32, ROPE_HEAD_DIM], pl.INT32],
+    qr_sign: pl.Tensor[[32, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
@@ -111,17 +115,19 @@ def indexer(
         o0 = idx * 32
         token_idx = o0 // IDX_N_HEADS
         batch_idx = token_idx // S
-        cos_b = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+        # A3 interleaved swap-gather (same form as q_head_rope_fused / kv_rope_fused),
+        # replacing de-interleave gather + rotate + re-interleave scatter. cos/sin come
+        # in ALREADY interleave-duplicated (cos_il[j]=cos[j>>1], per batch); swap_idx (j^1)
+        # + sign (+-1) are clean inputs. out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j].
+        cos_il_b = cos_il[batch_idx : batch_idx + 1, :]
+        sin_il_b = sin_il[batch_idx : batch_idx + 1, :]
         qr_rope_slice = qr_proj_flat[o0 : o0 + 32, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        even_tile = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd_tile = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
-        rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
-        rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
-        rope_buf = pl.full([32, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
-        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
-        qr_rope_out[o0 : o0 + 32, :] = pl.cast(rope_buf, target_type=pl.BF16, mode="rint")
+        qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=qr_swap_idx)
+        rope_rot = pl.add(
+            pl.col_expand_mul(qr_rope_slice, cos_il_b),
+            pl.col_expand_mul(pl.mul(qr_swapped, qr_sign), sin_il_b),
+        )
+        qr_rope_out[o0 : o0 + 32, :] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
@@ -281,6 +287,10 @@ def indexer_test(
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    qr_swap_idx: pl.Tensor[[32, ROPE_HEAD_DIM], pl.INT32],
+    qr_sign: pl.Tensor[[32, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
@@ -305,6 +315,10 @@ def indexer_test(
         weights_proj,
         cos,
         sin,
+        cos_il,
+        sin_il,
+        qr_swap_idx,
+        qr_sign,
         hadamard,
         inner_kv,
         inner_compress_state,
@@ -518,6 +532,11 @@ def build_tensor_specs(start_pos=None):
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     qr_i8, qr_scale = _int8_quant_per_row(init_qr())
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
+    # Shared cos/sin so the interleave-duplicated qr-rope inputs match the plain ones.
+    shared_cos = init_cos()
+    shared_sin = init_sin()
+    _qr_dup = (torch.arange(ROPE_HEAD_DIM) >> 1)                       # cos_il[j]=cos[j>>1]
+    _qr_sgn = (2 * (torch.arange(ROPE_HEAD_DIM) % 2) - 1).float()      # [-1,+1,...]
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
@@ -526,8 +545,13 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
-        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
-        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
+        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=lambda: shared_cos.clone()),
+        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=lambda: shared_sin.clone()),
+        TensorSpec("cos_il", [B, ROPE_HEAD_DIM], torch.float32, init_value=lambda: shared_cos[:, _qr_dup].contiguous()),
+        TensorSpec("sin_il", [B, ROPE_HEAD_DIM], torch.float32, init_value=lambda: shared_sin[:, _qr_dup].contiguous()),
+        TensorSpec("qr_swap_idx", [32, ROPE_HEAD_DIM], torch.int32,
+                   init_value=lambda: (torch.arange(ROPE_HEAD_DIM) ^ 1).to(torch.int32).unsqueeze(0).repeat(32, 1).contiguous()),
+        TensorSpec("qr_sign", [32, ROPE_HEAD_DIM], torch.float32, init_value=lambda: _qr_sgn.unsqueeze(0).repeat(32, 1).contiguous()),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("inner_kv", [B, S, INNER_HEAD_DIM], torch.float32),
         TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
