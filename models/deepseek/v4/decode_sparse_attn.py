@@ -84,6 +84,10 @@ def sparse_attn(
     seqused_kv: pl.Tensor[[B], pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    freqs_sin_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.INT32],
+    rope_sign_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -229,21 +233,24 @@ def sparse_attn(
             r_row = r_t * H
 
             for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-                # gather_mask requires FP/INT (not BF16): cast BF16 tile to FP32 first.
-                r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
-                r_even = pl.tensor.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-                r_odd = pl.tensor.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
-
-                r_cos = pl.cast(freqs_cos[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
-                r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
-                r_even_rot = pl.add(pl.col_expand_mul(r_even, r_cos), pl.col_expand_mul(r_odd, r_sin))
-                r_odd_rot = pl.sub(pl.col_expand_mul(r_odd, r_cos), pl.col_expand_mul(r_even, r_sin))
-                r_even_rot = pl.cast(pl.cast(r_even_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-                r_odd_rot = pl.cast(pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-                r_rope_buf = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
-                r_rope_buf = pl.tensor.scatter(r_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=r_rope_buf)
-                r_rope_buf = pl.tensor.scatter(r_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=r_rope_buf)
-                rope_buf[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE] = r_rope_buf
+                # A3 interleaved swap-gather (drops the de-interleave gather + scatter).
+                # sparse uses the CONJUGATE rotation (out[2k]=x[2k]cos+x[2k+1]sin,
+                # out[2k+1]=x[2k+1]cos-x[2k]sin), i.e. sign=[+1,-1,...] (OPPOSITE of
+                # q/kv) -> its own rope_sign_sp. cos/sin come in interleave-duplicated
+                # (cos_il[j]=cos[j>>1]) as FP32 inputs; swap_idx (j^1) is a clean input.
+                # out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]; keep the golden
+                # BF16 round-trip on the rotated values.
+                c0 = 2 * r_r0
+                r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
+                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=rope_swap_idx_sp)
+                r_cos_il = freqs_cos_il[r_t : r_t + 1, c0 : c0 + ROPE_INTERLEAVE_TILE]
+                r_sin_il = freqs_sin_il[r_t : r_t + 1, c0 : c0 + ROPE_INTERLEAVE_TILE]
+                r_rot = pl.add(
+                    pl.col_expand_mul(r_tile_fp32, r_cos_il),
+                    pl.col_expand_mul(pl.mul(r_swapped, rope_sign_sp), r_sin_il),
+                )
+                r_rot = pl.cast(pl.cast(r_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                rope_buf[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
     for rp_block in pl.spmd((T // ROPE_PACK_TOKEN_TILE) * O_GROUPS, name_hint="rope_pack"):
         rp_tb = rp_block // O_GROUPS
@@ -361,6 +368,10 @@ def sparse_attn_test(
     seqused_kv: pl.Tensor[[B], pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    freqs_sin_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
+    rope_swap_idx_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.INT32],
+    rope_sign_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -377,6 +388,10 @@ def sparse_attn_test(
         seqused_kv,
         freqs_cos,
         freqs_sin,
+        freqs_cos_il,
+        freqs_sin_il,
+        rope_swap_idx_sp,
+        rope_sign_sp,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -649,6 +664,17 @@ def build_tensor_specs(
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
+        # Pre-interleaved cos/sin (cos_il[j]=cos[j>>1]) + conjugate-rotation swap/sign
+        # for the A3 swap-gather rope. sign=[+1,-1,...] (sparse uses the conjugate, the
+        # OPPOSITE of q/kv). init_cos is deterministic so these match the plain freqs.
+        TensorSpec("freqs_cos_il", [T, ROPE_DIM], torch.float32,
+                   init_value=lambda: init_cos().to(torch.bfloat16).float()[:, (torch.arange(ROPE_DIM) >> 1)].contiguous()),
+        TensorSpec("freqs_sin_il", [T, ROPE_DIM], torch.float32,
+                   init_value=lambda: init_sin().to(torch.bfloat16).float()[:, (torch.arange(ROPE_DIM) >> 1)].contiguous()),
+        TensorSpec("rope_swap_idx_sp", [H, ROPE_INTERLEAVE_TILE], torch.int32,
+                   init_value=lambda: (torch.arange(ROPE_INTERLEAVE_TILE) ^ 1).to(torch.int32).unsqueeze(0).repeat(H, 1).contiguous()),
+        TensorSpec("rope_sign_sp", [H, ROPE_INTERLEAVE_TILE], torch.float32,
+                   init_value=lambda: (1 - 2 * (torch.arange(ROPE_INTERLEAVE_TILE) % 2)).float().unsqueeze(0).repeat(H, 1).contiguous()),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),

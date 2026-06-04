@@ -44,7 +44,7 @@ from hc_pre import hc_pre
 from decode_indexer import indexer
 from decode_qkv_proj_rope import qkv_proj_rope, Q_ROPE_T_TILE
 from decode_rmsnorm import attn_norm
-from decode_sparse_attn import sparse_attn
+from decode_sparse_attn import sparse_attn, ROPE_INTERLEAVE_TILE
 
 B = DECODE_BATCH
 S = DECODE_SEQ
@@ -141,6 +141,8 @@ def attention_csa(
     freqs_sin_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.INT32],
     rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.INT32],
+    rope_sign_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.FP32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -344,6 +346,10 @@ def attention_csa(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
+        rope_cos_il_t,
+        rope_sin_il_t,
+        rope_swap_idx_sp,
+        rope_sign_sp,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -373,6 +379,8 @@ def attention_csa_test(
     freqs_sin_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.INT32],
     rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.INT32],
+    rope_sign_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.FP32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -421,6 +429,8 @@ def attention_csa_test(
         freqs_sin_il,
         rope_swap_idx,
         rope_sign,
+        rope_swap_idx_sp,
+        rope_sign_sp,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -854,6 +864,12 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
                    init_value=lambda: (torch.arange(ROPE_HEAD_DIM) ^ 1).to(torch.int32).unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()),
         TensorSpec("rope_sign", [Q_ROPE_T_TILE, ROPE_HEAD_DIM], torch.float32,
                    init_value=lambda: (2 * (torch.arange(ROPE_HEAD_DIM) % 2) - 1).float().unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()),
+        # sparse_attn rope (conjugate): swap idx (j^1) + sign [+1,-1,...] over the
+        # interleave tile, broadcast over H rows.
+        TensorSpec("rope_swap_idx_sp", [H, ROPE_INTERLEAVE_TILE], torch.int32,
+                   init_value=lambda: (torch.arange(ROPE_INTERLEAVE_TILE) ^ 1).to(torch.int32).unsqueeze(0).repeat(H, 1).contiguous()),
+        TensorSpec("rope_sign_sp", [H, ROPE_INTERLEAVE_TILE], torch.float32,
+                   init_value=lambda: (1 - 2 * (torch.arange(ROPE_INTERLEAVE_TILE) % 2)).float().unsqueeze(0).repeat(H, 1).contiguous()),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
