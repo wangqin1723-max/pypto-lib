@@ -186,6 +186,15 @@ def indexer(
         inner_norm_w,
         cos,
         sin,
+        # Reuse the qr-rope A3 inputs for the inner compressor's rmsnorm_rope: cos_il/sin_il
+        # are the same per-batch interleave-duplicated cos/sin; swap_idx/sign are row-broadcast
+        # (j^1) / (+-1). The inner compressor takes the full [32, ROPE_HEAD_DIM] qr tiles and
+        # uses the first RMS_TILE rows internally (slicing here would cross the inline boundary
+        # and lose static shape inference).
+        cos_il,
+        sin_il,
+        qr_swap_idx,
+        qr_sign,
         hadamard,
         idx_kv_cache,
         idx_block_table,

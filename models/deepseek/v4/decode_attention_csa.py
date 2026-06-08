@@ -222,6 +222,10 @@ def attention_csa(
     cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
     cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    # Interleave-duplicated cmp cos/sin for compressor_ratio4's rmsnorm_rope (A3 swap-gather),
+    # assembled from freqs_cos_il at the same per-batch compress position as cmp_cos/cmp_sin.
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
         for b in pl.range(B):
             start_pos_b = pl.read(start_pos, [b])
@@ -230,6 +234,8 @@ def attention_csa(
             cmp_pos_b = pl.cast(start_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.assemble(cmp_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
             cmp_sin = pl.assemble(cmp_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            cmp_cos_il = pl.assemble(cmp_cos_il, pl.cast(pl.slice(freqs_cos_il, [1, ROPE_HEAD_DIM], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            cmp_sin_il = pl.assemble(cmp_sin_il, pl.cast(pl.slice(freqs_sin_il, [1, ROPE_HEAD_DIM], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -284,6 +290,14 @@ def attention_csa(
         cmp_norm_w,
         cmp_cos,
         cmp_sin,
+        # A3 swap-gather inputs for compressor_ratio4's rmsnorm_rope: interleave-duplicated
+        # cmp cos/sin + row-broadcast swap_idx (j^1) / sign (+-1). rope_swap_idx/rope_sign are
+        # [Q_ROPE_T_TILE, ROPE_HEAD_DIM]; the compressor takes the full tiles and uses the
+        # first RMS_TILE rows internally (slicing here would cross the inline boundary).
+        cmp_cos_il,
+        cmp_sin_il,
+        rope_swap_idx,
+        rope_sign,
         cmp_kv,
         cmp_block_table,
         cmp_start_pos,

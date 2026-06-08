@@ -47,6 +47,11 @@ B_TILE = 64
 HEAD_TILE = 64
 HEAD_DIM_TILE = 128
 RMS_TILE = 16
+# Row count of the shared A3 rope swap/sign broadcast tiles the caller hands in
+# (= the indexer's qr_swap_idx tile). Row-broadcast, so rmsnorm_rope uses only the first
+# RMS_TILE rows; a 32-row param lets the indexer pass its [32, ROPE_HEAD_DIM] qr tile
+# directly (slicing across the inline boundary loses static shape inference).
+ROPE_SWAP_TILE = 32
 
 
 @pl.jit.inline
@@ -61,6 +66,10 @@ def indexer_compressor(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[ROPE_SWAP_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[ROPE_SWAP_TILE, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -177,8 +186,6 @@ def indexer_compressor(
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope"):
         batch_base = batch_base_idx * RMS_TILE
-        cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
         partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
             kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
@@ -197,14 +204,26 @@ def indexer_compressor(
         kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
-        rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
-        rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
-        rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
-        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
-        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(rope_buf, target_type=pl.BF16, mode="rint")
+        # A3 interleaved swap-gather (same form as kv_rope_fused in decode_qkv_proj_rope),
+        # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
+        # are folded into rope_normed BEFORE the swap, so the swapped lane n[j^1] correctly
+        # carries gamma[j^1]; inv_rms is per-row so it commutes. cos/sin come in ALREADY
+        # interleave-duplicated (cos_il[j]=cos[j>>1], per batch, FP32 -- bit-identical to the
+        # old FP32 cos_b multiply with the dup folded into the host input); swap_idx (j^1)
+        # + sign (+-1, [-1,+1,...]) are clean GM inputs, never rebuilt in-task (an in-task
+        # index tile gets buffer-reuse clobbered -> tgather UB-OOB). normed_kv is BF16 so the
+        # rotated FP32 result is cast on writeback.
+        #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
+        cos_il_b = cos_il[batch_base : batch_base + RMS_TILE, :]
+        sin_il_b = sin_il[batch_base : batch_base + RMS_TILE, :]
+        swap_idx = rope_swap_idx[0:RMS_TILE, :]   # row-broadcast tile; use the first RMS_TILE rows
+        sign = rope_sign[0:RMS_TILE, :]
+        swapped = pl.gather(rope_normed, dim=-1, index=swap_idx)
+        rope_rot = pl.add(
+            pl.mul(rope_normed, cos_il_b),
+            pl.mul(pl.mul(swapped, sign), sin_il_b),
+        )
+        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
     kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_hadamard"):
@@ -249,6 +268,10 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    cos_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin_il: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[ROPE_SWAP_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[ROPE_SWAP_TILE, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -265,6 +288,10 @@ def compressor_test(
         norm_w,
         cos,
         sin,
+        cos_il,
+        sin_il,
+        rope_swap_idx,
+        rope_sign,
         hadamard,
         idx_kv_cache,
         idx_block_table,
@@ -402,10 +429,11 @@ def build_tensor_specs(start_pos=None):
         return torch.rand(COMPRESS_RATIO, OUT_DIM)
     def init_norm_w():
         return torch.ones(HEAD_DIM)
-    def init_cos():
-        return torch.rand(B, ROPE_HEAD_DIM // 2)
-    def init_sin():
-        return torch.rand(B, ROPE_HEAD_DIM // 2)
+    # Shared cos/sin so the interleave-duplicated rope inputs match the plain ones.
+    shared_cos = torch.rand(B, ROPE_HEAD_DIM // 2)
+    shared_sin = torch.rand(B, ROPE_HEAD_DIM // 2)
+    _rope_dup = (torch.arange(ROPE_HEAD_DIM) >> 1)                       # cos_il[j]=cos[j>>1]
+    _rope_sgn = (2 * (torch.arange(ROPE_HEAD_DIM) % 2) - 1).float()      # [-1,+1,...]
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_idx_kv_cache():
@@ -450,8 +478,13 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wgate", [D, OUT_DIM], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
         TensorSpec("norm_w", [HEAD_DIM], torch.float32, init_value=init_norm_w),
-        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
-        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
+        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=lambda: shared_cos.clone()),
+        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=lambda: shared_sin.clone()),
+        TensorSpec("cos_il", [B, ROPE_HEAD_DIM], torch.float32, init_value=lambda: shared_cos[:, _rope_dup].contiguous()),
+        TensorSpec("sin_il", [B, ROPE_HEAD_DIM], torch.float32, init_value=lambda: shared_sin[:, _rope_dup].contiguous()),
+        TensorSpec("rope_swap_idx", [ROPE_SWAP_TILE, ROPE_HEAD_DIM], torch.int32,
+                   init_value=lambda: (torch.arange(ROPE_HEAD_DIM) ^ 1).to(torch.int32).unsqueeze(0).repeat(ROPE_SWAP_TILE, 1).contiguous()),
+        TensorSpec("rope_sign", [ROPE_SWAP_TILE, ROPE_HEAD_DIM], torch.float32, init_value=lambda: _rope_sgn.unsqueeze(0).repeat(ROPE_SWAP_TILE, 1).contiguous()),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),

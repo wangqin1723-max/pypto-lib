@@ -27,10 +27,10 @@ from config import (
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
-from decode_qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import qkv_proj_rope, Q_ROPE_T_TILE
 from decode_rmsnorm import attn_norm
 from decode_compressor_ratio128 import compressor_ratio128
-from decode_sparse_attn import sparse_attn
+from decode_sparse_attn import sparse_attn, ROPE_INTERLEAVE_TILE
 
 
 # model config
@@ -95,6 +95,17 @@ def attention_hca(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    # A3 swap-gather rope inputs (shared by qkv_proj_rope and compressor_ratio128).
+    # cos/sin arrive interleave-duplicated in FP32 (cos_il[j]=cos[j>>1]); swap_idx (j^1)
+    # + sign (+-1) are row-broadcast clean GM tiles ([Q_ROPE_T_TILE, ROPE_HEAD_DIM]).
+    freqs_cos_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.FP32],
+    freqs_sin_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.FP32],
+    # sparse_attn inverse-rope A3 swap-gather: conjugate sign (+-1 OPPOSITE of q/kv),
+    # per-head [H, ROPE_INTERLEAVE_TILE] broadcast tiles.
+    rope_swap_idx_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.INT32],
+    rope_sign_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.FP32],
     # main compressor (head_dim=HEAD_DIM, ratio=128, overlap=False)
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -134,9 +145,15 @@ def attention_hca(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    # Interleave-duplicated per-token cos/sin for qkv_proj_rope's A3 swap-gather.
+    rope_cos_il_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_sin_il_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    # Interleave-duplicated per-batch cmp cos/sin for compressor_ratio128's A3 swap-gather.
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
         for b in pl.range(B):
             start_pos_b = pl.read(start_pos, [b])
@@ -147,6 +164,8 @@ def attention_hca(
             cmp_sin_row = freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
             cmp_cos[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_cos_row, target_type=pl.FP32)
             cmp_sin[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_sin_row, target_type=pl.FP32)
+            cmp_cos_il[b : b + 1, 0 : ROPE_HEAD_DIM] = freqs_cos_il[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM]
+            cmp_sin_il[b : b + 1, 0 : ROPE_HEAD_DIM] = freqs_sin_il[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM]
             for s in pl.range(S):
                 t = b * S + s
                 pos_b = pl.cast(start_pos_b + s, pl.INDEX)
@@ -154,6 +173,8 @@ def attention_hca(
                 step_sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
+                rope_cos_il_t[t : t + 1, 0 : ROPE_HEAD_DIM] = freqs_cos_il[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM]
+                rope_sin_il_t[t : t + 1, 0 : ROPE_HEAD_DIM] = freqs_sin_il[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM]
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -169,6 +190,10 @@ def attention_hca(
         wkv,
         rope_cos_t,
         rope_sin_t,
+        rope_cos_il_t,
+        rope_sin_il_t,
+        rope_swap_idx,
+        rope_sign,
         gamma_cq,
         gamma_ckv,
         q,
@@ -203,6 +228,10 @@ def attention_hca(
         cmp_norm_w,
         cmp_cos,
         cmp_sin,
+        cmp_cos_il,
+        cmp_sin_il,
+        rope_swap_idx,
+        rope_sign,
         cmp_kv,
         cmp_block_table,
         cmp_start_pos,
@@ -237,6 +266,10 @@ def attention_hca(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
+        rope_cos_il_t,
+        rope_sin_il_t,
+        rope_swap_idx_sp,
+        rope_sign_sp,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -268,6 +301,12 @@ def attention_hca_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.FP32],
+    freqs_sin_il: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign: pl.Tensor[[Q_ROPE_T_TILE, ROPE_HEAD_DIM], pl.FP32],
+    rope_swap_idx_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.INT32],
+    rope_sign_sp: pl.Tensor[[H, ROPE_INTERLEAVE_TILE], pl.FP32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -291,6 +330,8 @@ def attention_hca_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
+        freqs_cos_il, freqs_sin_il, rope_swap_idx, rope_sign,
+        rope_swap_idx_sp, rope_sign_sp,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
@@ -492,6 +533,20 @@ def build_tensor_specs(start_pos=None):
         return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
     def init_freqs_sin():
         return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+    # Interleave-duplicated FP32 freqs for the A3 swap-gather (shared by qkv + compressor).
+    # cos_il[pos,j] = float(bf16(freqs_cos[pos, j>>1])) -- bit-identical to the on-device
+    # "cast BF16->FP32" with the dup folded into the host input. swap_idx (j^1) / sign (+-1)
+    # are row-broadcast clean tiles.
+    _hca_rope_dup = (torch.arange(ROPE_HEAD_DIM) >> 1)
+    _hca_rope_sgn = (2 * (torch.arange(ROPE_HEAD_DIM) % 2) - 1).float()
+    def init_freqs_cos_il():
+        return init_freqs_cos().to(torch.bfloat16).float()[:, _hca_rope_dup].contiguous()
+    def init_freqs_sin_il():
+        return init_freqs_sin().to(torch.bfloat16).float()[:, _hca_rope_dup].contiguous()
+    def init_rope_swap_idx():
+        return (torch.arange(ROPE_HEAD_DIM) ^ 1).to(torch.int32).unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()
+    def init_rope_sign():
+        return _hca_rope_sgn.unsqueeze(0).repeat(Q_ROPE_T_TILE, 1).contiguous()
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
@@ -580,6 +635,14 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("freqs_cos_il", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.float32, init_value=init_freqs_cos_il),
+        TensorSpec("freqs_sin_il", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.float32, init_value=init_freqs_sin_il),
+        TensorSpec("rope_swap_idx", [Q_ROPE_T_TILE, ROPE_HEAD_DIM], torch.int32, init_value=init_rope_swap_idx),
+        TensorSpec("rope_sign", [Q_ROPE_T_TILE, ROPE_HEAD_DIM], torch.float32, init_value=init_rope_sign),
+        TensorSpec("rope_swap_idx_sp", [H, ROPE_INTERLEAVE_TILE], torch.int32,
+                   init_value=lambda: (torch.arange(ROPE_INTERLEAVE_TILE) ^ 1).to(torch.int32).unsqueeze(0).repeat(H, 1).contiguous()),
+        TensorSpec("rope_sign_sp", [H, ROPE_INTERLEAVE_TILE], torch.float32,
+                   init_value=lambda: (1 - 2 * (torch.arange(ROPE_INTERLEAVE_TILE) % 2)).float().unsqueeze(0).repeat(H, 1).contiguous()),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
