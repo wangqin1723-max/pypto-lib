@@ -111,17 +111,29 @@ def indexer(
         o0 = idx * 32
         token_idx = o0 // IDX_N_HEADS
         batch_idx = token_idx // S
+        # A3 interleaved swap-gather (same form as q_head_rope_fused / kv_rope_fused),
+        # replacing de-interleave gather + rotate + re-interleave scatter. The rotation
+        # indices/sign and the interleave-duplicated cos/sin are built ENTIRELY IN-KERNEL:
+        # swap_idx (j^1), sign ([-1,+1,...]) and dup_idx (j>>1) from pl.arange, and
+        # cos_il/sin_il dup-gathered from the per-batch cos/sin row (broadcast to 32 rows).
+        #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
         cos_b = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         sin_b = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         qr_rope_slice = qr_proj_flat[o0 : o0 + 32, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        even_tile = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd_tile = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
-        rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
-        rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
-        rope_buf = pl.full([32, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
-        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
-        qr_rope_out[o0 : o0 + 32, :] = pl.cast(rope_buf, target_type=pl.BF16, mode="rint")
+        rope_ones = pl.full([32, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
+        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        cos_b32 = pl.col_expand_mul(pl.full([32, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), cos_b)
+        sin_b32 = pl.col_expand_mul(pl.full([32, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), sin_b)
+        cos_il = pl.gather(cos_b32, dim=-1, index=rope_dup_idx)
+        sin_il = pl.gather(sin_b32, dim=-1, index=rope_dup_idx)
+        qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
+        rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(pl.mul(qr_swapped, rope_sign), sin_il))
+        qr_rope_out[o0 : o0 + 32, :] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)

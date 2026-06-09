@@ -166,34 +166,44 @@ def qkv_proj_rope(
                 q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
                 q_flat[:, h0 + n0 : h0 + n0 + HEAD_TILE] = pl.cast(q_normed, target_type=pl.BF16, mode="rint")
 
-    # Per-head RoPE rotation: gather-rotate-scatter, then cast FP32 -> BF16 and
-    # write the rope columns directly into q_flat. Mirrors the q_head_rms_nope
-    # column write above; folding the writeback in here drops the [H*T, ROPE_DIM]
-    # FP32 stage (2 MB GM round-trip) and the writeback barrier that previously
-    # waited on the full rope tail.
+    # Per-head RoPE (CANN A3 rotate_interleaved): stay on the interleaved layout and
+    # rotate via an i^1 swap gather + sign mask, dropping the de-interleave gather +
+    # re-interleave scatter. The rotation indices/sign and the interleave-duplicated
+    # cos/sin are built ENTIRELY IN-KERNEL (no host inputs): swap_idx (j^1), sign
+    # ([-1,+1,...]) and dup_idx (j>>1) come from pl.arange per task, and cos_il/sin_il
+    # are dup-gathered from rope_cos/rope_sin in-task. The prior in-task index-tile
+    # tail clobber (-> tgather UB-OOB -> 507018 hang) that once forced these to be
+    # kernel inputs is resolved. inv_rms is per-row so it factors out of the rotation
+    # and is applied after; the writeback into q_flat is folded in (no FP32 GM stage).
+    #   swapped = gather(x, j^1) = [x1,x0,x3,x2,...]; sign = [-1,+1,...]
+    #   out = inv_rms * (x*cos_il + swapped*sign*sin_il)
     for hg_idx in pl.spmd(H // 2, name_hint="q_head_rope_fused"):
         hg = hg_idx * 2
-        for h_inner in pl.range(2):
-            h = hg + h_inner
-            h0 = h * HEAD_DIM
-            for tg_idx in pl.range(T // Q_ROPE_T_TILE):
-                tg = tg_idx * Q_ROPE_T_TILE
+        # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
+        q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        q_col = pl.col_expand_mul(q_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        q_dup_f = pl.cast(pl.cast(pl.mul(q_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        q_dup_idx = pl.cast(q_dup_f, target_type=pl.INT32)                                       # j>>1
+        q_lane = pl.sub(q_col, pl.mul(q_dup_f, 2.0))                                             # j%2
+        q_swap_idx = pl.cast(pl.sub(pl.add(q_col, 1.0), pl.mul(q_lane, 2.0)), target_type=pl.INT32)  # j^1
+        q_sign = pl.sub(pl.mul(q_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        # tg-outer / head-inner: cos_il/sin_il are head-independent, so dup-gather once
+        # per tg and reuse for both heads.
+        for tg_idx in pl.range(T // Q_ROPE_T_TILE):
+            tg = tg_idx * Q_ROPE_T_TILE
+            q_cos_il = pl.gather(pl.cast(rope_cos[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
+            q_sin_il = pl.gather(pl.cast(rope_sin[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
+            for h_inner in pl.range(2):
+                h = hg + h_inner
+                h0 = h * HEAD_DIM
                 q_rope_inv_rms_chunk = pl.reshape(
                     q_head_inv_rms_all[h : h + 1, tg : tg + Q_ROPE_T_TILE], [Q_ROPE_T_TILE, 1]
                 )
                 q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
-                q_rope_norm_chunk = pl.row_expand_mul(q_rope_chunk, q_rope_inv_rms_chunk)
-                q_rope_even = pl.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-                q_rope_odd = pl.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
-                q_rope_cos_chunk = pl.cast(rope_cos[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-                q_rope_sin_chunk = pl.cast(rope_sin[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-                q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
-                q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
-                q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                q_rope_buf = pl.tensor.scatter(q_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_buf)
-                q_rope_buf = pl.tensor.scatter(q_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_buf)
+                q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
+                q_rope_rot = pl.add(pl.mul(q_rope_chunk, q_cos_il), pl.mul(pl.mul(q_rope_swapped, q_sign), q_sin_il))
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = pl.cast(
-                    q_rope_buf, target_type=pl.BF16, mode="rint"
+                    pl.row_expand_mul(q_rope_rot, q_rope_inv_rms_chunk), target_type=pl.BF16, mode="rint"
                 )
 
     q = pl.reshape(q_flat, [T, H, HEAD_DIM])
@@ -250,19 +260,27 @@ def qkv_proj_rope(
             kv_inv_rms_tensor[0:1, tg : tg + KV_ROPE_T_TILE], [KV_ROPE_T_TILE, 1]
         )
         kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
+        # A3 interleaved swap-gather (same form as q_head_rope_fused), built in-kernel.
+        # gamma is folded into kv_rope_norm_chunk BEFORE the swap so the swapped lane
+        # n[j^1] correctly carries gamma[j^1] (gamma is per-column, does NOT commute);
+        # inv_rms is per-row so it commutes. out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j].
         kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
-        kv_rope_even = pl.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-        kv_rope_odd = pl.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
-        kv_rope_cos_chunk = pl.cast(rope_cos[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-        kv_rope_sin_chunk = pl.cast(rope_sin[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-        kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))
-        kv_rot_odd = pl.add(pl.mul(kv_rope_even, kv_rope_sin_chunk), pl.mul(kv_rope_odd, kv_rope_cos_chunk))
-        kv_rope_buf = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-        # Mask-form scatter: inverse of the P0101/P1010 gathers above.
-        kv_rope_buf = pl.tensor.scatter(kv_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=kv_rope_buf)
-        kv_rope_buf = pl.tensor.scatter(kv_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=kv_rope_buf)
+        kv_ones = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        kv_col = pl.col_expand_mul(kv_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        kv_dup_f = pl.cast(pl.cast(pl.mul(kv_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        kv_dup_idx = pl.cast(kv_dup_f, target_type=pl.INT32)                                       # j>>1
+        kv_lane = pl.sub(kv_col, pl.mul(kv_dup_f, 2.0))                                            # j%2
+        kv_swap_idx = pl.cast(pl.sub(pl.add(kv_col, 1.0), pl.mul(kv_lane, 2.0)), target_type=pl.INT32)  # j^1
+        kv_sign = pl.sub(pl.mul(kv_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        kv_cos_il = pl.gather(pl.cast(rope_cos[tg : tg + KV_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
+        kv_sin_il = pl.gather(pl.cast(rope_sin[tg : tg + KV_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
+        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=kv_swap_idx)
+        kv_rope_rot = pl.add(
+            pl.mul(kv_rope_norm_chunk, kv_cos_il),
+            pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il),
+        )
         kv[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
-            kv_rope_buf, target_type=pl.BF16, mode="rint"
+            kv_rope_rot, target_type=pl.BF16, mode="rint"
         )
 
     return q

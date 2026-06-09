@@ -222,27 +222,39 @@ def sparse_attn(
     rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
         r_t0 = r_idx * ROPE_TOKEN_TILE
+        # A3 interleaved swap-gather, built ENTIRELY IN-KERNEL, replacing the de-interleave
+        # gather + rotate + re-interleave scatter. Sparse uses the CONJUGATE (inverse)
+        # rotation -- out[2k]=x[2k]cos+x[2k+1]sin, out[2k+1]=x[2k+1]cos-x[2k]sin -- so its
+        # sign is [+1,-1,...] (OPPOSITE of the forward q/kv/compressor sign). swap_idx (j^1),
+        # sign and dup_idx (j>>1) come from pl.arange (column pattern is chunk-independent,
+        # so build once per task); cos_il/sin_il are dup-gathered per chunk from freqs_cos/sin
+        # (cast BF16->FP32, broadcast across H rows). The golden BF16 round-trip is preserved.
+        #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
+        sp_ones = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
+        sp_col = pl.col_expand_mul(sp_ones, pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sp_dup_idx = pl.cast(sp_dup_f, target_type=pl.INT32)                                      # j>>1
+        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
+        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
+        sp_sign = pl.neg(pl.sub(pl.mul(sp_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate = -fwd)
         for r_dt in pl.range(ROPE_TOKEN_TILE):
             r_t = r_t0 + r_dt
             r_row = r_t * H
 
             for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-                # gather_mask requires FP/INT (not BF16): cast BF16 tile to FP32 first.
-                r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
-                r_even = pl.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-                r_odd = pl.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
-
+                c0 = 2 * r_r0
+                # gather requires FP/INT (not BF16): cast BF16 tile to FP32 first.
+                r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
                 r_cos = pl.cast(freqs_cos[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
                 r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
-                r_even_rot = pl.add(pl.col_expand_mul(r_even, r_cos), pl.col_expand_mul(r_odd, r_sin))
-                r_odd_rot = pl.sub(pl.col_expand_mul(r_odd, r_cos), pl.col_expand_mul(r_even, r_sin))
-                r_even_rot = pl.cast(pl.cast(r_even_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-                r_odd_rot = pl.cast(pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-
-                r_rope_buf = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
-                r_rope_buf = pl.tensor.scatter(r_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=r_rope_buf)
-                r_rope_buf = pl.tensor.scatter(r_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=r_rope_buf)
-                rope_buf[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE] = r_rope_buf
+                r_cos_h = pl.col_expand_mul(pl.full([H, ROPE_TILE], dtype=pl.FP32, value=1.0), r_cos)
+                r_sin_h = pl.col_expand_mul(pl.full([H, ROPE_TILE], dtype=pl.FP32, value=1.0), r_sin)
+                r_cos_il = pl.gather(r_cos_h, dim=-1, index=sp_dup_idx)
+                r_sin_il = pl.gather(r_sin_h, dim=-1, index=sp_dup_idx)
+                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(pl.mul(r_swapped, sp_sign), r_sin_il))
+                r_rot = pl.cast(pl.cast(r_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                rope_buf[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
     for rp_block in pl.spmd((T // ROPE_PACK_TOKEN_TILE) * O_GROUPS, name_hint="rope_pack"):
         rp_tb = rp_block // O_GROUPS
