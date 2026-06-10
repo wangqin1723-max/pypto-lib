@@ -90,15 +90,19 @@ def expert_routed(
                 n_base = nb_idx * (GATE_INNER * INTER_TILE)
                 for ng in pl.range(GATE_INNER):
                     n0 = n_base + ng * INTER_TILE
-                    # Peel-first-iter K loop: 3D-rhs b_trans=True matmul under
-                    # pl.pipeline + create_tensor + if-kb==0 carry triggers a
-                    # TLOAD DN->NZ ISA assertion (pypto#1540).
+                    # Peel the first K iter (plain matmul seeds the accumulator,
+                    # avoiding the if-kb==0 carry that trips the TLOAD DN->NZ ISA
+                    # assertion, pypto#1540), then run the remaining K iters under
+                    # pl.pipeline so each tile's weight MTE2 load overlaps the
+                    # previous tile's cube compute. This cube is MTE2-bound (PMU:
+                    # ~80% MTE2, ~20% idle), so the overlap fills that gap; INT32
+                    # accumulation order is unchanged, so it is numerically identical.
                     x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_TILE]
                     w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
                     w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
                     gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
                     up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.range(K_TILE, D, K_TILE):
+                    for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
                         x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
                         w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
                         w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
@@ -165,7 +169,10 @@ def expert_routed(
                 row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
                 for dg in pl.range(W2_INNER):
                     d0 = d_base + dg * D_OUT_TILE
-                    # Peel-first-iter K loop: see pypto#1540 note in exp_gate_up.
+                    # Peel-first-iter K loop (pypto#1540, see exp_gate_up). This w2
+                    # matmul is scalar/address-gen bound (PMU: scalar ~97%), not
+                    # MTE2-bound, so pipelining the K loop here buys nothing on
+                    # device and only adds simulator work -- keep it serial.
                     h_init = h_tile_i8[:, 0 : INTER_K]
                     w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, 0 : INTER_K]
                     y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
