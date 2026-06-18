@@ -235,18 +235,12 @@ def attention_csa(
         qr_scale,
     )
 
-    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed = pl.reshape(x_normed_t, [B, S, D])
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    position_ids_bsd = pl.create_tensor([B, S], dtype=pl.INT32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
-    cmp_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
-    idx_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
-    state_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    inner_state_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
     cmp_out, compress_state, cmp_kv = compressor_ratio4(
         x_normed,
@@ -704,14 +698,24 @@ def build_tensor_specs(start_pos=None):
     def init_x_hc():
         return torch.randn(T, HC_MULT, D) * 0.05
 
+    # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
+    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
+    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
     def init_hc_attn_fn():
-        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+        return torch.randn(MIX_HC, HC_DIM) * 0.0519
 
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([0.076099, 0.032597, 0.226994])
 
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            5.9166, -3.6223, -2.9324, -3.3124,
+            -3.9100, -0.9384, -3.3256, -2.5240,
+            2.0706, -2.5728, 0.1424, -3.9453,
+            -3.8859, 3.4634, -3.3799, -2.6077,
+            -2.7191, -2.4846, 2.0395, -0.5010,
+            -3.5992, -2.7520, -3.3493, 3.1587,
+        ])
 
     def init_attn_norm_w():
         return torch.ones(D)
@@ -742,17 +746,21 @@ def build_tensor_specs(start_pos=None):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
+    # Compressor/indexer fixtures calibrated to the real DeepSeek-V4-Flash CSA layers
+    # (mean l8/l32 of extract_weights_flash). The BF16 weights are clean zero-mean Gaussian
+    # (no quant grid), so randn x measured-std is in-distribution; the RMSNorm gammas center
+    # near a measured mean (not ones); idx_wq_b is the only quantized one (see below).
     def init_cmp_wkv():
-        return torch.randn(D, MAIN_OUT_DIM) / D ** 0.5
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0245
 
     def init_cmp_wgate():
-        return torch.randn(D, MAIN_OUT_DIM) / D ** 0.5
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0388
 
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.01
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
 
     def init_cmp_norm_w():
-        return torch.ones(HEAD_DIM)
+        return 0.9666 + 0.1929 * torch.randn(HEAD_DIM)
 
     def init_compress_state():
         state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
@@ -775,11 +783,8 @@ def build_tensor_specs(start_pos=None):
                 tbl[b, j] = b * MAIN_STATE_MAX_BLOCKS + j
         return tbl
 
-    def init_idx_wq_b():
-        return torch.randn(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
-
     def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) / D ** 0.5
+        return torch.randn(D, IDX_N_HEADS) * 0.2313
 
     def init_hadamard_idx():
         h = torch.ones((1, 1))
@@ -791,16 +796,16 @@ def build_tensor_specs(start_pos=None):
         return h / (IDX_HEAD_DIM ** 0.5)
 
     def init_inner_wkv():
-        return torch.randn(D, INNER_OUT_DIM) / D ** 0.5
+        return torch.randn(D, INNER_OUT_DIM) * 0.0293
 
     def init_inner_wgate():
-        return torch.randn(D, INNER_OUT_DIM) / D ** 0.5
+        return torch.randn(D, INNER_OUT_DIM) * 0.0512
 
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.01
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
 
     def init_inner_norm_w():
-        return torch.ones(IDX_HEAD_DIM)
+        return 0.6850 + 0.2610 * torch.randn(IDX_HEAD_DIM)
 
     def init_inner_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
@@ -990,8 +995,14 @@ def build_tensor_specs(start_pos=None):
         "post": shared_post,
         "comb": shared_comb,
     })
-    shared_idx_wq_b = init_idx_wq_b().to(torch.bfloat16)
-    idx_wq_b_i8, idx_wq_b_scale = quant_w_per_output_channel(shared_idx_wq_b)
+    # idx_wq_b is the only quantized indexer weight: simulate the real MXFP8 (e4m3 +
+    # 128x128-block E8M0) grid like the shared experts (199 levels, scaleCV ~0.61, ~1.1% zero
+    # spike) instead of a benign randn INT8. gen_shared_weight reduces over the last (in) dim
+    # and yields scale per output channel, so build [out, in] then transpose to [Q_LORA, out].
+    from decode_indexer import gen_shared_weight
+    idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight(
+        (IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
+    idx_wq_b_i8 = idx_wq_b_i8_T.t().contiguous()
     shared_weights_proj = init_weights_proj().to(torch.bfloat16)
     shared_hadamard_idx = init_hadamard_idx().to(torch.bfloat16)
     shared_idx_kv_cache = init_idx_kv_cache().to(torch.bfloat16)
@@ -1077,9 +1088,9 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
-            # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
-            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
+            # Tightened from CANN's 1e-2 bar: the realistic layer-8 hc_attn gates keep
+            # x_out well-conditioned, so it holds 0% over 3e-3 (worst rdiff well under 1).
+            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )

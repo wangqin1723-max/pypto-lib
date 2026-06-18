@@ -96,7 +96,7 @@ assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_
 
 
 @pl.jit
-def decode_layer_dp_ep(
+def decode_layer(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -256,7 +256,7 @@ def decode_layer_dp_ep(
 
 
 @pl.jit.host
-def host_orch_auto(
+def l3_decode_layer(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -363,7 +363,7 @@ def host_orch_auto(
         recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        decode_layer_dp_ep(
+        decode_layer(
             x_hc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
             attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
@@ -802,7 +802,7 @@ if __name__ == "__main__":
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
-    host_fn = host_orch_auto
+    host_fn = l3_decode_layer
     golden_fn = golden_decode_layer_auto
 
     result = run_jit(
@@ -828,10 +828,10 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # The composed attention->MoE smoke feeds quantized MoE with the
-            # real attention output distribution; keep KV strict and use a
-            # wider FFN envelope for this end-to-end bring-up check.
-            "x_next": ratio_reldiff(diff_thd=0.1, pct_thd=0.05),
+            # KV strict, x_next on an FFN envelope (one gate for all layer_id branches).
+            # Strict per-point bar: over-1e-2 fraction is swa ~6.1% / hca ~6.2% / csa ~8.1%
+            # (csa binding), so pct_thd=0.10. Alt: diff_thd=0.03, pct_thd=0.05 (all <=1.4%).
+            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.1),
         },
     )
     if not result.passed:

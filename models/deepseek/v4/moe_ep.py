@@ -589,16 +589,26 @@ def build_tensor_specs(layer_id=0):
     def init_x_hc():
         return torch.randn(N_RANKS, T, HC_MULT, D)
 
+    # Real layer-0 hc_ffn scale/base (fn synthetic at real magnitude). A synthetic
+    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling the FFN output and
+    # hc residual to near-zero in x_next where W8A8 noise blows up the relative tail.
     def init_hc_ffn_fn():
-        x = torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+        x = torch.randn(MIX_HC, HC_DIM) * 0.0635
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
     def init_hc_ffn_scale():
-        x = torch.ones(3) * 0.5
+        x = torch.tensor([0.11334, 0.035901, 0.058183])
         return x.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_hc_ffn_base():
-        x = torch.zeros(MIX_HC)
+        x = torch.tensor([
+            2.4153, -2.0252, -2.0019, -2.1947,
+            -1.5430, -3.0228, -6.8248, 0.5894,
+            2.1916, -7.2132, -3.0938, -2.1119,
+            -3.0161, 3.3293, -3.2224, -4.0226,
+            -2.0428, -3.3478, 3.0893, -3.4166,
+            -1.8144, -3.8147, -3.1307, 1.7862,
+        ])
         return x.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_norm_w():
@@ -742,9 +752,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            # BF16 x_next, same FFN precision floor as single-card moe.py (real-matched
-            # weights): ~1% of points > 5e-3. No max_diff_hd (near-zero cancellations).
-            "x_next": ratio_reldiff(diff_thd=5e-3, pct_thd=0.05),
+            # BF16 x_next, same FFN floor as single-card moe.py. Tightened 5e-3 -> 3e-3 with
+            # the real layer-0 hc_ffn gate (~2.1% of points > 3e-3). No max_diff_hd
+            # (near-zero residual/FFN cancellations blow up relatively).
+            "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
         },
     )
     if not result.passed:
