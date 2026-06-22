@@ -258,6 +258,16 @@ python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --export-kernel-insight
 Or run the exporter directly on an existing build via
 [`tools/export_all_kernel_insight.py`](../tools/export_all_kernel_insight.py).
 
+For ad-hoc, single-kernel profiling without a full model run, the
+`incore-profiling` skill
+([`.claude/skills/incore-profiling/`](../.claude/skills/incore-profiling/SKILL.md))
+builds a standalone single-core simulator testcase per kernel — driven by the
+kernel `.cpp` and its sibling `.pto`, with no PTOAS checkout — runs it under
+`msprof op simulator`, and emits the same Insight trace. De-clutter it into a
+Perfetto-viewable per-pipe swimlane with
+`python -m pypto.tools.clean_sim_trace <OPPROF_*> -o <out>`. See the skill's
+`SKILL.md` for the full flag reference and troubleshooting.
+
 ### Tuning rules
 
 #### 1. Fix tile-shape MTE hints from `perf_hints.log`
