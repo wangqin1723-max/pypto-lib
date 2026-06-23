@@ -881,3 +881,5 @@ y = pl.add(y, pl.row_expand_mul(pl.cast(pl.load(x_flat, [t0, 3*D+d0], ...), pl.F
 | `build_output/_jit_hc_pre_test_20260616_141903/dfx_outputs/merged_swimlane_20260616_141909.json` | `build_output/_jit_hc_pre_test_20260616_141948/dfx_outputs/merged_swimlane_20260616_141954.json` |
 
 机理参考（D_TILE=512、AIV 96us 那次）：`build_output/_jit_hc_pre_test_20260616_122317/dfx_outputs/merged_swimlane_20260616_122323.json`。PR: hw-native-sys/pypto-lib#545。
+
+![alt text](image-11.png)|![alt text](image-12.png)
