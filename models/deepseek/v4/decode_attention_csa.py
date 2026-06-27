@@ -115,8 +115,8 @@ def attention_csa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
-    cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
@@ -317,8 +317,8 @@ def attention_csa_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
-    cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
@@ -644,10 +644,10 @@ def build_tensor_specs(start_pos=None):
     # (no quant grid), so randn x measured-std is in-distribution; the RMSNorm gammas center
     # near a measured mean (not ones); idx_wq_b is the only quantized one (see below).
     def init_cmp_wkv():
-        return torch.randn(D, MAIN_OUT_DIM) * 0.0245
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0245
 
     def init_cmp_wgate():
-        return torch.randn(D, MAIN_OUT_DIM) * 0.0388
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0388
 
     def init_cmp_ape():
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
@@ -915,8 +915,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_cos.clone()),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_sin.clone()),
-        TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
-        TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
+        TensorSpec("cmp_wkv", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wkv),
+        TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec("compress_state", [MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], torch.float32, init_value=init_compress_state),
