@@ -35,16 +35,16 @@ fans out across scopes (mirroring hc_head.py's pure-AIC split-K):
                   latency floor that more cores cannot shorten).
   mix_x       x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD cores).
 
-Prefill (T=128): _hc_pre_prefill is the fused single-spmd variant (#533) — its
-token-tiles already saturate the chip, so the decode fan-out would only add AICPU
-dispatch overhead (the per-tile scopes multiply into hundreds of tasks). The
-dispatch does buy prefill one thing: with decode peeled off, every prefill tile
-is full, so the matmul reads x_flat in static LINEAR_T_TILE tiles and the old
-BF16 16-row pad scratch (a ~35us copy) is gone.
+Prefill (T=128): _hc_pre_prefill is the fused single-spmd variant (#533, with the
+#653 pad-free `valid_shape` + `fillpad` matmul) — its token-tiles already saturate
+the chip, so the decode fan-out would only add AICPU dispatch overhead (the
+per-tile scopes multiply into hundreds of tasks). The dispatch leaves this path
+unchanged.
 
-Device a2a3, best-of-N: decode ~125us -> ~70us; prefill ~147us -> ~85us. The
-mixed cube+vec prefill kernel still needs the pypto#1761 cube<->vec fix; the
-decode matmul reads pre-cast FP32 x_fp32, so it is a clean cube-only kernel.
+Device a2a3, best-of-N vs the pad-free fused baseline (post-#653): decode ~75us ->
+~68us (split-K parallelizes the otherwise-1-cube matmul); prefill ~unchanged
+(~87us, same fused path). The decode matmul reads pre-cast FP32 x_fp32, so it is a
+clean cube-only kernel; the mixed prefill kernel still needs the pypto#1761 fix.
 """
 
 
@@ -95,11 +95,6 @@ assert (DECODE_BATCH * DECODE_SEQ) % COMB_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % COMB_T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= LINEAR_T_TILE
 assert T_MAX % LINEAR_T_TILE == 0
-# _hc_pre_prefill reads x_flat in static LINEAR_T_TILE-row matmul tiles (no pad
-# scratch -- the decode/prefill dispatch means every prefill tile is full), so
-# the prefill token count must tile evenly by LINEAR_T_TILE or the last tile
-# would read past x_flat.
-assert (PREFILL_BATCH * PREFILL_SEQ) % LINEAR_T_TILE == 0
 assert HC_DIM % LINEAR_OK == 0 and LINEAR_K_PER_SPLIT % LINEAR_K_CHUNK == 0
 assert D % D_SPMD == 0 and D_SPMD % D_CHUNK == 0
 assert HC_DIM % CAST_K_SPMD == 0 and CAST_K_SPMD % RMS_K_CHUNK == 0
