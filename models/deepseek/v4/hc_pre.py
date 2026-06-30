@@ -273,7 +273,7 @@ def _hc_pre_decode(
         row2_cur = pl.div(row2_eff, col_sum)
         row3_cur = pl.div(row3_eff, col_sum)
 
-        for sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
+        for _sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
             row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
             row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
             row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
@@ -482,7 +482,7 @@ def _hc_pre_prefill(
         row2_cur = pl.div(row2_eff, col_sum)
         row3_cur = pl.div(row3_eff, col_sum)
 
-        for sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
+        for _sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
             row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
             row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
             row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
