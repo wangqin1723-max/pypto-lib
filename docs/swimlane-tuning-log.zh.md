@@ -883,3 +883,327 @@ y = pl.add(y, pl.row_expand_mul(pl.cast(pl.load(x_flat, [t0, 3*D+d0], ...), pl.F
 机理参考（D_TILE=512、AIV 96us 那次）：`build_output/_jit_hc_pre_test_20260616_122317/dfx_outputs/merged_swimlane_20260616_122323.json`。PR: hw-native-sys/pypto-lib#545。
 
 ![alt text](image-11.png)|![alt text](image-12.png)
+---
+
+## 17. UP_DOWN「咬合」靠 cube：注入哑 matmul 救活 subblock1，原地切 mix_x 实测 −25%（更正 §16「失败尝试 (b)(c)」）
+
+> 例子：`models/deepseek/v4/_tmp_updown_dummymm.py`（单 spmd，切 vs 不切 隔离）+ `_tmp_setvalidshape_split.py`（唯一真墙的最小复现）。
+> **更正 §16 结尾「失败尝试 (b)(c)」**：那两条说 `pl.split(UP_DOWN)` "编译崩 memory_reuse 溢出"、"T_TILE 16→32 爆 Vec 247KB" 当成死路——**不是死路**：那只是 UB 溢出（可过），且 UP_DOWN 根本没在纯向量 scope 上生效（白挂）。隔离后原地切 mix_x **实测 −25%**。
+
+### 17.1 关键机理：UP_DOWN 只在「含 cube(matmul)」的 scope 上咬合
+
+`pl.split(SplitMode.UP_DOWN)` 想把行劈到两个 AIV 子块（让闲着的 subblock1 干活）。但**它只在 scope 里有 cube(matmul) 时才生成「任务内子块切分」**；挂在**纯向量 scope** 上是 **no-op（白挂，不报错也不生效）**。
+
+判据（编译期，不上设备）——看生成的 AIV C++ 有没有子块 id：
+```bash
+python models/deepseek/v4/_tmp_updown_dummymm.py -p a2a3 --compile-only
+BD=$(ls -dt build_output/_jit_mixx_with_mm_* | head -1)
+grep -c get_subblockid $BD/kernels/aiv/*.cpp     # >0 = 真咬合；0 = 白挂
+```
+- `mixx_no_mm`（纯 mix_x + UP_DOWN）→ `get_subblockid = 0`（白挂）。
+- `mixx_with_mm`（+ 哑 matmul）→ `get_subblockid = 3` + `get_sub_block_id = 1`（真咬合）。
+
+> codegen 出处 `pypto/python/pypto/backend/pto_backend.py`：子块 id 三模式（fixed / runtime_bridge / 无）。纯向量 spmd 拿到「无」。注：`get_subblockid()` 是 body 宏、`get_sub_block_id(args)` 是 wrapper 取**逻辑** lane id；别直接调底层原生 intrinsic（返回的是物理子块号，A2A3 mixed-task 下 ≠ 逻辑 lane，会算错）。
+
+### 17.2 哑 matmul 技巧：给纯向量 scope 塞个微型 matmul 把 UP_DOWN 翻成真咬合
+
+```python
+# 例：mix_x scope 本是纯向量 → 塞一个哑 matmul，UP_DOWN 就生效，mix_x 行被劈到两子块
+for ob in pl.spmd(T // T_TILE, name_hint="mixx_mm", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+    t0 = ob * T_TILE
+    # —— 哑 matmul：只为让 cube 在场、UP_DOWN 咬合；输出存到 dummy_out 逃过 DCE ——
+    acc = pl.matmul(pl.cast(xb[t0:t0+T_TILE, 0:128], pl.FP32), wd, b_trans=True, out_dtype=pl.FP32)
+    dummy_out[t0:t0+T_TILE, 0:16] = acc      # 必须被「用」一下，否则死代码消除会删掉它
+    # —— 真正要切的 mix_x（纯向量），现在被劈到 veccore0/veccore1 各一半 ——
+    ... pre（row_sum 取 col-major）... mix_x D-loop -> x_mixed ...
+```
+
+两个硬约束：
+- **T_TILE ≥ 32**：UP_DOWN 劈半后 cube 要 ≥16 行（fractal 下限，否则 `boxed tile rows multiple of innerRows(16) got 8`）。
+- 哑 matmul 维度 **cube-legal**：N 为 16 的倍数（我一开始 N=8 也被拒）。
+- 哑 matmul 很便宜（in-core ~1.3us）。
+
+### 17.3 实测：原地切 mix_x = **−25%**（单 spmd 隔离，无 de-fusion 干扰）
+
+`_tmp_updown_dummymm.py` 两函数都是**单 spmd**，唯一差别 = 有没有哑 matmul：
+
+| 单 spmd 版本 | in-core | L2 (`--enable-l2-swimlane`) |
+|---|---|---|
+| 不切（mix_x 跑单子块，UP_DOWN no-op） | veccore0 满载 / veccore1 闲 | **56.76us** |
+| 切（哑 mm 咬合，mix_x 50/50） | **veccore0 = veccore1 = 22us（各 567 指令、87% util）** | **42.42us** |
+
+→ **−25%。subblock1 真被填满、向量尾 44→22us 真 halved。** 注意必须**隔离测**：把 mix_x 拆成独立 scope 再切（de-fused），mix_x 那 −14us 会被拆 scope 的 GM 往返（~+16us/桥）赔光（3-scope 实测 109us > 融合 92.6）——所以**收益要原地（融合内）切才拿得到**。
+
+### 17.4 完整 hc_pre 原地切的「四堵墙」——前三堵可过，真墙只剩 `set_validshape`
+
+把 hc_pre 融合 scope `NONE→UP_DOWN` 直接编（**不用加哑 matmul，真 RMS+linear matmul 已在场、自己咬合**），逐层 dump 完整报错：
+
+| # | 墙 | 报错 | 过法 |
+|---|---|---|---|
+| 1 | transpose | `UP_DOWN but contains a tile.transpose that swaps the split axis` | 换 row_sum 取列（逐 head GM 读 → row-major sigmoid → `row_sum` 出 col-major [T,1]） |
+| 2 | cube 16 行下限 | `boxed tile rows multiple of innerRows(16) got 8` | `T_TILE = 32` |
+| 3 | **UB 溢出**（= §16 误判的"memory_reuse 崩"） | `Vec buffer 193344 > 188416`（只超 ~4KB） | mix_x **顺序累加** + `LINEAR_K_TILE 256→128`（缩 x_lin） |
+| 4 | **`set_validshape`** | `set_validshape op expects row operand <= shape dim (16)` | ❌ **唯一真墙，源码无解** |
+
+> **法则（UP_DOWN 切分排雷顺序）**：先确认咬合（§17.1 grep get_subblockid，纯向量要塞哑 matmul）；再过 cube 16 行下限（T_TILE≥32）；再过 UB（顺序累加 + 缩 K-tile，**别把 UB 溢出当死路**）；最后大概率卡在 `set_validshape`（窄列写）。
+
+### 17.5 唯一真墙：`set_validshape × UP_DOWN`（窄列写）——最小复现
+
+- **机理**：FP32 UB tile 行须 ≥32B（≥8 列），所以 `[T,4]` 这种**窄输出**只能用 8 宽 tile + `pl.set_validshape(tile, T_TILE, 4)` 写出 4 个有效列（=「窄列写」，post/comb 都这么写）。UP_DOWN 把行劈给两子块、每块物理只剩 16 行，但 `set_validshape` 的 **row 参数写死 T_TILE=32**、split pass 没改写它 → `32 > 16` 报错。
+- **最小复现** `models/deepseek/v4/_tmp_setvalidshape_split.py`（自包含 ~60 行）：`--no-split`(NONE) **PASS**；默认(UP_DOWN) **报错**，差别仅一个 `optimizations=[pl.split(UP_DOWN)]`。已报 pypto issue。
+- **修复方向**：① split pass 把 `set_validshape` 的 row 操作数自动改写成劈后行数（T_TILE→T_TILE/2）；② 让 UP_DOWN 支持窄列写。
+
+### 17.6 桌上的收益 & 给 hc_pre 用时的注意
+
+- **原地切 mix_x = −25%（实测）**；前三堵墙都能过；唯一拦路 = `set_validshape × UP_DOWN`。修了它，完整 hc_pre 大概率 **92.6 → ~78us（−15%）**。
+- **hc_pre 不用加哑 matmul**——真 RMS+linear matmul 已在融合 scope 里，UP_DOWN 自己咬合。哑 matmul 只用于「想切一个没有 matmul 的纯向量 scope」（隔离测 / de-fused，但 de-fused 路亏）。
+- **还没验的点**：真 matmul 在切分 scope 里**自己也被劈半**（M=32→16），`T_TILE=32` 下 cube 下限满足，但 **matmul+RMS 的 row_sum 在行劈下数值对不对没验过**（卡在 set_validshape 前没跑成）。set_validshape 修好后，**第一件事是验 x_mixed/mixes 数值正确性**，别只看编过。
+前后泳道图：
+![alt text](image-11.png) ![alt text](image-12.png)
+
+---
+
+## 18. ratio4 compressor softmax_pool 头维加宽（8×[1,64] → 1×[1,512]，busy −48%）
+
+> `models/deepseek/v4/decode_compressor_ratio4.py`，standalone compressor，B=64, HEAD_DIM=512, HEAD_TILE=64, STATE_LEN=8。
+> **接第 10 节**：§10 把 task 数从 512 粗化到 64（`pl.spmd(B)` + 内层 `pl.range(HEAD_DIM//HEAD_TILE)`，攻的是 **task 发射开销 + 解放核给 qr_rope**）。本节在 §10 的成果之上，进一步把那个内层 `pl.range` 的 8 个 `[1,HEAD_TILE=64]` 碎 tile **塌成单个 `[1,HEAD_DIM=512]` 整 tile**，攻的是**每 task 内部的 op 发射 + GM transaction 笔数**。同一个 scope、不同的杠杆、叠加。
+
+**改动前**（§10 形态：内层 8 次 `pl.range`，每轮 online-softmax 在 `[1,64]` 上跑）
+
+```python
+for hb in pl.range(HEAD_DIM // HEAD_TILE):           # 8 轮
+    h0 = hb * HEAD_TILE
+    mi = compress_state_flat[last_row:last_row+1, OUT_DIM+HEAD_DIM+h0 : ...+HEAD_TILE]  # [1,64]
+    li = pl.exp(pl.sub(mi, mi)); oi = compress_state_flat[..., HEAD_DIM+h0 : ...+HEAD_TILE]
+    for s in pl.range(0, COMPRESS_RATIO):            # front 窗
+        if prev_abs >= 0: ... mi/li/oi 各 [1,64] 的 max/exp/mul/add ...
+    for s in pl.range(0, COMPRESS_RATIO - 1):        # back 窗
+        ... [1,64] 上 fold ...
+    pooled_kv[c_idx:c_idx+1, h0:h0+HEAD_TILE] = pl.div(oi, li)
+```
+
+**改动后**（去掉 hb 循环，所有 tile 宽 = 整 HEAD_DIM，列范围用符号常量；online fold 数学一字未改）
+
+```python
+mi = compress_state_flat[last_row:last_row+1, OUT_DIM+HEAD_DIM : COMPRESS_STATE_DIM]  # [1,512]
+li = pl.exp(pl.sub(mi, mi)); oi = compress_state_flat[..., HEAD_DIM : OUT_DIM]
+for s in pl.range(0, COMPRESS_RATIO):                # front 窗
+    if prev_abs >= 0:
+        front_score = compress_state_flat[prev_row:prev_row+1, OUT_DIM : OUT_DIM+HEAD_DIM]
+        front_kv    = compress_state_flat[prev_row:prev_row+1, 0 : HEAD_DIM]
+        ... mi/li/oi 各 [1,512] 的 max/exp/mul/add ...
+for s in pl.range(0, COMPRESS_RATIO - 1):            # back 窗
+    back_score = compress_state_flat[cur_row:cur_row+1, OUT_DIM+HEAD_DIM : COMPRESS_STATE_DIM]
+    back_kv    = compress_state_flat[cur_row:cur_row+1, HEAD_DIM : OUT_DIM]
+    ... [1,512] 上 fold ...
+pooled_kv[c_idx:c_idx+1, 0 : HEAD_DIM] = pl.div(oi, li)
+```
+
+**原因（为什么 bit-identical）**：online softmax 是**逐列独立**的——512 个 head-dim 列各自带自己的 `mi/li/oi`，列与列之间无交互；front_kv / back_kv / front_score / back_score 在 state 里各是一整条**连续的 HEAD_DIM 宽 slab**。所以 `[1,512]` 切片读到的数据 = 8 个 `[1,64]` 拼起来，逐元素算结果完全一致。纯 tiling 变化，不动逻辑。
+
+**原因（为什么变快）**：宽化把 **vector op count** 和 **GM load transaction 笔数**各砍 8×（HEAD_DIM/HEAD_TILE）。ALU 干的活、搬的字节数都不变——消掉的是每条向量指令的固定发射开销、每笔访存的地址生成/描述符开销。`[1,64]` FP32 只 256B、向量 ~1 cycle 就算完却要付整份发射开销；`[1,512]` 一条指令喂满流水 8 cycle 只付 1 份。**busy −48% 说明原来差不多一半时间是过路费，不是有效工作**——这是碎 tile 的典型病。
+
+> **法则——`busy` 和 `span` 是两个量，别混**：`busy = Σ dur`（所有 task 实例时长求和 = 跨核总工作量，串到 1 核要花的时间）；`span = max(finish) − min(dispatch)`（并行后的墙钟时间窗）。本节 busy 砍 48% 但 span 只砍 17%——总工作量减半了，墙钟窗口还被「单 task 内部的串行依赖链 + 调度/straggler」托着，那些没变。**比 perf 优先看 busy**（两次跑 task 数同口径、最干净），span/wall 掺并行+调度噪声。
+
+结果（standalone `decode_compressor_ratio4.py`，真机 a2a3，**同-session A/B**，softmax_pool scope）：
+
+| 指标 | 改动前(online) | 改动后(widen) | 变化 |
+|---|---|---|---|
+| softmax_pool task 实例数 | 128 | 128 | 同口径 |
+| softmax_pool vector busy（Σdur） | 2299.5us | 1189.2us | **−48.3%** |
+| softmax_pool span | 45.5us | 37.8us | **−17%** |
+| compressor 总 wall | 320.3us | 320.6us | **中性** |
+
+**总 wall 为什么不动**：softmax_pool **不在关键路径**——它在调度里叠在 `kv_score_proj`（占 ~61% wall）底下被 overlap 掉。砍它的 busy = 释放一批 vector cycle，但没缩短决定总时长的那条链。属于「省了电、没省时」：现在 wall 中性、vector 占用降半；将来 kv_score_proj 真被压下去（ratio128 路线）、softmax_pool 浮上关键路径时，这 −48% 直接兑现成 wall 收益。
+
+> **踩坑（同-session baseline 是铁律）**：第一次我拿一个旧 build（`_jit_compressor_test_20260626_102331`，kv_score_proj 16 task / 总 wall 205us）当 baseline 对比，结构和当前代码（64 task / 320us）根本不同，得出「widen 无效（busy 只 −4%）」的**错误结论**。git stash 出原版、在同环境背靠背重跑后才看出真实 −48%。**比 perf 必须同 session、其余代码一致**，否则 cross-run 漂移直接把结论带歪。
+
+精度：standalone 三输出（kv / compress_state / cmp_kv_cache）全 PASS。
+
+> **失败的姊妹尝试（Lever B：two-pass，已 park）**：试过把 online 串行 fold 整个换成 ratio128 式 two-pass（`row_max → exp(row_expand_sub) → row_sum → row_expand_div → row_sum(kv·prob)` + transpose，沿 STATE_LEN 归约、HEAD_DIM 行并行，理论上连串行依赖链都干掉）。但 ① 全 HEAD_DIM 版 UB 溢出（296960 > 188416）；② POOL_TILE=256 分块版编过但**精度 FAIL**（kv + cmp_kv_cache 挂、compress_state PASS，疑 `pl.full(-inf)` 掩码在 overlap 双窗下没对齐 online 的 prev_abs guard 语义）。两版躺在 stash，待日后 debug。Lever A(widen) 和 B(two-pass) 打的不是同一个点：A 攻 op/transaction 笔数、保留串行链；B 攻串行链本身。
+
+> 验证 build：baseline `build_output/_jit_compressor_test_20260626_173729`，widen `..._172915`（dfx_outputs/merged_swimlane_*.json）。解析法：读 traceEvents 取 `ph=="X"` 且 name 以 `softmax_pool(` 开头的事件，`busy=Σdur`、`span=max(ts+dur)−min(ts)`。已提 PR **hw-native-sys/pypto-lib#624**。
+![alt text](image-13.png)，![alt text](image-14.png)
+---
+
+## 19. kv_score_proj 权重转置 + b_trans（ND2NZ→DN2ZN，−14% busy / −7% compressor wall）
+
+> `models/deepseek/v4/decode_compressor_ratio4.py` 的 `kv_score_proj`（compressor 关键路径，~61% wall），standalone，B_TILE=64, K_TILE=512, OUT_TILE=64。
+> 起因：incore op-sim 看 `kv_score_proj.clean.json`，发现它**死死 MTE2-load-bound**——MTE2 5 条子队列并集 23.58us **0 gap（100% 占满）**，CUBE 只 4.8us/23%。所有 load 都是 `MOV_OUT_TO_L1_MULTI_ND2NZ`（ND→NZ fractal 转换）。
+
+**诊断链（关键，避免走错路）**：
+1. **不是 per-lane gap 可压**：5 条 lane 平均并发 3.62/5，但并集 0 gap。想填满 lane → 加深 pipeline，但 **stage=3 实跑 `Mat buffer 576KB > 512KB` L1 溢出**，stage=2 已是极限。
+2. **不是裸带宽墙**：每 load ~21GB/s/lane，远低于 HBM 天花板 → **transaction-bound**（ND2NZ 把 row-major `[K,N]` 拼 16×16 fractal 块 = 大量短 strided burst）。
+3. **NZ 预打包绕不过**：cube L0B 要 NZ、GM 只能 ND；声明 `pl.Tensor[...,pl.NZ]` 输入 **codegen 静默忽略**（probe `_tmp_nz_weight_probe.py`：NZ vs ND 生成的 `.pto` 逐字节相同）。
+
+**真正的杠杆 = `b_trans`**：weight 存成 `[OUT_DIM, D]`（转置）+ `pl.matmul(..., b_trans=True)`，把 load 从 ND2NZ 变 **DN2ZN**。
+
+```python
+# 改前（ND2NZ）：weight [D, OUT_DIM]，读 [K_TILE, OUT_TILE] → 沿 K 是 256 个 64 宽碎 burst
+wkv_tile = wkv[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
+kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
+# 改后（DN2ZN）：weight [OUT_DIM, D]，读 [OUT_TILE, K_TILE] → 每行 K 个连续 = 长 burst
+wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+```
+
+fractal 转换仍在做，但 **碎 burst → 长 burst，transaction 笔数大减**。
+
+结果（同-session A/B，**busy 为准**——span/wall 带 ~10% run 噪声）：
+
+**standalone `decode_compressor_ratio4`**（2 跑干净，真机 a2a3，rebase 到含 #624 widen 的 main 上）：
+
+| 指标 | ND2NZ | b_trans(DN2ZN) | 变化 |
+|---|---|---|---|
+| kv_score_proj busy（Σdur） | 6456us | 5479us | **−15.1%** |
+| compressor 总 wall | 294.6us | 270.2us | **−8.3%** |
+
+**完整 `decode_attention_csa` 整图**（3 跑取中位数，真机 a2a3）：
+
+| 指标 | ND | b_trans | 变化 |
+|---|---|---|---|
+| kv_score_proj busy | 1299us | 912us | **−29.8%** |
+| 整图 total wall | 4304us | 3750us | **−12.9%** |
+
+> CSA 整图 wall 的绝对值 session 敏感（idle gap 撑大，不同 session 差 ~2.7×）；**单跑不可信**（曾出现 +20% 假象），3 跑中位数方向稳健（b_trans 全部低于 ND），量级 ≈ −10%（区间 −8~−15%）。standalone −8.3% 与 busy 降幅是硬数。
+
+精度：standalone 三输出 + `decode_attention_csa` 整图（x_out / kv_cache）+ `decode_fwd` 全 PASS（a2a3 上板 CI 绿）。
+
+> **法则**：matmul scope 若 incore 看到 `MOV_OUT_TO_L1_MULTI_ND2NZ` 且 per-lane GB/s 偏低 → 先试 `b_trans`（weight 转置存，host 端一次性免费）再下"带宽墙"结论。这**推翻**了之前"kv_score_proj levers exhausted"——有可回收的 transaction 开销，只是不在 NZ-prepack（框架 no-op）或 pipeline 深度（L1 墙）上。
+>
+> **全链传播（耦合坑，血泪）**：`compressor_ratio4` 被整条 decode CSA 链共享，改权重签名必须**一路传播**否则 caller OOB/编译崩：
+> - `decode_compressor_ratio4`：wkv/wgate → `[OUT_DIM, D]`，matmul `b_trans=True`
+> - `decode_attention_csa`：cmp_wkv/cmp_wgate → `[MAIN_OUT_DIM, D]`（含 golden/specs）
+> - `decode_layer`：csa_cmp_wkv/wgate → `[.., MAIN_OUT_DIM, D]`
+> - `decode_fwd`：stacked `[NUM_LAYERS*MAIN_OUT_DIM, D]`，per-layer slice 偏移改 `loop_i*MAIN_OUT_DIM`
+> 不动：HCA 走 `compressor_ratio128`、inner 走 `indexer_compressor` —— 都不是 `compressor_ratio4`，**不要误改**。只漏改 decode_layer/decode_fwd 时：列越界 → 运行时 **507018**（device drain，非 shape 报错，迷惑性强）。
+>
+> **排查弯路（记一笔，省下次的命）**：传播后 CI 上板报 `Subscript-write shape mismatch: window expects 0, source has 128`，定位发现是 **`decode_attention_swa.py:180`（跟 b_trans 无关！）**——我的分支基于**旧 base**带旧 SWA，在**新 pypto 的严检查**下越界；新 main（#629 SWA 重写）不会。decode_fwd/decode_layer 走 SWA 才中招，compressor/CSA 不碰 SWA 所以一直绿。**修复 = rebase 到新 main**，不是改 b_trans。教训：① 报错文件名要看准（别假设是自己改的文件）；② 本地复现不出 CI 报错先查 **pypto 版本偏差**（CI 用 `ci.yml` pin 的 origin HEAD，本地可能落后；`python -c "import pypto;print(pypto.__file__)"` + `git -C <pypto> rev-list --count HEAD..origin/main`）；③ 本地编译干净 ≠ CI 干净（CI `rm -rf build_output` 全新 trace，本地有缓存）。
+>
+> 验证 build：standalone ND `_jit_compressor_test_20260627_115352`、b_trans `..._115315`；CSA 3 跑见 `csa_{btrans,ndbase}_x3_626.log`。PR **hw-native-sys/pypto-lib#628**（`perf/dsv4-compressor-btrans-load`，a2a3 上板 CI 绿；sim 不看护、忽略）。probe：`models/deepseek/v4/_tmp_nz_weight_probe.py`（`PROBE_NZ`/`PROBE_TRANS`）。
+
+![alt text](img_v3_02132_71914fdb-c67c-427d-8d12-7860b9cd279g.jpg)![alt text](image-15.png)
+
+
+---
+
+## 20. ratio128 softmax_pool 按块批量加载 + 列归约去转置（hca 整图 wall −8.7%）
+
+> `models/deepseek/v4/decode_compressor_ratio128.py` 的 `softmax_pool`，B=64, HEAD_DIM=512, STATE_LEN=128, COMPRESS_STATE_BLOCK_SIZE=8（每页 8 个 state 行）, COMPRESS_STATE_DIM=1024, OUT_DIM=512, HEAD_TILE=64。
+> 起因：incore op-sim 看 `softmax_pool.clean.json`，发现它 **MTE2-load-bound**——veccore span 20.58us 里 MTE2 占 69%（**256 笔 `[1,64]` 散读**，每笔 ~211ns），VECTOR 占 63% 但**绝大部分是搬运不是算**（`MOV_UB_TO_UB` 逐行 staging + `VNCHWCONV` 两次转置，真 softmax 算子 VEXP/VDIV/VCADD 合计 <1us）。
+> **与 §18 的区别**：§18 是 ratio4、online-softmax 形态、且 softmax_pool **不在关键路径**（叠在 kv_score_proj 下，wall 中性）。本节是 ratio128、two-pass softmax 形态，且在 hca 整图里 softmax_pool 是**第 2 忙 scope**（9495us，>40% of qk_pv）——所以这里的优化**直接兑现成 wall**，**推翻**了 §18「softmax_pool off critical path」的假设在 ratio128/hca 上不成立。两轮叠加。
+
+### Round 1 — 逐行散读 → 按物理块批量读
+
+**关键观察（为什么块对齐永远成立）**：`STATE_LEN=128` 个连续 state 位置，起点 `state_pos0 = (first_pos // COMPRESS_RATIO) * COMPRESS_RATIO`，必是 `COMPRESS_RATIO=128` 的倍数 ⇒ 必是 `COMPRESS_STATE_BLOCK_SIZE=8` 的倍数。所以这个窗口**恰好覆盖 `NUM_STATE_BLOCKS = 128/8 = 16` 个完整物理块，无残头残尾**。
+
+**改动前**（每 s 一行散读 + 逐行 staging，128 轮）
+
+```python
+for idx in pl.spmd(b_dim * HEAD_DIM // HEAD_TILE, name_hint="softmax_pool"):
+    softmax_score_state = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
+    softmax_kv_state    = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
+    for s in pl.pipeline(STATE_LEN, stage=2):                 # 128 轮，每轮 2 个 [1,64]
+        state_blk_id = ...block_table[gc, state_pos // 8]...  # 每行查一次 block table
+        kv_col0 = state_intra * COMPRESS_STATE_DIM + h0
+        slot_score = compress_state_flat[blk:blk+1, OUT_DIM+kv_col0 : +HEAD_TILE]  # [1,64] 散读
+        slot_kv    = compress_state_flat[blk:blk+1,         kv_col0 : +HEAD_TILE]  # [1,64]
+        softmax_score_state[s:s+1, :] = slot_score           # 逐行 staging（MOV_UB_TO_UB）
+        softmax_kv_state[s:s+1, :]    = slot_kv
+    softmax_score_state_t = pl.transpose(softmax_score_state, axis1=0, axis2=1)    # 转置 ×2
+    softmax_kv_state_t    = pl.transpose(softmax_kv_state,    axis1=0, axis2=1)
+    score_max  = pl.row_max(softmax_score_state_t)
+    score_exp  = pl.exp(pl.row_expand_sub(softmax_score_state_t, score_max))
+    score_sum  = pl.row_sum(score_exp)
+    score_prob = pl.row_expand_div(score_exp, score_sum)
+    pooled_chunk_t = pl.row_sum(pl.mul(softmax_kv_state_t, score_prob))
+    pooled_kv[gc:gc+1, h0:h0+HEAD_TILE] = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
+```
+
+**改动后**（每块一次 `[8,64]` 跨步读，16 轮；block table 每块查一次；softmax 数学不变）
+
+```python
+compress_state_rows = pl.reshape(compress_state,
+    [compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])  # 每个 slot 一行
+NUM_STATE_BLOCKS = STATE_LEN // COMPRESS_STATE_BLOCK_SIZE                         # 16
+for idx in pl.spmd(b_dim * HEAD_DIM // HEAD_TILE, name_hint="softmax_pool"):
+    ...
+    base_logical_blk = state_pos0 // COMPRESS_STATE_BLOCK_SIZE                    # 窗口块对齐
+    for blk_i in pl.pipeline(NUM_STATE_BLOCKS, stage=2):                          # 16 轮，每轮 2 个 [8,64]
+        state_blk_id = ...block_table[gc, base_logical_blk + blk_i]...            # 每块查一次
+        row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE
+        s0   = blk_i * COMPRESS_STATE_BLOCK_SIZE
+        slot_score = compress_state_rows[row0:row0+8, OUT_DIM+h0 : OUT_DIM+h0+HEAD_TILE]  # [8,64] 跨步
+        slot_kv    = compress_state_rows[row0:row0+8,        h0 :        h0+HEAD_TILE]    # [8,64]
+        softmax_score_state[s0:s0+8, :] = slot_score                             # 整块落，无逐行 staging
+        softmax_kv_state[s0:s0+8, :]    = slot_kv
+    # transpose + row-reduce 段不变
+```
+
+**为什么 bit-identical**：`reshape [block,8,1024] → [block*8,1024]` 后，一个物理块的 8 个 state 行在 flat 布局里就是 8 行连续；`[8,64]` 跨步读到的元素 = 原来 8 次 `[1,64]` 散读拼起来，落进 `softmax_score_state[s0:s0+8]` 的同一批位置。纯加载粒度变化，softmax 段一字未动。设备验证 `max_error_ratio=0.0`。
+
+**为什么变快**：MTE2 **transaction 笔数 8×↓**（256→32），且每笔从 `[1,64]`（256B 短 strided）变 `[8,64]`（更长 burst）；逐行 `MOV_UB_TO_UB` staging 消失（整块直接落 UB）。incore（a2a3 op-sim 单 task，position_ids 喂 127 激活 gate）：
+
+| 指标 | 改前（逐行） | 改后（块读） | 变化 |
+|---|---|---|---|
+| MTE2 cycles（跨核求和） | 450249 | 43474 | **−90.3%** |
+| MTE2 load 笔数 | 256 | 32 | **8× 更少** |
+| VECTOR cycles | 473236 | 91948 | **−80.6%**（staging 消失） |
+| veccore0 span | 20.58us | 7.73us | **−62.4%** |
+
+### Round 2 — 列归约去转置 → HEAD_TILE 加宽 64→128
+
+转置（`VNCHWCONV` 1.05us）存在的唯一原因是 `row_max/row_sum` 只沿**最后一维**归约，而 softmax 要沿 **state 轴**归约。改用**列归约**（沿行/axis-0 归约）就不需要转置。转置一去，UB 省出来 → `POOL_HEAD_TILE` 可加宽到 128，每块加载冗余从 8×（HEAD_DIM/64）降到 4×（HEAD_DIM/128）。
+
+**改动后**（独立常量 `POOL_HEAD_TILE=128`，保留 HEAD_TILE=64 给 rmsnorm_rope）
+
+```python
+POOL_HEAD_TILE = 128                                          # 4 个 head-tile/batch（原 8）
+for idx in pl.spmd(b_dim * HEAD_DIM // POOL_HEAD_TILE, ...):  # 任务数 512→256
+    softmax_score_state = pl.create_tensor([STATE_LEN, POOL_HEAD_TILE], ...)  # [128,128]
+    softmax_kv_state    = pl.create_tensor([STATE_LEN, POOL_HEAD_TILE], ...)
+    ...  # 块读同 R1，宽度换成 POOL_HEAD_TILE
+    # 沿 state 轴（行）直接列归约，去掉两次 transpose：
+    score_max  = pl.col_max(softmax_score_state)                       # [1,128]，沿行求 max
+    score_exp  = pl.col_expand_expdif(softmax_score_state, score_max)  # 融合 exp(x - col_max)
+    score_sum  = pl.col_sum(score_exp)                                 # [1,128]
+    score_prob = pl.col_expand_mul(score_exp, pl.recip(score_sum))     # /sum = ×recip(sum)
+    pooled_chunk = pl.col_sum(pl.mul(softmax_kv_state, score_prob))    # [1,128]，已是目标形状
+    pooled_kv[gc:gc+1, h0:h0+POOL_HEAD_TILE] = pooled_chunk            # 无需 reshape
+```
+
+> **坑——`col_expand_sub` / `col_expand_div` 没有 codegen**：Python API 里有，但 `tile.col_expand_sub` 报 `No codegen registered`。能用的列广播只有 `col_expand_mul`（codebase 64 处验证过）。绕法：① 减 max 用 **`col_expand_expdif`**（融合算 `exp(x - col_vec)`，正好是 stable-softmax 的 exp，省一步且避开 sub）；② 除 sum 用 **`col_expand_mul(x, recip(sum))`**。两者都 bit-identical PASS。
+
+**为什么 bit-identical**：列归约沿 state 轴、逐 head-dim 列独立，归约的是同一批 128 个 state 值、同样顺序 ⇒ 结果与「转置后 row 归约」逐元素一致。HEAD_TILE 加宽只是切片更宽。`max_error_ratio=0.0`。
+
+**代价（诚实记一笔）**：列归约比「转置 + 行归约」更吃 vector——per-task VECTOR 4.85→13.46us，kernel 从 MTE2-bound 变 **VECTOR-bound**（span 由 VECTOR 主导）。但因为同时砍掉转置 + head 数翻倍（每 task 干 2× 的 head、任务数减半），**净 per-batch core-time −30%**（incore 61.8→43.3us/batch）。`POOL_HEAD_TILE=256` 装不下（`3×[128,256] FP32 > 192KB` UB），128 是上限。
+
+### 整图结果（decode_attention_hca，真机 a2a3，3 跑，**噪声受控**）
+
+整图全程 bit-identical（`x_out` / `kv_cache` 容差内 PASS）。wall 从 `l2_swimlane_records.json` 重建（这几次 swimlane 的 Latency/Total 列没采到=0，需 `runtime_debug_mode=1`+`DUMP_DEVICE_PERF`；wall = `max(finish)−min(dispatch)`，`field[1]`=func key 偏移 2^32，tick@50MHz）。
+
+| 版本 | 整图 wall | softmax_pool core-time | qk_pv（无关 scope，判噪声） |
+|---|---|---|---|
+| 原始（逐行 + 转置） | 1303.6us | 9495us（**第 2 忙**, avg18.54, n512） | 22301us |
+| R1 块读 HT64 | 1276.2us | 3203us（avg6.26, n512） | **19754us**（这次跑得偏快） |
+| **R2 块读 + 列归约 HT128** | **1190.1us** | **2792us**（avg10.91, n256, **−71%**） | 21918us（≈原始） |
+| **Δ（R2 vs 原始）** | **−113.5us (−8.7%)** | **−71%** | matched ⇒ 非噪声 |
+
+> **法则——wall A/B 必须用「匹配的无关 scope」判噪声**：这次差点被骗。R1 单看 wall 1276 比原始 1304 只降 27us，且 R1 那次 `qk_pv`（跟 softmax_pool 完全无关）跑出 19754us，比正常的 ~22000 低了 2500us——**R1 的 wall 收益大半是那次 session 的 qk_pv 偶然跑得快，不是我的改动**。正确做法：拿原始 vs R2 比，因为两者 `qk_pv` 几乎一致（22301 vs 21918），**−114us wall 才是真实归因**。其它无关 scope（state_scatter / off3 / off12 等）三跑稳定在 ~1-2% 内，也佐证 R2 这次不是「快 session」。**单跑 wall 不可信，且不能只看自己改的 scope——锚一个不该变的大 scope。**
+
+> **法则——按块批量加载是 paged-pool MTE2-bound 的标准杠杆**：分页 KV/state 池的 pooling，若窗口块对齐（起点是 block_size 倍数），就把「逐行 `[1,N]` 散读」换成「逐块 `[block_size, N]` 跨步读」——transaction 笔数 ÷block_size、burst 变长、省掉逐行 staging。比改算法便宜得多。
+
+> **incore profiling 踩坑（数据依赖 kernel 会假装很快）**：softmax_pool 有 gate `position_ids % 128 >= 128-S`（S=2 ⇒ 需 ≥126），auto-golden 把 `position_ids` 清零 ⇒ gate 不进、跑 0 轮 ⇒ 退化 trace（skill 报 `degenerate trace`）。修法：在生成的 case 里把 `v1.bin`（position_ids）写成 127，手动重跑 `msprof op simulator`（见 incore-profiling skill 的 Caveats）。per-instruction cost 与数据无关，只需让控制张量真实。
+
+精度：standalone `decode_compressor_ratio128`（kv / compress_state / cmp_kv_cache）+ `decode_attention_hca` 整图（x_out / kv_cache）全 PASS，两轮均 `max_error_ratio=0.0`。
+
+> 验证 build：原始 `_jit_attention_hca_test_20260629_150217`、R1 `..._161532`、R2 `..._165013`（`dfx_outputs/l2_swimlane_records.json`）；incore `build_output/incore_softmax_pool_ratio128_blockload_20260629`（R1）、`..._colreduce_ht128_20260629`（R2，含 `summary.txt` 记录复现条件）。PR **hw-native-sys/pypto-lib#641**（`perf/dsv4-compressor-softmax-pool-blockload`，基于 main，不依赖在途的 #628 b_trans 分支——改的是不同行）。
+
+
+![alt text](image-20.png)
+![alt text](image-21.png)
+![alt text](image-22.png)
+三次的泳道图对比：
+![alt text](image-18.png)
+![alt text](image-17.png)，
+![alt text](image-16.png)
