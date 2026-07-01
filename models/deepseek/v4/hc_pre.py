@@ -6,18 +6,45 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 hc_pre (dynamic shape) fused into a SINGLE pl.spmd scope.
+"""DeepSeek-V4 hc_pre (dynamic shape) — T-adaptive: split-K (decode) + fused (prefill).
 
-Based on the dynamic-shape hc_pre.py (5 scopes: linear / split_pre_post /
-write_post / comb_sinkhorn / mix_x). Here all five are folded into ONE spmd
-loop over the dynamic token tiles: per tile we do the RMS+linear matmul into a
-GM scratch row, then read it straight back (intra-task) to produce pre/post/
-mix_x/comb — no cross-scope GM intermediates (pre_val_store / post_pad_store /
-comb_logits are gone).
+hc_pre wants opposite tilings in the two regimes, so it dispatches on T = B*S at
+runtime (hc_pre inlines into each decode/prefill attention kernel, so each context
+keeps only its branch):
 
-Requires the SplitVectorKernel cube->vec fix (pypto#1761): fusing the cube
-matmul with the vector epilogue in one task previously 507018-deadlocked
-because the split=0 cube<->vec pipe ops were replayed into both AIV subblocks.
+  T <= LINEAR_T_TILE  -> _hc_pre_decode   (small T: one token-tile)
+  else                -> _hc_pre_prefill  (large T: many token-tiles)
+
+Decode (T=8): the fused single-spmd shape runs the whole op on one core (1 of 24
+AIC / 1 of 48 AIV) — one token-tile is one spmd block. _hc_pre_decode instead
+fans out across scopes (mirroring hc_head.py's pure-AIC split-K):
+
+  cast        x (BF16) -> x_fp32 (FP32), so the projection is a pure-AIC matmul
+  x_pad       zero-fill x_fp32 rows [t_dim:t_linear] (decode pads 8->16 rows)
+  rms         sum-of-squares over HC_DIM -> inv_rms (overlaps seed+linear)
+  seed        zero-seed mixes_raw for the atomic-add accumulation
+  linear      SPLIT-K matmul: (t_linear/LINEAR_T_TILE)*LINEAR_OK tasks, each one
+              token-tile x one 1/OK K-slice, atomic-adding its FP32 partial into
+              mixes_raw. Decode goes 1 cube task -> LINEAR_OK (~40us -> ~7us).
+              assemble(atomic=Add) is device-only -- the a2a3sim / a5sim sims do
+              not model it, so those two sim CI checks are skipped for hc_pre.
+  split_pre_post  scale mixes_raw by inv_rms, then sigmoid -> pre / post-pad and
+                  comb logits.
+  write_post  narrow post-pad [.,HC_PAD] -> post [.,HC_MULT].
+  comb_sinkhorn   softmax + Sinkhorn normalization -> comb (20 serial iters; a
+                  latency floor that more cores cannot shorten).
+  mix_x       x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD cores).
+
+Prefill (T=128): _hc_pre_prefill is the fused single-spmd variant (#533, with the
+#653 pad-free `valid_shape` + `fillpad` matmul) — its token-tiles already saturate
+the chip, so the decode fan-out would only add AICPU dispatch overhead (the
+per-tile scopes multiply into hundreds of tasks). The dispatch leaves this path
+unchanged.
+
+Device a2a3, best-of-N vs the pad-free fused baseline (post-#653): decode ~75us ->
+~68us (split-K parallelizes the otherwise-1-cube matmul); prefill ~unchanged
+(~87us, same fused path). The decode matmul reads pre-cast FP32 x_fp32, so it is a
+clean cube-only kernel; the mixed prefill kernel still needs the pypto#1761 fix.
 """
 
 
@@ -41,41 +68,256 @@ HC_EPS = M.hc_eps
 NORM_EPS = M.rms_norm_eps
 
 # kernel-local
-MIX_PAD = 32  # MIX_HC padded for vector ops
-HC_PAD = 8  # HC_MULT padded
-NEG_INF = -1e20
+MIX_PAD = 32  # MIX_HC (24) padded to a 32-wide cube N / vector row
+HC_PAD = 8  # HC_MULT (4) padded for 32B-aligned vector ops
 T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 
 # tiling
-T_TILE = 8  # unified row-tile for the fused spmd
+T_TILE = 8  # vector row-tile (RMS / cast / split / mix_x)
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
-MIX_RAW_ROWS = (T_MAX // T_TILE) * LINEAR_T_TILE
-RMS_K_TILE = 128
-# 256 (not 128/512): the matmul K-reduction is a serial matmul_acc dependency
-# chain (HC_DIM/LINEAR_K_TILE steps), each carrying fixed MTE/sync overhead.
-# Doubling the K-tile halves the chain length (−~29% on the matmul in the
-# multiscope variant); 512 overflows L0B for the FP32 weight (32x512x4=64KB).
-LINEAR_K_TILE = 256
-# 256 (not 512): in the single fused spmd the mix_x FP32 tiles share Vec UB with
-# the matmul / sinkhorn buffers; D_TILE=512 overflows the 192KB Vec limit.
-D_TILE = 256
+COMB_T_TILE = 8  # sinkhorn row-tile
+RMS_K_CHUNK = 512  # cast / rms K-fragment
+LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fits L0B)
+D_CHUNK = 512  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
+D_SPMD = 512  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
+CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
+# Split the K=HC_DIM reduction into LINEAR_OK slices that atomic-add their FP32
+# partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
+# cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
+# decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
+LINEAR_OK = 16
+LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
+LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
+
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+assert (DECODE_BATCH * DECODE_SEQ) % COMB_T_TILE == 0
+assert (PREFILL_BATCH * PREFILL_SEQ) % COMB_T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= LINEAR_T_TILE
 assert T_MAX % LINEAR_T_TILE == 0
-# The fused pre-mix below is hand-unrolled for HC_MULT == 4: the four pre0..pre3
-# residual scales, the four mix_g0..mix_g3 / comb base loads, the comb_off =
-# HC_MULT * 2 offset and the in_h * HC_MULT column strides all assume it. Fail
-# loudly if the model config changes hc_mult instead of silently mixing the
-# wrong comb columns.
+assert HC_DIM % LINEAR_OK == 0 and LINEAR_K_PER_SPLIT % LINEAR_K_CHUNK == 0
+assert D % D_SPMD == 0 and D_SPMD % D_CHUNK == 0
+assert HC_DIM % CAST_K_SPMD == 0 and CAST_K_SPMD % RMS_K_CHUNK == 0
+# The 4-way pre / comb reduce, the comb_off = HC_MULT*2 column offset, and the
+# pre0..pre3 / row0..row3 unrolling all assume HC_MULT == 4.
 assert HC_MULT == 4, (
     f"hc_pre is hand-specialized to HC_MULT == 4, got {HC_MULT}; "
-    "regenerate the pre0..pre3 / mix_g0..mix_g3 unrolling for the new hc_mult before using it."
+    "regenerate the pre0..pre3 / row0..row3 unrolling for the new hc_mult before using it."
 )
 
 
+
+# --- fused-path tiling (large T / prefill): one mixed cube+vec task per token-tile ---
+MIX_RAW_ROWS = (T_MAX // T_TILE) * LINEAR_T_TILE
+LINEAR_K_TILE = 256  # fused matmul K-fragment (32x256x4 FP32 weight fits L0B; 512 overflows)
+D_TILE = 512  # fused mix_x D-fragment; halves the D-loop trip count versus 256
+
+
 @pl.jit.inline
-def hc_pre(
+def _hc_pre_decode(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+):
+    t_dim = pl.tensor.dim(x, 0)
+    t_linear = pl.max(t_dim, LINEAR_T_TILE)
+    x_flat = pl.reshape(x, [t_dim, HC_DIM])
+    scale0 = pl.read(hc_scale, [0])
+    scale1 = pl.read(hc_scale, [1])
+    scale2 = pl.read(hc_scale, [2])
+
+    inv_rms = pl.create_tensor([T_MAX, 1], dtype=pl.FP32)
+    x_fp32 = pl.create_tensor([T_MAX, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
+    mixes_raw = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
+
+    for blk in pl.spmd((t_dim // T_TILE) * (HC_DIM // CAST_K_SPMD), name_hint="hc_pre_cast"):
+        t0 = (blk // (HC_DIM // CAST_K_SPMD)) * T_TILE
+        k_base = (blk % (HC_DIM // CAST_K_SPMD)) * CAST_K_SPMD
+        for kb in pl.pipeline(CAST_K_SPMD // RMS_K_CHUNK, stage=4):
+            k0 = k_base + kb * RMS_K_CHUNK
+            x_chunk = pl.cast(x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK], target_type=pl.FP32)
+            x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK] = x_chunk
+    if t_linear > t_dim:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_x_pad"):
+            for k0 in pl.pipeline(0, HC_DIM, RMS_K_CHUNK, stage=4):
+                x_fp32[t_dim:t_linear, k0:k0 + RMS_K_CHUNK] = pl.full(
+                    [LINEAR_T_TILE - T_TILE, RMS_K_CHUNK], dtype=pl.FP32, value=0.0
+                )
+
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms"):
+        t0 = t * T_TILE
+        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
+            k0 = kb * RMS_K_CHUNK
+            x_chunk = x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
+        inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
+        inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
+
+    # Split-K via atomic-add: zero-seed mixes_raw, then each (token-tile, K-slice)
+    # task atomic-adds its [LINEAR_T_TILE, MIX_PAD] partial. The seed write -> RMW
+    # WAW dependency orders the seed first; token tiles touch disjoint rows, so
+    # only the LINEAR_OK tasks per row block contend. (assemble(atomic=Add) is a
+    # device-only accumulate -- the a2a3sim / a5sim simulators do not model it, so
+    # those two sim CI checks are skipped for hc_pre.)
+    for tc in pl.spmd(t_linear // T_TILE, name_hint="hc_pre_seed"):
+        ts0 = tc * T_TILE
+        mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear"):
+        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
+        for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
+            k0 = k_base + kb * LINEAR_K_CHUNK
+            x_linear_chunk = x_fp32[t0:t0 + LINEAR_T_TILE, k0:k0 + LINEAR_K_CHUNK]
+            w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, k0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
+            if kb == 0:
+                acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
+            else:
+                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
+        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+
+    # Scale the raw projection by inv_rms, then sigmoid -> pre (kept for mix_x via
+    # pre_val_store) and post (written straight out); comb logits bridge to the
+    # sinkhorn scope. inv_rms is folded in per column-group (cheap on [T, <=16]).
+    pre_val_store = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
+    post_pad_store = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
+    # MIX_PAD (not HC_MULT*HC_MULT=16): comb_sinkhorn loads each group HC_PAD-wide
+    # at offset k*HC_MULT, so group 3 reads cols [12:20] -- the 16-wide alloc made
+    # that load descriptor exceed the tensor even though valid_shapes bounds the
+    # real transfer to [12:16]. The 32-wide alloc keeps every descriptor in-bounds.
+    comb_logits = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
+        t0 = ob * T_TILE
+        inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
+
+        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+        pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
+        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+        pre_val = pl.add(pre_sig, HC_EPS)
+        pre_val_store = pl.assemble(pre_val_store, pre_val, [t0, 0])
+
+        post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
+        post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
+        post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
+        post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
+        post_pad = pl.mul(post_sig, 2.0)
+        post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
+
+        comb_base = pl.reshape(hc_base[HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], [1, HC_MULT * HC_MULT])
+        comb_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], inv_col), scale2)
+        comb_logits_tile = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
+        comb_logits = pl.assemble(comb_logits, comb_logits_tile, [t0, 0])
+
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="write_post"):
+        t0 = ob * COMB_T_TILE
+        post_tile = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
+                            valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        pl.store(post_tile, [t0, 0], post)
+
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
+        t0 = ob * COMB_T_TILE
+        row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        row2 = pl.load(comb_logits, [t0, 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        row3 = pl.load(comb_logits, [t0, 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
+        row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
+        row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
+        row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
+
+        row_max_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row0_max = pl.row_max(row0_p, row_max_tmp)
+        row1_max = pl.row_max(row1_p, row_max_tmp)
+        row2_max = pl.row_max(row2_p, row_max_tmp)
+        row3_max = pl.row_max(row3_p, row_max_tmp)
+        row0_exp = pl.exp(pl.row_expand_sub(row0_p, row0_max))
+        row1_exp = pl.exp(pl.row_expand_sub(row1_p, row1_max))
+        row2_exp = pl.exp(pl.row_expand_sub(row2_p, row2_max))
+        row3_exp = pl.exp(pl.row_expand_sub(row3_p, row3_max))
+        row0_sum = pl.row_sum(row0_exp, row_sum_tmp)
+        row1_sum = pl.row_sum(row1_exp, row_sum_tmp)
+        row2_sum = pl.row_sum(row2_exp, row_sum_tmp)
+        row3_sum = pl.row_sum(row3_exp, row_sum_tmp)
+        row0_soft = pl.add(pl.row_expand_div(row0_exp, row0_sum), HC_EPS)
+        row1_soft = pl.add(pl.row_expand_div(row1_exp, row1_sum), HC_EPS)
+        row2_soft = pl.add(pl.row_expand_div(row2_exp, row2_sum), HC_EPS)
+        row3_soft = pl.add(pl.row_expand_div(row3_exp, row3_sum), HC_EPS)
+
+        row0_valid = pl.set_validshape(row0_soft, COMB_T_TILE, HC_MULT)
+        row1_valid = pl.set_validshape(row1_soft, COMB_T_TILE, HC_MULT)
+        row2_valid = pl.set_validshape(row2_soft, COMB_T_TILE, HC_MULT)
+        row3_valid = pl.set_validshape(row3_soft, COMB_T_TILE, HC_MULT)
+        row0_eff = pl.fillpad(row0_valid, pad_value=pl.PadValue.zero)
+        row1_eff = pl.fillpad(row1_valid, pad_value=pl.PadValue.zero)
+        row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
+        row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
+
+        row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
+        col_sum = pl.add(col_sum, HC_EPS)
+        row0_cur = pl.div(row0_eff, col_sum)
+        row1_cur = pl.div(row1_eff, col_sum)
+        row2_cur = pl.div(row2_eff, col_sum)
+        row3_cur = pl.div(row3_eff, col_sum)
+
+        for _sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
+            row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
+            row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
+            row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
+            row3_rowsum = pl.add(pl.row_sum(row3_cur, row_sum_tmp_iter), HC_EPS)
+            row0_norm = pl.row_expand_div(row0_cur, row0_rowsum)
+            row1_norm = pl.row_expand_div(row1_cur, row1_rowsum)
+            row2_norm = pl.row_expand_div(row2_cur, row2_rowsum)
+            row3_norm = pl.row_expand_div(row3_cur, row3_rowsum)
+            col_sum = pl.add(pl.add(row0_norm, row1_norm), pl.add(row2_norm, row3_norm))
+            col_sum = pl.add(col_sum, HC_EPS)
+            row0_cur = pl.div(row0_norm, col_sum)
+            row1_cur = pl.div(row1_norm, col_sum)
+            row2_cur = pl.div(row2_norm, col_sum)
+            row3_cur = pl.div(row3_norm, col_sum)
+
+        row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+        row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+        row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+        row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+
+    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x"):
+        t0 = (blk // (D // D_SPMD)) * T_TILE
+        d_base = (blk % (D // D_SPMD)) * D_SPMD
+        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+        for db in pl.pipeline(D_SPMD // D_CHUNK, stage=2):
+            d0 = d_base + db * D_CHUNK
+            x0 = pl.cast(x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x1 = pl.cast(x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x2 = pl.cast(x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x3 = pl.cast(x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            y0 = pl.row_expand_mul(x0, pre0)
+            y1 = pl.row_expand_mul(x1, pre1)
+            y2 = pl.row_expand_mul(x2, pre2)
+            y3 = pl.row_expand_mul(x3, pre3)
+            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+            x_mixed[t0:t0 + T_TILE, d0:d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+    return x_mixed
+
+
+@pl.jit.inline
+def _hc_pre_prefill(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
@@ -137,25 +379,23 @@ def hc_pre(
         mix_acc_real = mix_raw_gm[mix_raw_t0 + linear_row_off:mix_raw_t0 + linear_row_off + T_TILE, 0:MIX_PAD]
         mixes_gm[t0:t0 + T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc_real, inv_rms_col)
 
-        # Bias bases as tiles (col_expand needs tile-level operands).
-        pre_base = pl.load(hc_base_2d, [0, 0], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
-        post_base = pl.load(hc_base_2d, [0, HC_MULT], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
-
-        # --- pre = sigmoid(mixes[:, :hc]*s0 + base) + eps. Kept in Vec, consumed
-        # by mix_x below in the SAME scope (no GM round-trip). ---
-        pre_in = pl.load(mixes_gm, [t0, 0], [T_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
-        pre_scaled = pl.mul(pre_in, scale0)
-        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
-        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
-        pre_eps = pl.add(pre_sig, HC_EPS)
-
         # --- post = 2*sigmoid(mixes[:, hc:2hc]*s1 + base) -> store ---
+        post_base = pl.load(hc_base_2d, [0, HC_MULT], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
         post_in = pl.load(mixes_gm, [t0, HC_MULT], [T_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
         post_scaled = pl.mul(post_in, scale1)
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_tile = pl.set_validshape(pl.mul(post_sig, 2.0), T_TILE, HC_MULT)
         pl.store(post_tile, [t0, 0], post)
+
+        # --- pre = sigmoid(mixes[:, :hc]*s0 + base) + eps. Kept in Vec, consumed
+        # by mix_x below in the SAME scope (no GM round-trip). ---
+        pre_base = pl.load(hc_base_2d, [0, 0], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
+        pre_in = pl.load(mixes_gm, [t0, 0], [T_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
+        pre_scaled = pl.mul(pre_in, scale0)
+        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+        pre_eps = pl.add(pre_sig, HC_EPS)
 
         # --- mix_x = sum_h pre[:, h] * x[:, h, :]. Transpose so each head is a
         # 32B-aligned row, then materialize each [T_TILE,1] scale into its own
@@ -235,7 +475,7 @@ def hc_pre(
         row2_cur = pl.div(row2_eff, col_sum)
         row3_cur = pl.div(row3_eff, col_sum)
 
-        for sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
+        for _sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
             row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
             row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
             row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
@@ -259,6 +499,29 @@ def hc_pre(
         pl.store(row1_out, [t0, 1 * HC_MULT], comb)
         pl.store(row2_out, [t0, 2 * HC_MULT], comb)
         pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+    return x_mixed
+
+
+@pl.jit.inline
+def hc_pre(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+):
+    # Decode (T = B*S small, one token-tile) starves the chip in the fused single
+    # task; split-K + per-axis fan-out fills 24 AIC / 48 AIV. Prefill already fills
+    # the chip per token-tile, so the extra scopes are pure dispatch overhead there.
+    # hc_pre inlines into each decode/prefill attention kernel, so each context keeps
+    # only its branch.
+    t_dim_sel = pl.tensor.dim(x, 0)
+    if t_dim_sel <= LINEAR_T_TILE:
+        _hc_pre_decode(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+    else:
+        _hc_pre_prefill(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
     return x_mixed
 
 
@@ -294,17 +557,17 @@ def golden_hc_pre(tensors):
     x_flat_2d = x.reshape(t_dim, HC_DIM)
 
     sq_sum = torch.zeros(t_dim, 1, dtype=torch.float32)
-    for k0 in range(0, HC_DIM, RMS_K_TILE):
-        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_TILE]
+    for k0 in range(0, HC_DIM, RMS_K_CHUNK):
+        x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
 
     mix_cols = []
     for m in range(MIX_HC):
         mix_col = torch.zeros(t_dim, 1, dtype=torch.float32)
-        for k0 in range(0, HC_DIM, LINEAR_K_TILE):
-            x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_TILE]
-            w_chunk = hc_fn[m:m + 1, k0:k0 + LINEAR_K_TILE]
+        for k0 in range(0, HC_DIM, LINEAR_K_CHUNK):
+            x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_CHUNK]
+            w_chunk = hc_fn[m:m + 1, k0:k0 + LINEAR_K_CHUNK]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
     mixes = torch.cat(mix_cols, dim=1)  # [T, mix_hc]
@@ -393,7 +656,7 @@ if __name__ == "__main__":
 
     for mode_name in modes_to_run:
         B, S = MODES[mode_name]
-        print(f"--- hc_pre 1spmd {mode_name}: B={B}, S={S} ---")
+        print(f"--- hc_pre {mode_name}: B={B}, S={S} ---")
         result = run_jit(
             fn=hc_pre_test,
             specs=build_tensor_specs(B, S),
