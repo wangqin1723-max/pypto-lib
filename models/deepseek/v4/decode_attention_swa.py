@@ -21,6 +21,7 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
+    DECODE_START_POS,
     BLOCK_SIZE,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
@@ -403,7 +404,7 @@ def golden_attention_swa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos=None):
+def build_tensor_specs(start_pos=DECODE_START_POS):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
@@ -554,9 +555,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=None,
-                        help="If set, use this single start_pos for all batches; "
-                             "otherwise use the default per-batch coverage pattern.")
+    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
+                        help="Fixture-only start_pos for all batches; default is the 8k target position.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)

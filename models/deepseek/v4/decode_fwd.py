@@ -76,7 +76,7 @@ from decode_attention_csa import (
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
 )
-from config import FLASH as MODEL_CONFIG
+from config import DECODE_START_POS, FLASH as MODEL_CONFIG
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -900,7 +900,7 @@ def _make_final_norm_spec(name):
 
 def make_forward_metadata_tensors(
     base_specs,
-    start_pos=None,
+    start_pos=DECODE_START_POS,
     commit_tokens=1,
 ):
     import torch
@@ -1016,7 +1016,7 @@ def make_forward_metadata_tensors(
     return {name: init_value() for name, init_value in init_by_name.items()}
 
 
-def _make_forward_metadata_specs(base_specs, start_pos=None, commit_tokens=1):
+def _make_forward_metadata_specs(base_specs, start_pos=DECODE_START_POS, commit_tokens=1):
     from golden import TensorSpec
 
     metadata_names = [
@@ -1084,7 +1084,7 @@ def _attention_kind_for_layer(layer_id):
     raise ValueError(f"unsupported compress ratio {ratio} for layer_id={layer_id}")
 
 
-def build_single_layer_tensor_specs(start_pos=None, layer_id=10):
+def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
     build_tensor_specs restacks across the 43 forward layers."""
     import torch
@@ -1247,7 +1247,7 @@ def build_single_layer_tensor_specs(start_pos=None, layer_id=10):
     return specs
 
 
-def build_tensor_specs(start_pos=None, num_tokens=T):
+def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
     base_specs = {
@@ -1294,7 +1294,12 @@ def main():
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
-    parser.add_argument("--start-pos", type=int, default=None, help="If set, use this single start_pos for all batches.")
+    parser.add_argument(
+        "--start-pos",
+        type=int,
+        default=DECODE_START_POS,
+        help="Fixture-only start_pos for all batches; default is the 8k target position.",
+    )
     parser.add_argument("--num-tokens", type=int, default=T, help=f"Active token rows for MoE routing/combine; default is T={T}.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
