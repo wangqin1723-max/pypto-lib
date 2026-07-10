@@ -62,6 +62,8 @@ QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real ro
 DEQUANT_T_TILE = 8      # qproj_dequant token tile
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
+Q_ROPE_H_TILE = 4       # heads per q_head_rms_nope_rope task; cos/sin build amortizes over them
+assert H % Q_ROPE_H_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= MATMUL_T_TILE
@@ -113,6 +115,7 @@ def qkv_proj_rope(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    late_dep: pl.Scalar[pl.TASK_ID],
 ):
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
@@ -139,7 +142,7 @@ def qkv_proj_rope(
                 qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = pl.full(
                     [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul"):
+    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
         for tc in pl.range(t_matmul // QR_M_TILE):
@@ -229,7 +232,7 @@ def qkv_proj_rope(
                 q_proj_fp32[tc : tc + DEQUANT_T_TILE, w_col0 : w_col0 + Q_PROJ_OUT_TILE] = col_dequant
 
     # Fused per-head RMSNorm + NOPE writeback + interleaved (CANN A3) RoPE. One spmd
-    # task owns 2 heads; per (head, tg-tile) it computes the per-head inv_rms once
+    # task owns Q_ROPE_H_TILE heads; per (head, tg-tile) it computes the per-head inv_rms once
     # (pass 1) and consumes it locally for BOTH the NOPE writeback and the rope rotation
     # -- so inv_rms no longer round-trips through GM (the old q_head_inv_rms_all) and the
     # two passes collapse into a single dispatch. q's per-head RMS has NO gamma. NOPE
@@ -240,12 +243,12 @@ def qkv_proj_rope(
     # (CANN A3 rotate_interleaved). The rotation index/sign and the interleave-duplicated
     # cos/sin are built ENTIRELY IN-KERNEL: swap_idx (j^1), sign ([-1,+1,...]) and dup_idx
     # (j>>1) from pl.arange (once per task), and cos_il/sin_il dup-gathered per tg
-    # (head-independent, reused across both heads). inv_rms is per-row so it factors out
+    # (head-independent, reused across the task's heads). inv_rms is per-row so it factors out
     # of the rotation and is folded into the writeback.
     #   out[j] = inv_rms * (x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j])
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope_rope", allow_early_resolve=True):
-        hg = hg_idx * 2
+    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="q_head_rms_nope_rope"):
+        hg = hg_idx * Q_ROPE_H_TILE
         # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
         q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         q_col = pl.col_expand_mul(q_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
@@ -258,7 +261,7 @@ def qkv_proj_rope(
             tg = tg_idx * Q_ROPE_T_TILE
             q_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
             q_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
-            for h_inner in pl.range(2):
+            for h_inner in pl.range(Q_ROPE_H_TILE):
                 h = hg + h_inner
                 h0 = h * HEAD_DIM
                 # Load each head's NOPE + RoPE columns once (fp32), reused for both the
@@ -303,7 +306,11 @@ def qkv_proj_rope(
                 kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
                     [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    for kbg in pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul"):
+    # `late_dep` is a dummy barrier hung off the rms_norm TaskId: kv_proj is off the
+    # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
+    # take the cores first.
+    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+        kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE
         for tc in pl.range(t_matmul // KV_M_TILE):
@@ -398,6 +405,8 @@ def qkv_proj_rope_test(
     qr.bind_dynamic(0, T_DYN)
     qr_scale.bind_dynamic(0, T_DYN)
 
+    # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
+    late_dep = pl.system.task_dummy(deps=[])
     qkv_proj_rope(
         x,
         wq_a,
@@ -412,6 +421,7 @@ def qkv_proj_rope_test(
         kv,
         qr,
         qr_scale,
+        late_dep,
     )
     return q
 
