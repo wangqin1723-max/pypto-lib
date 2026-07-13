@@ -231,67 +231,68 @@ def sparse_attn_hca(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv") as qk_tid:
-        qk_t = pl.tile.get_block_idx()
+    with pl.spmd(T * SPARSE_BLOCKS, name_hint="qk_pv") as qk_tid:
+        qk_item = pl.tile.get_block_idx()
+        qk_t = qk_item // SPARSE_BLOCKS
+        qk_sb = qk_item - qk_t * SPARSE_BLOCKS
         qk_b = qk_t // S
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         # Sparse-block OUTER / head-tile INNER: gather the block's KV into L1 once,
         # then both head-batches' QK (b_trans) and PV consume the SAME tile.
-        for qk_sb in pl.unroll(SPARSE_BLOCKS):
-            qk_s0 = qk_sb * ATTN_K_TILE
-            qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
-            qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
-            for qk_r in pl.range(ATTN_K_TILE):
-                qk_k = qk_s0 + qk_r
-                if qk_k < WIN:
-                    qk_win_slot_i32 = pl.read(window_swa_indices, [qk_t, qk_k])
-                    if qk_win_slot_i32 >= 0:
-                        qk_win_slot = pl.cast(qk_win_slot_i32, pl.INDEX)
-                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_win_slot, 0], [1, HEAD_DIM])
+        qk_s0 = qk_sb * ATTN_K_TILE
+        qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
+        qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
+        for qk_r in pl.range(ATTN_K_TILE):
+            qk_k = qk_s0 + qk_r
+            if qk_k < WIN:
+                qk_win_slot_i32 = pl.read(window_swa_indices, [qk_t, qk_k])
+                if qk_win_slot_i32 >= 0:
+                    qk_win_slot = pl.cast(qk_win_slot_i32, pl.INDEX)
+                    qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_win_slot, 0], [1, HEAD_DIM])
+                else:
+                    qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
+            else:
+                qk_cmp_k = qk_k - WIN
+                if qk_cmp_k < CMP_TOPK:
+                    qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_cmp_k])
+                    if qk_ridx >= 0:
+                        qk_slot = qk_ridx
+                        qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
+                        qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
+                        qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
                     else:
                         qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
-                else:
-                    qk_cmp_k = qk_k - WIN
-                    if qk_cmp_k < CMP_TOPK:
-                        qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_cmp_k])
-                        if qk_ridx >= 0:
-                            qk_slot = qk_ridx
-                            qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
-                            qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
-                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
-                        else:
-                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
-                # Padded lane (qk_k >= TOPK): skip the gather; bias + merge kill it.
+            # Padded lane (qk_k >= TOPK): skip the gather; bias + merge kill it.
 
-            # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
-            # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
-            # (2x reuse at QK_M_TILE=32) instead of per head-tile. The
-            # [QK_M_TILE, ...] softmax result is sliced back into H_TILE-row
-            # stores at the SAME offsets as the per-head-tile path
-            # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
-            # sparse_blk_* layout and merge_norm are bit-identical.
-            for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                qk_h0 = qk_hb * QK_M_TILE
-                qk_head_row = qk_t * H + qk_h0
-                qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
-                qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
-                qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
-                qk_mi = pl.row_max(qk_scores)
-                # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
-                # blocks die in the merge alpha/beta -- no mask multiply needed.
-                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                qk_li = pl.row_sum(qk_exp)
-                qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
-                for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
-                    qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
-                    qk_r0 = qk_sub * H_TILE
-                    qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
+        # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
+        # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
+        # (2x reuse at QK_M_TILE=32) instead of per head-tile. The
+        # [QK_M_TILE, ...] softmax result is sliced back into H_TILE-row
+        # stores at the SAME offsets as the per-head-tile path
+        # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
+        # sparse_blk_* layout and merge_norm are bit-identical.
+        for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+            qk_h0 = qk_hb * QK_M_TILE
+            qk_head_row = qk_t * H + qk_h0
+            qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
+            qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
+            qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+            qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
+            qk_mi = pl.row_max(qk_scores)
+            # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
+            # blocks die in the merge alpha/beta -- no mask multiply needed.
+            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+            qk_li = pl.row_sum(qk_exp)
+            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+            qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
+            for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
+                qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
+                qk_r0 = qk_sub * H_TILE
+                qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
+                qk_row = qk_blk_base + qk_sb * H_TILE
+                sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
+                sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
+                sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
 
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
