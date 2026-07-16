@@ -36,6 +36,12 @@ GATE_N_TILE = 16        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
+# Per-row RMSNorm: 1 token / core. ROW_PAD physical rows (8 FP32 = 32B) clear the
+# ptoas tile floor while only valid [1, *] is used. Each core holds just one token,
+# so FFN_D_TILE can be large (few pipeline iterations, low per-iter overhead).
+ROW_PAD = 8
+FFN_D_TILE = 1024
+assert D % FFN_D_TILE == 0
 GATE_D_TILE = 2048
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
@@ -54,13 +60,23 @@ def gate(
     num_tokens: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    x_norm: pl.Tensor[[T, D], pl.BF16],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    x_norm_gate_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
+    # the per-token positive scalar inv_rms factors out of everything downstream:
+    #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
+    #   - int8 quant : symmetric per-token quant of xg CANCELS inv_rms exactly;
+    #                  inv_rms rides only x_norm_scale (= inv_rms * amax(xg)/127).
+    # This lets sq_sum (needs raw x) and xg share ONE pass over x_mixed instead of
+    # a sqsum pass followed by a separate normalize pass.
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
+    # and consumed by x_norm_quant so quant skips its own amax pass.
+    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -73,42 +89,49 @@ def gate(
     if active_gate_tokens > T:
         active_gate_tokens = pl.cast(T, pl.INDEX)
 
-    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_norm"):
-            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for rms_d0 in pl.pipeline(0, D, D_TILE, stage=2):
-                rms_x = pl.cast(x_mixed[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_TILE], pl.FP32)
-                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
-            inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
-            for an_d0 in pl.pipeline(0, D, D_TILE, stage=2):
-                an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE], pl.FP32)
-                an_w = pl.cast(pl.reshape(norm_w[an_d0 : an_d0 + D_TILE], [1, D_TILE]), pl.FP32)
-                an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
-                an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
-                x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
-                x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
+    # Per-row RMSNorm: one token per core. Slice the token to [1, FFN_D_TILE] and
+    # assemble it into row 0 of a physical [ROW_PAD, FFN_D_TILE] tile (valid [1, *]),
+    # so the reduction output is physically [ROW_PAD, 1] (col-major 32B) valid [1, 1]
+    # -- a plain [1,1] reduction tile is 4B and fails the ptoas 32B floor. Accumulators
+    # stay [1, ROW_PAD] (row-major 32B) valid [1, 1]. sq_sum and the int8 amax fold
+    # into one pass since xg = x*gamma does not depend on inv_rms.
+    norm_w_2d = pl.reshape(norm_w, [1, D])
+    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm", allow_early_resolve=True):
+        sq_sum = pl.set_validshape(pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=0.0), 1, 1)
+        xg_amax = pl.set_validshape(pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS), 1, 1)
+        for rms_d0 in pl.pipeline(0, D, FFN_D_TILE, stage=2):
+            rms_x = pl.cast(
+                pl.tile.load(x_mixed, [tok, rms_d0], [ROW_PAD, FFN_D_TILE], valid_shapes=[1, FFN_D_TILE]),
+                pl.FP32,
+            )
+            sq_tmp = pl.create_tile([ROW_PAD, FFN_D_TILE], dtype=pl.FP32)
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x), sq_tmp), [1, ROW_PAD]))
+            rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, rms_d0], [1, FFN_D_TILE]), pl.FP32)
+            xg = pl.col_expand_mul(rms_x, rms_w)
+            pl.tile.store(xg, [tok, rms_d0], xg_buf, shapes=[1, FFN_D_TILE])
+            amax_tmp = pl.create_tile([ROW_PAD, FFN_D_TILE], dtype=pl.FP32)
+            xg_amax = pl.maximum(xg_amax, pl.reshape(pl.row_max(pl.maximum(xg, pl.neg(xg)), amax_tmp), [1, ROW_PAD]))
+        inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+        pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
+        # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
+        xg_sq = pl.div(pl.set_validshape(pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX), 1, 1), xg_amax)
+        pl.tile.store(pl.mul(pl.recip(xg_sq), inv_rms), [tok, 0], x_norm_scale, shapes=[1, 1])
+        pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
-    # Per-token symmetric INT8 quant of x_norm (read the bf16 output directly;
-    # x_norm_gate_buf holds the same bf16 values widened to fp32). Early
-    # resolution lets the shared-expert chain pre-stage before dispatch_push.
+    # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
+    # cancels here (symmetric quant is invariant to a positive per-token scalar),
+    # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
+    # pre-stage before dispatch_push.
     for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="x_norm_quant",
             allow_early_resolve=True,
         ):
-            xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for xq_a_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-                xn_a_f32 = x_norm_gate_buf[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_TILE]
-                xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
-                xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
-                xn_amax = pl.maximum(xn_amax, xn_a_max)
-            xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
-            x_norm_scale[t0 : t0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
-            xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
+            xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
             for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
                 xn_q_scaled = pl.row_expand_mul(
-                    x_norm_gate_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
+                    xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
                     xn_sq_col,
                 )
                 xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
@@ -135,7 +158,7 @@ def gate(
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate"):
+    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
         tg = gb_idx // GATE_N_BLOCKS
         nb = gb_idx % GATE_N_BLOCKS
         t1 = tg * GATE_M_TILE
@@ -144,12 +167,14 @@ def gate(
         gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
             gd_kd = kb * GATE_D_TILE
-            gd_x = x_norm_gate_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
             gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
             if gd_kd == 0:
                 gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
             else:
                 gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+        # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
+        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
         gp_relu = pl.maximum(gate_logits_tile, 0.0)
         gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
         gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
@@ -166,32 +191,39 @@ def gate(
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
-        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash"):
+        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
             t1 = th_idx * GATE_T_TILE
-            # Scalar gather TOPK (eid, unbiased score) per row; tail
-            # [TOPK, TOPK_PAD) stays zero so row_sum below sums only TOPK.
-            hs_vals_buf = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
-            hs_idx_buf = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+            # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
+            # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
+            # index build stays scalar; the score fetch is a batched gather below.
+            # Tail [TOPK, TOPK_PAD) zeroed so fillpad drops it from the sum.
+            hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             for hs_tt in pl.range(GATE_T_TILE):
                 hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
                 for hs_k in pl.range(TOPK):
-                    hs_eid = pl.read(tid2eid, [hs_token, hs_k])
-                    hs_epos = pl.cast(hs_eid, pl.INDEX)
-                    hs_unbiased = pl.read(route_scores_buf, [t1 + hs_tt, hs_epos])
-                    pl.write(hs_idx_buf, [hs_tt, hs_k], hs_eid)
-                    pl.write(hs_vals_buf, [hs_tt, hs_k], hs_unbiased)
-            # Normalize+scale, then scalar-scatter to GM. Slice-assign would
-            # alloc a [GATE_T_TILE, TOPK=6] temp (24B row, under alloc_tile's
-            # 32B alignment), so write element-by-element.
-            hs_denom = pl.reshape(pl.row_sum(hs_vals_buf), [GATE_T_TILE, 1])
-            hs_weights_buf = pl.mul(pl.row_expand_div(hs_vals_buf, hs_denom), ROUTE_SCALE)
+                    pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
+                for hs_pad_k in pl.range(TOPK, TOPK_PAD):
+                    pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
+            # Batched score gather (replaces per-eid scalar reads); set_validshape +
+            # fillpad zero the [TOPK, TOPK_PAD) tail so row_sum sees only TOPK.
+            local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
+            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
+            gather_all = pl.gather(local_scores, dim=-1, index=hs_idx_tile)
+            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
+            hs_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
+            # Copy to dodge the tensor_view-vs-ptr SSA conflict between the gather
+            # and the scalar pl.read below (pypto #1493).
+            hs_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            hs_idx_read[:, :] = hs_idx_tile[:, :]
+            hs_denom = pl.reshape(pl.row_sum(hs_vals_pad), [GATE_T_TILE, 1])
+            hs_weights_pad = pl.mul(pl.row_expand_div(hs_vals_pad, hs_denom), ROUTE_SCALE)
             for hs_wt_tt in pl.range(GATE_T_TILE):
                 if t1 + hs_wt_tt < active_tokens:
                     for hs_wt_k in pl.range(TOPK):
-                        pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_buf, [hs_wt_tt, hs_wt_k]))
-                        pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_buf, [hs_wt_tt, hs_wt_k]))
+                        pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
+                        pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
     else:
-        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
+        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
             # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
             # the batched pl.gather below accepts it — Tile-against-Tensor src
@@ -244,7 +276,6 @@ def gate_test(
     num_tokens: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    x_norm: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     x_norm_i8: pl.Out[pl.Tensor[[T, D], pl.INT8]],
     x_norm_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
@@ -255,9 +286,9 @@ def gate_test(
         norm_w, gate_w, gate_bias,
         layer_id, num_tokens,
         tid2eid, input_ids,
-        x_norm, x_norm_i8, x_norm_scale, indices, weights,
+        x_norm_i8, x_norm_scale, indices, weights,
     )
-    return x_norm, x_norm_i8, x_norm_scale, indices, weights
+    return x_norm_i8, x_norm_scale, indices, weights
 
 
 def _per_token_int8_quant(x_bf16):
@@ -276,24 +307,26 @@ def golden_gate_core(tensors):
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    # FFN RMSNorm.
+    # FFN RMSNorm, deferred (qwen3-style): xg = bf16(x * gamma), with the
+    # per-token inv_rms scalar folded downstream instead of applied per-element.
     x_f = tensors["x_mixed"].float().view(T, D)
     norm_w = tensors["norm_w"].float()
     sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
-    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)
-    x_normalized = (x_f * inv_rms) * norm_w.view(1, D)
-    x_flat = x_normalized.to(torch.bfloat16)
+    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)   # [T,1]
+    xg = x_f * norm_w.view(1, D)
 
-    # Per-token symmetric INT8 quant of bf16(x_norm).
-    x_norm_i8, x_norm_scale = _per_token_int8_quant(x_flat)
+    # Symmetric INT8 quant of xg: inv_rms cancels in the int8 values (a positive
+    # per-token scalar), so it rides only the dequant scale.
+    x_norm_i8, scale_dq_g = _per_token_int8_quant(xg)
+    x_norm_scale = scale_dq_g.reshape(T, 1) * inv_rms   # inv_rms * amax(xg)/127
 
-    # Gate matmul + sqrtsoftplus router score. Use the log1p stable form, which
-    # equals F.softplus while keeping the negative-logit tail alive: the naive
-    # log(exp(-|x|)+1) rounds 1+tiny back to 1.0 in fp32 and zeros the tail for
-    # logits below ~-16.
+    # Gate matmul + sqrtsoftplus router score. logits = inv_rms * (xg @ gate_w.T).
+    # Use the log1p stable form, which equals F.softplus while keeping the
+    # negative-logit tail alive: the naive log(exp(-|x|)+1) rounds 1+tiny back to
+    # 1.0 in fp32 and zeros the tail for logits below ~-16.
     gate_w = tensors["gate_w"].float()
     gate_bias = tensors["gate_bias"].float()
-    logits = x_flat.float() @ gate_w.T
+    logits = inv_rms * (xg.float() @ gate_w.T)
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
     biased = scores + gate_bias.view(1, -1)
@@ -317,7 +350,6 @@ def golden_gate_core(tensors):
         indices[num_tokens:] = 0
         weights[num_tokens:] = 0
 
-    tensors["x_norm"][:] = x_flat
     tensors["x_norm_i8"][:] = x_norm_i8
     tensors["x_norm_scale"][:] = x_norm_scale.reshape(T, 1)
     tensors["indices"][:] = indices.to(torch.int32)
@@ -350,7 +382,6 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("tid2eid", [VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
         TensorSpec("input_ids", [T], torch.int64, init_value=init_input_ids),
-        TensorSpec("x_norm", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("x_norm_i8", [T, D], torch.int8, is_output=True),
         TensorSpec("x_norm_scale", [T, 1], torch.float32, is_output=True),
         TensorSpec("indices", [T, TOPK], torch.int32, is_output=True),
@@ -398,7 +429,6 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "x_norm": gate_tile_prefix_compare(args.num_tokens, ratio_allclose(atol=1e-3, rtol=1.0 / 128)),
             "x_norm_i8": gate_tile_prefix_compare(
                 args.num_tokens,
                 ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
