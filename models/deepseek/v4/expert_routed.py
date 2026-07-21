@@ -63,19 +63,27 @@ def expert_routed(
     routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    count_tid: pl.Scalar[pl.TASK_ID],
+    gather_tid: pl.Scalar[pl.TASK_ID],
 ):
+    # Keep expert rows in one ND view after outlining. The 3-D recv_x view is
+    # inferred as NZ by PTOAS when RECV_MAX == 32 (EP=4), which conflicts with
+    # the row-major matmul input layout.
+    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     # gate (w1) / up (w3) INT32 accumulators for every (expert, row-tile), flat
     # row-addressed so they survive the parallel nest that produces them.
     gate_i32 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT32)
     up_i32 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT32)
+    gate_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
+    up_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
 
-    # Each local expert owns a disjoint recv_y row slab. The routed stages run in
-    # auto scope: the runtime tracks every dependency from the tensor reads/writes,
-    # including ordering the recv_x read after its producer (the dispatch gather),
-    # which a manual scope would not do automatically. The final w2 epilogue
-    # assembles each static channel block into recv_y.
+    # Each local expert owns a disjoint recv_y row slab. Predicated tasks depend
+    # directly on the count producer; gate/up also wait for the dispatch gather.
+    # Per-expert TaskIDs carry those edges across the split compute passes, while
+    # auto dependency tracking still covers tensor reads/writes. The final w2
+    # epilogue assembles each static channel block into recv_y.
     for local_i in pl.parallel(N_LOCAL_EXPERTS):
         # This expert's row slab of the two accumulators.
         flat_base = local_i * RECV_MAX
@@ -84,7 +92,12 @@ def expert_routed(
 
         # Read the valid row count inside each stage so its scalar stays on the
         # stage's cores instead of feeding every stage from the frame level.
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+        with pl.spmd(
+            MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE),
+            name_hint="exp_gate_mm",
+            deps=[count_tid, gather_tid],
+            predicate=(recv_expert_count[local_i, 0] > 0),
+        ) as gate_tid:
             gate_rows = pl.read(recv_expert_count, [local_i, 0])
             gate_tiles = (gate_rows + RECV_TILE - 1) // RECV_TILE
             nb_idx = pl.tile.get_block_idx()
@@ -95,7 +108,10 @@ def expert_routed(
                     n0 = n_base + ng * MM_INTER_TILE
                     gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_k = recv_x[local_i : local_i + 1, gate_t0 : gate_t0 + RECV_TILE, k0 : k0 + K_TILE]
+                        x_k = recv_x_flat[
+                            flat_base + gate_t0 : flat_base + gate_t0 + RECV_TILE,
+                            k0 : k0 + K_TILE,
+                        ]
                         w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                         if k0 == 0:
                             gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
@@ -104,8 +120,14 @@ def expert_routed(
                     gate_e[gate_t0 : gate_t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = pl.reshape(
                         gate_acc, [RECV_TILE, MM_INTER_TILE]
                     )
+        gate_tids[local_i] = gate_tid
 
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+        with pl.spmd(
+            MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE),
+            name_hint="exp_up_mm",
+            deps=[count_tid, gather_tid],
+            predicate=(recv_expert_count[local_i, 0] > 0),
+        ) as up_tid:
             up_rows = pl.read(recv_expert_count, [local_i, 0])
             up_tiles = (up_rows + RECV_TILE - 1) // RECV_TILE
             ub_idx = pl.tile.get_block_idx()
@@ -116,7 +138,10 @@ def expert_routed(
                     u0 = u_base + ug * MM_INTER_TILE
                     up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_u = recv_x[local_i : local_i + 1, up_t0 : up_t0 + RECV_TILE, uk0 : uk0 + K_TILE]
+                        x_u = recv_x_flat[
+                            flat_base + up_t0 : flat_base + up_t0 + RECV_TILE,
+                            uk0 : uk0 + K_TILE,
+                        ]
                         w3_k = routed_w3[local_i : local_i + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
                         if uk0 == 0:
                             up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
@@ -125,6 +150,7 @@ def expert_routed(
                     up_e[up_t0 : up_t0 + RECV_TILE, u0 : u0 + MM_INTER_TILE] = pl.reshape(
                         up_acc, [RECV_TILE, MM_INTER_TILE]
                     )
+        up_tids[local_i] = up_tid
 
     y_i32 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT32)
     h_tile_scale_dq = pl.create_tensor(
@@ -139,7 +165,12 @@ def expert_routed(
         h_tile_fp32 = pl.create_tensor([RECV_MAX, MOE_INTER], dtype=pl.FP32)
         h_tile_i8 = pl.create_tensor([RECV_MAX, MOE_INTER], dtype=pl.INT8)
 
-        with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
+        with pl.spmd(
+            MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE),
+            name_hint="exp_gate_up_act",
+            deps=[count_tid, gate_tids[local_e], up_tids[local_e]],
+            predicate=(recv_expert_count[local_e, 0] > 0),
+        ) as act_tid:
             act_rows = pl.read(recv_expert_count, [local_e, 0])
             act_tiles = (act_rows + RECV_TILE - 1) // RECV_TILE
             ab_idx = pl.tile.get_block_idx()
@@ -170,11 +201,19 @@ def expert_routed(
                     gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
                     h_tile_fp32[act_t0 : act_t0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE] = gated_masked
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
+        with pl.spmd(
+            1,
+            name_hint="exp_h_q",
+            deps=[count_tid, act_tid],
+            predicate=(recv_expert_count[local_e, 0] > 0),
+        ) as quant_tid:
+            # Inline SPMD requires an explicit block-index read; this scope has one block.
+            quant_idx = pl.tile.get_block_idx()
+            quant_row_base = quant_idx * RECV_MAX
             quant_rows = pl.read(recv_expert_count, [local_e, 0])
             quant_tiles = (quant_rows + RECV_TILE - 1) // RECV_TILE
             for quant_t in pl.range(quant_tiles):
-                quant_t0 = quant_t * RECV_TILE
+                quant_t0 = quant_row_base + quant_t * RECV_TILE
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     eh_a_f32 = h_tile_fp32[quant_t0 : quant_t0 + RECV_TILE, k0 : k0 + QUANT_TILE]
@@ -197,7 +236,12 @@ def expert_routed(
                         eh_q_half, target_type=pl.INT8, mode="trunc"
                     )
 
-        with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
+        with pl.spmd(
+            D // (W2_INNER * D_OUT_TILE),
+            name_hint="exp_w2_mm",
+            deps=[count_tid, quant_tid],
+            predicate=(recv_expert_count[local_e, 0] > 0),
+        ) as _w2_tid:
             w2_rows = pl.read(recv_expert_count, [local_e, 0])
             w2_tiles = (w2_rows + RECV_TILE - 1) // RECV_TILE
             wb_idx = pl.tile.get_block_idx()
@@ -269,11 +313,12 @@ def expert_routed_test(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
+    input_tid = pl.system.task_invalid()
     expert_routed(
         recv_x, recv_scale_dq, recv_weights, recv_expert_count,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
-        recv_y,
+        recv_y, input_tid, input_tid,
     )
     return recv_y
 
