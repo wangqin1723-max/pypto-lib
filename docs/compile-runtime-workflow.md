@@ -241,8 +241,8 @@ directly on an existing build:
 python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
 ```
 
-or, for `models/qwen3/14b/qwen3_14b_decode.py`, append
-`--export-kernel-insight` to the normal run. The export root is written under
+or drive the case run end-to-end with `--case <kernel.py>` instead of
+`--build-dir`. The export root is written under
 `build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`, and the build
 directory also gets `latest_all_funcs_kernel_insight_export_root.txt` pointing
 at the latest export.
@@ -254,6 +254,18 @@ full per-flag details.
 > The old single boolean `runtime_profiling` / `--runtime-profiling` is
 > a deprecated alias for `enable_l2_swimlane` / `--enable-l2-swimlane`.
 > It still works but emits a `DeprecationWarning` and will be removed.
+
+### 4b. Benchmark (opt-in, before validation)
+
+With `PYPTO_BENCH=1` in the environment, the harness re-dispatches the
+compiled program in a timed loop right after the correctness dispatch and
+before validation, and prints
+`[RUN]   effective_us (N rounds) min=… median=… mean=… max=…`. It is
+env-gated only — no model file needs a flag. `PYPTO_BENCH_ROUNDS` /
+`PYPTO_BENCH_WARMUP` (default 100 / 5) size the loop and `PYPTO_BENCH_RAW`
+dumps the per-dispatch samples. See
+[performance-tuning.md](performance-tuning.md#measuring--the-benchmark-loop-pypto_bench)
+for the output format, the multi-card breakdown, and what the number means.
 
 ### 5. Validate
 

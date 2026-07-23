@@ -12,6 +12,84 @@ compute core.
 
 ---
 
+## Measuring — the benchmark loop (`PYPTO_BENCH`)
+
+Tuning needs a number before and after. Set `PYPTO_BENCH=1` and every
+`run` / `run_jit` call in the process times the kernel on device after its
+correctness dispatch — no `--benchmark` flag, no edit to the model file:
+
+```bash
+PYPTO_BENCH=1 python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0
+```
+
+```
+[RUN]   effective_us (100 rounds) min=520.1 median=538.4 mean=539.9 max=602.0
+```
+
+**Effective** is the framework's post-graph-build execution window on
+device (`orch` ∪ `sched` — the old device-log "Total"), recovered from the
+runtime's `[STRACE]` markers. Quote `mean=`: daily CI's per-case perf number
+is exactly this field of exactly this line
+([daily_ci.yml](../.github/workflows/daily_ci.yml)), so a local mean is
+directly comparable to the dashboard.
+
+Requirements: a real device — a `*sim` platform prints
+`effective_us unavailable: no device-domain spans` — and a runtime built
+with `SIMPLER_PROFILING`. A `runtime_dir=` replay has no live
+`CompiledProgram` and skips benchmarking with a `[RUN] benchmark skipped`
+note.
+
+### Multi-card (L3) output
+
+A distributed program adds a per-rank breakdown and a context line:
+
+```
+[RUN]   effective_us (100 rounds) min=520.1 median=538.4 mean=539.9 max=602.0
+[RUN]     rank 10: eff_us min=500.0 median=510.0 mean=511.0 max=520.0
+[RUN]     rank 11: eff_us min=520.1 median=538.4 mean=539.9 max=602.0
+[RUN] benchmark kernel=moe_ep2 l3_resident=1 rounds=100 ranks=2 host_union_mean_us=900 host_mean_us=950
+```
+
+- The headline is the **per-round max across ranks** — the round ends when
+  the slowest card finishes. The `eff_us` lines expose the cross-card
+  imbalance that max hides; a persistent gap between ranks is a load-balance
+  problem, not a kernel problem.
+- `host_union_mean_us` is the cross-rank host-timeline window
+  (`max(end) - min(start)`), so it captures start skew and overlap, but
+  includes host dispatch overhead.
+- `fallback_flattened=1` means a rank's dispatch count was not divisible by
+  `warmup + rounds` (a non-deterministic dispatch shape), so per-round
+  segmentation was abandoned and the numbers are a pooled per-dispatch
+  sample — treat them as indicative only.
+
+### Knobs
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `PYPTO_BENCH` | off | Enables the timed loop. Any value except `""` / `0` / `false` / `False` is on. |
+| `PYPTO_BENCH_ROUNDS` | `100` | Timed rounds. 100 rounds is ~0.1 s of device time for a decode step but minutes for a long prefill or a multi-card run — drop it while iterating. |
+| `PYPTO_BENCH_WARMUP` | `5` | Leading launches discarded before measurement. The resident L3 path always keeps ≥ 1 (its first warmup launch doubles as the validation dispatch). |
+| `PYPTO_BENCH_RAW` | off | Prints every measured dispatch's Effective sample, one line per rank, in dispatch order. Use it when a summary looks suspicious — start-up drift, a bimodal rank, one card lagging. |
+
+A malformed or out-of-range value warns and falls back to the default
+rather than failing the run. Daily CI sets none of the three, so its numbers
+always come from the 100 / 5 baseline; if you change the loop sizes locally,
+compare only against other runs with the same sizes.
+
+```bash
+# Quick iteration on a long prefill, with the raw per-dispatch samples.
+PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
+  python models/deepseek/v4-flash/prefill_fwd.py -p a2a3 -d 0
+```
+
+When only the timing changes between iterations — not the numerics — pair
+this with the `test-with-golden` skill
+([`.claude/skills/test-with-golden/`](../.claude/skills/test-with-golden/SKILL.md))
+to generate the golden once and replay it via `golden_data=`, cutting the
+torch recompute out of every later run.
+
+---
+
 ## Part 1 — L2 tuning (inter-kernel schedule)
 
 ### Capture
@@ -20,7 +98,7 @@ Run the case with `--enable-l2-swimlane`. The runtime writes per-task L2
 records and a merged swimlane JSON under the build directory:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --enable-l2-swimlane
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
 ```
 
 ```
@@ -60,7 +138,7 @@ a dependency chain. Use `pl.parallel` whenever there is no carried state,
 and reserve `pl.range` for accumulators or stateful loops.
 
 ```python
-# qwen3_14b_decode.py: batch tile is independent — pl.parallel
+# decode_fwd.py: batch tile is independent — pl.parallel
 for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
     ...
 ```
@@ -243,20 +321,24 @@ artifacts drive intra-kernel tuning:
 PMU counters per kernel:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --enable-pmu 2
+python models/deepseek/v4-flash/decode_sparse_attn.py -p a2a3 -d 0 --enable-pmu 2
 # → build_output/<...>/dfx_outputs/pmu.csv
 ```
 
+Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
+captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run` / `run_jit`
+call (the harness bundles it into the runtime's DFX options).
+
 Per-kernel intra-core swimlane (MindStudio Insight / msprof simulator
-trace), exported after a normal run:
+trace), exported from an existing build directory:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --export-kernel-insight
+python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
 # → build_output/<...>/kernel_insight_all_funcs_<ts>/
 ```
 
-Or run the exporter directly on an existing build via
-[`tools/export_all_kernel_insight.py`](../tools/export_all_kernel_insight.py).
+See [`tools/export_all_kernel_insight.py`](../tools/export_all_kernel_insight.py)
+for driving a case run end-to-end (`--case`) instead of reusing a build.
 
 For ad-hoc, single-kernel profiling without a full model run, the
 `incore-profiling` skill
@@ -308,7 +390,7 @@ loop body `stage` times for ping-pong buffering, so MTE2 (load) overlaps
 with cube/vec compute on alternating tiles.
 
 ```python
-# qwen3_14b_decode.py — stage=4 used for the largest input-proj K dim
+# decode_fwd.py — stage=4 used for the largest input-proj K dim
 for kb in pl.pipeline(input_proj_k_blocks, stage=4):
     ...
 
