@@ -1,0 +1,1200 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<title>Qwen3-14B Decode · 性能优化语法图鉴</title>
+<style>
+  :root{
+    --bg:#e9edf1; --surface:#ffffff; --surface-2:#f2f5f9; --code-bg:#eef2f7;
+    --ink:#141a24; --muted:#586576; --faint:#8593a3; --line:#d6dee7;
+    --accent:#b26a10;
+    --algo:#4f52d8; --intra:#b26a10; --sched:#1c8b7b;
+    --aic:#bd7418; --aiv:#1c8b7b; --mte:#4f52d8;
+    --tok-com:#8894a3; --tok-ns:#b26a10; --tok-fn:#4f52d8; --tok-num:#1c8b7b; --tok-k:#b6478a; --tok-str:#1c8b7b;
+    --shadow:0 1px 2px rgba(20,26,36,.05),0 6px 22px rgba(20,26,36,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0b0f16; --surface:#141b26; --surface-2:#10161f; --code-bg:#0a0e15;
+      --ink:#e6edf5; --muted:#8b98aa; --faint:#5e6b7c; --line:#232e3b;
+      --accent:#eaa24b;
+      --algo:#8b90ff; --intra:#eaa24b; --sched:#4fc9b8;
+      --aic:#eaa24b; --aiv:#4fc9b8; --mte:#8b90ff;
+      --tok-com:#5c6879; --tok-ns:#eaa24b; --tok-fn:#8b90ff; --tok-num:#4fc9b8; --tok-k:#e08ab0; --tok-str:#4fc9b8;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#e9edf1; --surface:#ffffff; --surface-2:#f2f5f9; --code-bg:#eef2f7;
+    --ink:#141a24; --muted:#586576; --faint:#8593a3; --line:#d6dee7;
+    --accent:#b26a10; --algo:#4f52d8; --intra:#b26a10; --sched:#1c8b7b;
+    --aic:#bd7418; --aiv:#1c8b7b; --mte:#4f52d8;
+    --tok-com:#8894a3; --tok-ns:#b26a10; --tok-fn:#4f52d8; --tok-num:#1c8b7b; --tok-k:#b6478a; --tok-str:#1c8b7b;
+    --shadow:0 1px 2px rgba(20,26,36,.05),0 6px 22px rgba(20,26,36,.06);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0b0f16; --surface:#141b26; --surface-2:#10161f; --code-bg:#0a0e15;
+    --ink:#e6edf5; --muted:#8b98aa; --faint:#5e6b7c; --line:#232e3b;
+    --accent:#eaa24b; --algo:#8b90ff; --intra:#eaa24b; --sched:#4fc9b8;
+    --aic:#eaa24b; --aiv:#4fc9b8; --mte:#8b90ff;
+    --tok-com:#5c6879; --tok-ns:#eaa24b; --tok-fn:#8b90ff; --tok-num:#4fc9b8; --tok-k:#e08ab0; --tok-str:#4fc9b8;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 30px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body,.page{margin:0}
+  .page{
+    background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6; font-size:16px;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  .wrap{max-width:1000px;margin:0 auto;padding:0 22px}
+  a{color:inherit}
+
+  .hero{padding:64px 0 34px;border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);margin:0 0 16px}
+  .hero h1{font-size:clamp(2rem,5.2vw,3.3rem);line-height:1.06;letter-spacing:-.02em;margin:0 0 16px;text-wrap:balance;font-weight:800}
+  .hero p.lede{max-width:62ch;color:var(--muted);font-size:1.06rem;margin:0 0 20px}
+  .aicpu-note{max-width:62ch;font-size:.92rem;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:12px 16px;margin:0 0 24px}
+  .aicpu-note b{color:var(--accent)}
+  .readout{display:flex;flex-wrap:wrap;gap:10px;font-family:var(--mono);font-size:.78rem}
+  .readout span{display:inline-flex;gap:7px;align-items:baseline;padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--muted)}
+  .readout b{color:var(--ink);font-weight:600}
+  .legend{display:flex;flex-wrap:wrap;gap:18px;margin-top:24px;font-family:var(--mono);font-size:.8rem}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:8px;vertical-align:middle}
+  .legend span{color:var(--muted)}
+
+  .catnav{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  .catnav .wrap{display:flex;gap:6px;padding-top:10px;padding-bottom:10px;flex-wrap:wrap}
+  .catnav a{font-family:var(--mono);font-size:.8rem;text-decoration:none;color:var(--muted);padding:7px 13px;border-radius:8px;border:1px solid transparent;transition:.15s}
+  .catnav a:hover{color:var(--ink);border-color:var(--line);background:var(--surface)}
+  .catnav a b{color:var(--accent);font-weight:700;margin-right:6px}
+
+  .cat{padding:52px 0 8px;scroll-margin-top:60px}
+  .cat-head{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-bottom:6px}
+  .cat-head .num{font-family:var(--mono);font-size:.95rem;font-weight:700;color:var(--cat)}
+  .cat-head h2{font-size:clamp(1.5rem,3.4vw,2.1rem);margin:0;letter-spacing:-.01em;font-weight:800}
+  .cat-head .en{font-family:var(--mono);font-size:.78rem;color:var(--faint);letter-spacing:.04em}
+  .cat-sub{color:var(--muted);margin:2px 0 30px;max-width:70ch}
+  #algo{--cat:var(--algo)} #intra{--cat:var(--intra)} #sched{--cat:var(--sched)}
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:24px 24px 8px;margin-bottom:22px;overflow:hidden}
+  .card-top{display:flex;gap:14px;align-items:flex-start;margin-bottom:18px}
+  .chip{flex:none;font-family:var(--mono);font-size:.68rem;font-weight:600;letter-spacing:.04em;padding:5px 9px;border-radius:7px;color:var(--surface);background:var(--cat);white-space:nowrap;margin-top:3px}
+  .titles h3{margin:0 0 4px;font-size:1.16rem;font-weight:700;letter-spacing:-.01em;display:flex;flex-wrap:wrap;gap:10px;align-items:baseline}
+  .titles h3 .api{font-family:var(--mono);font-size:.82rem;font-weight:500;color:var(--cat)}
+  .titles .role{margin:0;color:var(--muted);font-size:.96rem}
+  .titles .role b{color:var(--ink)}
+
+  .blocks{display:flex;flex-direction:column;gap:14px}
+  .block{min-width:0}
+  .blabel{display:block;font-family:var(--mono);font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin-bottom:7px}
+  pre{margin:0;background:var(--code-bg);border:1px solid var(--line);border-radius:10px;padding:14px 15px;overflow-x:auto}
+  code.py{font-family:var(--mono);font-size:.795rem;line-height:1.62;white-space:pre;color:var(--ink);display:block;tab-size:4}
+  .tok-com{color:var(--tok-com);font-style:italic}
+  .tok-ns{color:var(--tok-ns)} .tok-fn{color:var(--tok-fn)}
+  .tok-num{color:var(--tok-num)} .tok-k{color:var(--tok-k);font-weight:600}
+
+  .win{background:color-mix(in srgb,var(--accent) 9%,transparent);border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line));border-radius:9px;padding:10px 13px;margin-top:14px;font-size:.9rem;color:var(--ink)}
+  .win b{color:var(--accent);font-family:var(--mono);font-size:.82rem}
+
+  figure.diagram{margin:22px 0 16px;padding:0;border-top:1px dashed var(--line);padding-top:18px}
+  figure.diagram figcaption{font-family:var(--mono);font-size:.75rem;color:var(--muted);margin-top:12px;text-align:center;line-height:1.5}
+  .canvas-wrap{position:relative;width:100%;height:230px}
+  .canvas-wrap canvas{width:100%;height:100%;display:block}
+  .dia-legend{display:flex;justify-content:center;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:2px}
+  .dia-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:middle}
+
+  .schem{display:flex;flex-direction:column;gap:14px;align-items:center}
+  .flowrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center}
+  .node{font-family:var(--mono);font-size:.78rem;padding:10px 14px;border-radius:9px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink);text-align:center;line-height:1.35}
+  .node.ghost{border-style:dashed;opacity:.5}
+  .node.hot{border-color:var(--cat);box-shadow:0 0 0 1px var(--cat) inset;color:var(--cat)}
+  .node.aic{border-color:var(--aic);color:var(--aic)}
+  .node.aiv{border-color:var(--aiv);color:var(--aiv)}
+  .node .sub{display:block;font-size:.66rem;color:var(--faint);margin-top:3px}
+  .arrow{font-family:var(--mono);color:var(--faint);font-size:1.1rem}
+  .rowlbl{font-family:var(--mono);font-size:.7rem;color:var(--faint);min-width:64px;text-align:right}
+  .fork{display:flex;gap:26px;flex-wrap:wrap;justify-content:center}
+  .twin{display:grid;grid-template-columns:1fr 1fr;gap:16px;width:100%}
+  @media (max-width:560px){.twin{grid-template-columns:1fr}}
+  .twin .panel{border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--surface-2)}
+  .twin .panel h4{margin:0 0 12px;font-family:var(--mono);font-size:.76rem;letter-spacing:.04em;color:var(--cat)}
+
+  svg.dag{width:100%;height:auto;display:block}
+  svg.dag .edge{fill:none;stroke:var(--cat);stroke-width:1.6;opacity:.55}
+  svg.dag .nodebox{fill:var(--surface-2);stroke:var(--line)}
+  svg.dag text{font-family:var(--mono);font-size:12px;fill:var(--ink)}
+  @media (prefers-reduced-motion:no-preference){
+    svg.dag .edge{stroke-dasharray:6 6;animation:flow 1.1s linear infinite}
+  }
+  @keyframes flow{to{stroke-dashoffset:-24}}
+
+  /* overview baseline vs optimized */
+  .overview{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:22px 22px 20px;margin-bottom:26px;box-shadow:var(--shadow)}
+  .overview h3{margin:0 0 4px;font-size:1.1rem;font-weight:700}
+  .overview .ovsub{margin:0 0 18px;color:var(--muted);font-size:.92rem}
+  .ov-row{margin-bottom:20px}
+  .ov-row:last-of-type{margin-bottom:8px}
+  .ov-lbl{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.74rem;letter-spacing:.04em;margin-bottom:9px}
+  .ov-lbl .tag{font-weight:700}
+  .ov-lbl.base .tag{color:var(--faint)} .ov-lbl.opt .tag{color:var(--accent)}
+  .ov-lbl .cnt{margin-left:auto;color:var(--muted);font-size:.7rem}
+  .ov-flow{display:flex;gap:6px;align-items:stretch;overflow-x:auto;padding:2px 0 8px}
+  .stage{flex:none;font-family:var(--mono);font-size:.7rem;padding:8px 9px;border-radius:7px;border:1px solid var(--line);background:var(--surface-2);color:var(--muted);white-space:nowrap;display:flex;align-items:center;line-height:1.2}
+  .stage.k{color:var(--faint)}
+  .grp{flex:none;display:flex;flex-direction:column;gap:5px}
+  .grp .glbl{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:var(--gc,var(--accent));white-space:nowrap}
+  .grp .gbox{display:flex;gap:5px;border:1px dashed var(--gc,var(--accent));border-radius:9px;padding:6px;background:color-mix(in srgb,var(--gc,var(--accent)) 9%,transparent);align-items:center}
+  .grp .gbox .stage{background:var(--surface);color:var(--ink);border-color:transparent}
+  .sep{flex:none;align-self:center;color:var(--faint);font-family:var(--mono);font-size:.85rem}
+  .ov-notes{display:grid;grid-template-columns:1fr 1fr;gap:8px 22px;margin-top:14px;padding-top:16px;border-top:1px dashed var(--line);font-size:.86rem;color:var(--muted)}
+  @media (max-width:640px){.ov-notes{grid-template-columns:1fr}}
+  .ov-notes div{display:flex;gap:9px;align-items:baseline}
+  .ov-notes b{color:var(--ink);font-weight:600}
+  .ov-notes .dot{flex:none;width:7px;height:7px;border-radius:2px;background:var(--accent);transform:translateY(-1px)}
+
+  .card.note{background:var(--surface-2)}
+  .card.note .warn{font-family:var(--mono);font-size:.76rem;color:var(--accent);margin:0 0 6px}
+
+  footer{border-top:1px solid var(--line);margin-top:40px;padding:30px 0 60px;color:var(--faint);font-family:var(--mono);font-size:.76rem}
+  footer .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+</style>
+
+<div class="page">
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">models/qwen3/14b/decode_fwd.py · pypto kernel</p>
+      <h1>Qwen3-14B Decode Layer<br>性能优化语法图鉴</h1>
+      <p class="lede">一层 decode 里用到的 pypto 性能优化语法，按 <b>算法 / 核内 / 调度</b> 三层拆分。每条含语法、完整代码示例（标注 <code style="font-family:var(--mono);font-size:.85em">file:line</code>），关键原理配可交互的图示 / 动画。</p>
+      <p class="aicpu-note">贯穿全文的一条主线：decode 的瓶颈很大程度在 <b>AICPU 调度</b>。<b>syncall 合并 kernel</b>、<b>spmd 缩减任务数</b>、<b>manual_scope 省 tensormap 建依赖</b>、<b>mix kernel 用 tpush/tpop 就地同步</b>、<b>allow_early_resolve 提前下发</b> —— 大量"调度优化"本质是把工作从 AICPU 卸下、减少它要调度的东西。</p>
+      <div class="readout">
+        <span><b>40</b> layers</span>
+        <span>BATCH <b>16</b></span>
+        <span>HIDDEN <b>5120</b></span>
+        <span>KV heads <b>8</b> · GQA <b>5</b></span>
+        <span>NUM_CORES <b>24</b> (48 AIV + 24 AIC)</span>
+        <span>carry <b>FP32</b></span>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--algo)"></i>算法优化 · 拆全局同步</span>
+        <span><i style="background:var(--intra)"></i>核内优化 · 榨算力</span>
+        <span><i style="background:var(--sched)"></i>调度优化 · 省 AICPU</span>
+        <span><i style="background:var(--aic)"></i>AIC / cube</span>
+        <span><i style="background:var(--aiv)"></i>AIV / vector</span>
+      </div>
+    </div>
+  </header>
+
+  <nav class="catnav">
+    <div class="wrap">
+      <a href="#algo"><b>01</b>算法优化</a>
+      <a href="#intra"><b>02</b>核内优化</a>
+      <a href="#sched"><b>03</b>调度优化</a>
+    </div>
+  </nav>
+
+  <main class="wrap">
+
+    <!-- ============ 算法优化 ============ -->
+    <section id="algo" class="cat">
+      <div class="cat-head">
+        <span class="num">01</span>
+        <h2>算法优化</h2>
+        <span class="en">split global sync · avoid waiting</span>
+      </div>
+      <p class="cat-sub">重排计算次序、融合算子、拆开强同步点，让下游不必等上游整体完成。下图先给一层 decode 的 <b>baseline 完整流程</b> 与 <b>优化后完整流程</b> 的对比，再逐条展开。</p>
+
+      <!-- OVERVIEW baseline vs optimized -->
+      <div class="overview">
+        <h3>一层 decode：baseline 流程 vs 优化后流程</h3>
+        <p class="ovsub">每个方块是一段计算；虚线框 = 被融合进同一个 kernel / dispatch。优化后 kernel 数显著变少（省 AICPU 调度），且层间以 FP32 carry 贯穿。</p>
+
+        <div class="ov-row">
+          <div class="ov-lbl base"><span class="dot" style="background:var(--faint)"></span><span class="tag">BASELINE</span><span>每块 = 独立 kernel 派发 · 层间 BF16 carry</span><span class="cnt">≈ 15 kernels / layer</span></div>
+          <div class="ov-flow">
+            <div class="stage k">RMSNorm<br>(reduce+×γ)</div><span class="sep">›</span>
+            <div class="stage k">Q proj</div><span class="sep">›</span>
+            <div class="stage k">K proj</div><span class="sep">›</span>
+            <div class="stage k">V proj</div><span class="sep">›</span>
+            <div class="stage k">RoPE + QK-norm<br>(GM 往返)</div><span class="sep">›</span>
+            <div class="stage k">attn<br>QK·softmax·SV</div><span class="sep">›</span>
+            <div class="stage k">online-<br>softmax</div><span class="sep">›</span>
+            <div class="stage k">out proj</div><span class="sep">›</span>
+            <div class="stage k">resid +<br>RMSNorm</div><span class="sep">›</span>
+            <div class="stage k">gate</div><span class="sep">›</span>
+            <div class="stage k">up</div><span class="sep">›</span>
+            <div class="stage k">silu</div><span class="sep">›</span>
+            <div class="stage k">down</div><span class="sep">›</span>
+            <div class="stage k">resid →<br>out</div><span class="sep">›</span>
+            <div class="stage k">x·γ<br>(下层)</div>
+          </div>
+        </div>
+
+        <div class="ov-row">
+          <div class="ov-lbl opt"><span class="dot"></span><span class="tag">OPTIMIZED</span><span>融合 + 合并 kernel · 层间 FP32 carry</span><span class="cnt">≈ 8 groups / layer</span></div>
+          <div class="ov-flow">
+            <div class="grp" style="--gc:var(--algo)"><span class="glbl">解耦 · 并行</span><div class="gbox">
+              <div class="stage">rms_recip<br>(1/rms 延迟)</div><div class="stage">x·γ<br>(来自上层 dcr)</div>
+            </div></div><span class="sep">›</span>
+            <div class="grp" style="--gc:var(--intra)"><span class="glbl">split-K atomic</span><div class="gbox">
+              <div class="stage">Q</div><div class="stage">K</div><div class="stage">V</div>
+            </div></div><span class="sep">›</span>
+            <div class="grp" style="--gc:var(--sched)"><span class="glbl">ONE mix kernel · syncall</span><div class="gbox">
+              <div class="stage">RoPE+QKnorm<br>(寄存器内)</div><div class="stage">‖ attn</div><div class="stage">‖ online-sm</div>
+            </div></div><span class="sep">›</span>
+            <div class="stage">out proj</div><span class="sep">›</span>
+            <div class="grp" style="--gc:var(--algo)"><span class="glbl">融合</span><div class="gbox">
+              <div class="stage">residual_rms_cast<br>(resid+γ+reduce)</div>
+            </div></div><span class="sep">›</span>
+            <div class="grp" style="--gc:var(--intra)"><span class="glbl">split-K</span><div class="gbox">
+              <div class="stage">gate</div><div class="stage">up</div><div class="stage">silu</div><div class="stage">down</div>
+            </div></div><span class="sep">›</span>
+            <div class="grp" style="--gc:var(--algo)"><span class="glbl">融合 spmd</span><div class="gbox">
+              <div class="stage">dcr_xgamma<br>(resid + 下层 x·γ)</div>
+            </div></div>
+          </div>
+        </div>
+
+        <div class="ov-notes">
+          <div><span class="dot"></span><span><b>rope + attn + online-softmax → 1 个 mix kernel</b>：核内 syncall 分相，省 2 次 kernel 派发 + dep 边</span></div>
+          <div><span class="dot"></span><span><b>1/rms 延迟</b>：归约与 x·γ 解耦，rms_recip 与 QKV 重叠</span></div>
+          <div><span class="dot"></span><span><b>QK-norm + RoPE 寄存器内融合</b>：消 q/k_norm 中间张量 GM 往返</span></div>
+          <div><span class="dot"></span><span><b>dcr_xgamma 融合</b>：残差 + 下层 x·γ 同块直出，2 → 1</span></div>
+          <div><span class="dot"></span><span><b>FP32 层间 carry</b>：去掉每层 BF16 舍入与 round-trip</span></div>
+          <div><span class="dot"></span><span><b>QKV / MLP split-K + 原子加</b>：M/N 小的瘦高矩阵切 K 补并行度</span></div>
+        </div>
+      </div>
+
+      <!-- 1 deferred inv_rms -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">算法 · 01</span>
+          <div class="titles">
+            <h3>延迟 1/rms<span class="api">inv_rms commute</span></h3>
+            <p class="role">inv_rms 是 per-row 标量，沿线性的 QKV / RoPE 可交换。把除法从归约后推到 rope 里一次标量乘 —— x·γ 不再等 sum-of-squares 归约，rms_recip 与 QKV proj 重叠。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">恒等式</span>
+<pre><code class="py"># RMSNorm(x) = (x * inv_rms) * gamma,  inv_rms[b] = 1/sqrt(mean_k x^2 + eps)
+# inv_rms 是 per-row 标量, 对 matmul 可交换:
+#     q = inv_rms * ((x * gamma) @ Wq)
+# 于是把 ÷rms 推迟到 QKV 之后, 折进 rope 一次标量乘</code></pre></div>
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:444-460, 632-704</span>
+<pre><code class="py"># ── rms_recip: 一个独立 CORE_GROUP 任务, 只算 1/sqrt(mean(x^2)+eps) ──
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms_recip",
+           deps=[prev_out_tids[i] for i in range(DOWN_ON)]) as rms_tid:
+    partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+    for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
+        k0 = kb * RMSNORM_K_CHUNK
+        x_chunk = hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK]
+        partial_sq = pl.add(partial_sq,
+            pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]))
+    variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
+    inv_rms = pl.recip(pl.sqrt(variance))
+    inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
+rope_dep_tids[RMS_TID_IDX] = rms_tid
+
+# ...QKV 直接用 normed_in(= x*gamma) 开算, 完全不等 rms_tid...
+
+# rope (fa_fused phase-0) 内才把 inv_rms 乘回 —— 一次 per-row 标量乘:
+inv_rms_b = pl.read(inv_rms_states, [b, 0])
+q_raw = pl.mul(q_proj_slab, inv_rms_b)   # 1/rms 折进这里, 而非归约处</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="schem">
+            <div class="flowrow"><span class="rowlbl">baseline</span>
+              <div class="node hot">÷ rms<span class="sub">阻塞: 等归约</span></div><span class="arrow">→</span>
+              <div class="node">×γ</div><span class="arrow">→</span>
+              <div class="node aic">Q/K/V matmul</div><span class="arrow">→</span>
+              <div class="node aiv">RoPE</div>
+            </div>
+            <div class="flowrow"><span class="rowlbl">优化</span>
+              <div class="node ghost">÷ rms</div><span class="arrow">⇢</span>
+              <div class="node">×γ<span class="sub">立即可算</span></div><span class="arrow">→</span>
+              <div class="node aic">Q/K/V matmul<span class="sub">与归约并行</span></div><span class="arrow">→</span>
+              <div class="node aiv hot">RoPE ×(1/rms)<span class="sub">折入一次标量乘</span></div>
+            </div>
+          </div>
+          <figcaption>÷rms 越过 matmul 下沉到 rope，×γ 路径与归约解耦并行</figcaption>
+        </figure>
+      </article>
+
+      <!-- 2 flash-decoding block-level load balance -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">算法 · 02</span>
+          <div class="titles">
+            <h3>flash-decoding 块级负载均衡<span class="api">fa_work_build + grid-stride</span></h3>
+            <p class="role">先用 AIV 预处理把 ragged batch 的真实 seq-block 压成无缝 work table，再 <code style="font-family:var(--mono)">core = w % NUM_CORES</code> 轮询均分 —— 摆脱 per-batch 长度倾斜（≈1.25× 理想）。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:548-560, 724-734</span>
+<pre><code class="py"># ── AIV 预处理: 把真实 seq-block 压成 gap-free work table ──
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_work_build") as work_tid:
+    cursor = pl.read(seq_lens, [0]) * 0            # scalar 0 (INDEX)
+    for wb in pl.unroll(BATCH):
+        wb_ctx = (pl.read(seq_lens, [wb]) + (SEQ_TILE - 1)) // SEQ_TILE
+        for wp in pl.range(wb_ctx):
+            pl.tensor.write(fa_work_table, [cursor + wp, 0],
+                pl.cast(wb * MAX_CTX_BLOCKS + wp, target_type=pl.INT32))
+        cursor = cursor + wb_ctx                   # 前缀和游标
+    pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
+
+# ── fa_fused 核内: 片上读块数, 每核 grid-stride 领等价代价块 ──
+fa_total_blocks = pl.cast(pl.read(fa_total, [0, 0]), target_type=pl.INDEX)
+for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):   # core = w % N
+    fa_enc = pl.cast(pl.read(fa_work_table, [fa_w, 0]), target_type=pl.INDEX)
+    fa_b = fa_enc // MAX_CTX_BLOCKS                # 还原 batch
+    fa_p = fa_enc % MAX_CTX_BLOCKS                 # 还原 block</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="canvas-wrap"><canvas data-anim="loadbalance"></canvas></div>
+          <figcaption>ragged 批次 → 无缝 work table → 按核轮询均分（等价代价块打散跨批）</figcaption>
+        </figure>
+      </article>
+
+      <!-- 3 phase split -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">算法 · 03</span>
+          <div class="titles">
+            <h3>online-softmax 相位拆分<span class="api">phase-1 / phase-2 + barrier</span></h3>
+            <p class="role">逐块 partial（各核算）与跨块归约（需全核可见）分成两相，中间用一道核内 syncall 隔开 —— 三段并入同一个 mix kernel（见 核内·01），而非三个独立 kernel。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:742-771, 792-839</span>
+<pre><code class="py"># ── phase-1: 每个真实块逐头算 partial, 各核乱序产出 ──
+for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
+    for gp in pl.pipeline(GP_SIZE, stage=3):
+        raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+        ...                                        # softmax -> mi / li
+        oi_tmp = pl.matmul(exp_full, v_tile, out_dtype=pl.FP32)
+        all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
+
+pl.system.syncall(core_type="mix")                 # 全核到齐, partial 可见
+
+# ── phase-2: 48 路 AIV 按 (b,kvh) lane 跨块归约 ──
+for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+    os_aiv = fa_core * 2 + aiv_id
+    for os_spmd_idx in pl.range(os_aiv, OS_WORK, NUM_CORES * 2):
+        for sb in pl.pipeline(1, os_ctx_blocks, stage=2):
+            mi_new = pl.maximum(mi, online_cur_mi)
+            alpha = pl.exp(pl.sub(mi, mi_new))
+            beta  = pl.exp(pl.sub(online_cur_mi, mi_new))
+            li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
+            oi = pl.add(pl.row_expand_mul(oi, alpha),
+                        pl.row_expand_mul(oi_tmp_valid, beta))
+            mi = mi_new
+        ctx = pl.row_expand_div(oi, li)
+        attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="schem">
+            <div class="flowrow">
+              <div class="node aic">phase-1<br>逐块 partial<span class="sub">各核并行, 无序</span></div>
+              <span class="arrow">→</span>
+              <div class="node hot">syncall(mix)<span class="sub">全核到齐</span></div>
+              <span class="arrow">→</span>
+              <div class="node aiv">phase-2<br>跨块归约<span class="sub">48 路 AIV</span></div>
+            </div>
+          </div>
+          <figcaption>partial 由不同核乱序产出 → barrier 保证可见 → 归约按 lane 并行</figcaption>
+        </figure>
+      </article>
+
+      <!-- 4 dcr_xgamma fusion -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">算法 · 04</span>
+          <div class="titles">
+            <h3>融合 dcr_xgamma<span class="api">1 register block → 2 outputs</span></h3>
+            <p class="role">同一寄存器 FP32 块同时产出层残差 <code style="font-family:var(--mono)">out</code> 与下一层的 x·γ <code style="font-family:var(--mono)">normed_out</code> —— 省掉 x_gamma 的整轮 GM 读写往返，两个 kernel 合一。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:1066-1090</span>
+<pre><code class="py"># dcr_xgamma: 一个 spmd(DOWN_ON) dispatch, DOWN_ON 个块天然并行
+with pl.spmd(DOWN_ON, name_hint="dcr_xgamma",
+             deps=[down_tids[i] for i in range(DOWN_ON * K_SPLITS)]) as dcr_tid:
+    n_out = pl.tile.get_block_idx()
+    n0 = n_out * DOWN_TN
+    # OUTPUT 1: 层残差 (down_acc + post_norm, 均 FP32) -> out (残差流)
+    out_chunk = pl.add(down_acc_all[:, n0 : n0 + DOWN_TN],
+                       post_norm_partial[:, n0 : n0 + DOWN_TN])
+    out = pl.assemble(out, out_chunk, [0, n0])
+    # OUTPUT 2: 下一层 x*gamma, 同一寄存器块直出 (无 GM 回读 out)
+    gamma_next = pl.slice(input_rms_weight, [1, DOWN_TN], [next_gamma_idx, n0])
+    xg = pl.col_expand_mul(out_chunk, gamma_next)
+    normed_out = pl.assemble(normed_out, pl.cast(xg, target_type=pl.BF16), [0, n0])
+
+# 一个 dcr dispatch tid 同时承载 out + normed_out 的全部 DOWN_ON slab;
+# 下一层的 rms_recip/seeds(读 prev_out_tids) 与 QKV(读 prev_normed_tids) 都等它
+for _slab in pl.unroll(DOWN_ON):
+    prev_out_tids[_slab] = dcr_tid
+    prev_normed_tids[_slab] = dcr_tid</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="schem">
+            <div class="flowrow">
+              <div class="node hot">in-register<br>FP32 chunk<span class="sub">down_acc + post_norm</span></div>
+              <div class="fork">
+                <div class="flowrow"><span class="arrow">↗</span><div class="node">out (残差, FP32)<span class="sub">→ 残差流</span></div></div>
+                <div class="flowrow"><span class="arrow">↘</span><div class="node aiv">normed_out (x·γ, BF16)<span class="sub">→ 下层 QKV</span></div></div>
+              </div>
+            </div>
+          </div>
+          <figcaption>一块寄存器数据分叉出两个消费者，x·γ 不落 GM 再回读</figcaption>
+        </figure>
+      </article>
+
+      <!-- 5 fused qk-norm + rope -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">算法 · 05</span>
+          <div class="titles">
+            <h3>融合 QK-norm + RoPE<span class="api">in-register norm→rotate</span></h3>
+            <p class="role">inv_rms 缩放 · gamma · per-row qk_inv 归一 · RoPE 旋转，全部在寄存器内一次完成 —— 省掉 q/k_proj_norm 中间张量的 GM 往返；零行填充只为 32B 对齐。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:655-679（K 路径）</span>
+<pre><code class="py"># 读原始 k_proj 行, 列补零到 K_RED_ROWS (col-major 32B 对齐), reshape 后 ×1/rms
+k_raw = pl.mul(
+    pl.reshape(pl.concat(k_proj[b : b + 1, kv_col : kv_col + HEAD_DIM], k_red_pad),
+               [K_RED_ROWS, HEAD_DIM]),
+    inv_rms_b)
+k_ss  = pl.row_sum(pl.mul(k_raw, k_raw))                 # QK-norm 平方和
+k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
+k_normed = pl.row_expand_mul(pl.col_expand_mul(k_raw, k_norm_w), k_inv)  # ×γ ×qk_inv
+k_full = k_normed[0:1, :]                                # 只保留 row 0 (head)
+k_lo = k_full[:, 0:HALF_DIM]
+k_hi = k_full[:, HALF_DIM:HEAD_DIM]
+# RoPE (NeoX half-split) 旋转
+rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
+rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
+rot = pl.concat(rot_lo, rot_hi)                          # 合成一整行 -> 1x MTE3 写
+cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
+k_cache = pl.assemble(k_cache, pl.cast(rot, target_type=pl.BF16), [cache_row, 0])</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="schem"><div class="flowrow">
+            <div class="node">k_proj 行<span class="sub">raw, GM</span></div><span class="arrow">→</span>
+            <div class="node hot">×1/rms</div><span class="arrow">→</span>
+            <div class="node hot">qk-norm</div><span class="arrow">→</span>
+            <div class="node hot">×γ</div><span class="arrow">→</span>
+            <div class="node aiv">RoPE 旋转</div><span class="arrow">→</span>
+            <div class="node">k_cache<span class="sub">1× MTE3 写</span></div>
+          </div></div>
+          <figcaption>整条 norm→rotate 链在寄存器内串起，中间态不落 GM</figcaption>
+        </figure>
+      </article>
+    </section>
+
+    <!-- ============ 核内优化 ============ -->
+    <section id="intra" class="cat">
+      <div class="cat-head">
+        <span class="num">02</span>
+        <h2>核内优化</h2>
+        <span class="en">intra-kernel · squeeze the cores</span>
+      </div>
+      <p class="cat-sub">在单个 kernel 内部把算力压满：AIC/AIV 混合根、瘦高矩阵切 K、把 MTE2→cube/vec→MTE3 三条硬件流水线流起来，以及把一块张量在双 AIV lane 上拆算。</p>
+
+      <!-- 6 mix kernel -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">核内 · 01</span>
+          <div class="titles">
+            <h3>mix kernel<span class="api">AIC + AIV 混合根</span></h3>
+            <p class="role"><b>一个 kernel 内同时跑 AIC(cube) 与 AIV(vector)</b>，两者用 <code style="font-family:var(--mono)">tpush / tpop</code> 就地握手同步（而非跨 kernel 经 AICPU）—— 既让 cube 与 vector 重叠，又把原本 rope / attn / online-softmax 三个 kernel 合并成一个，<b>减少 AICPU 调度</b>。三相之间用 syncall 做全核 barrier。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:600-800（三相骨架）</span>
+<pre><code class="py">with pl.spmd(NUM_CORES, name_hint="fa_fused",
+             deps=[rope_dep_tids[i] for i in range(FA_NDEPS)]) as attn_done_tid:
+    fa_core = pl.get_block_idx()
+
+    # ── phase-0: QK-norm + RoPE (AIV), 折入 fa_fused (原 rope_qkv 独立 grid) ──
+    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+        rope_lane = fa_core * 2 + aiv_id           # 0..47
+        if rope_lane < ROPE_CORES:                 # 0..31 跑 rope, 32..47 空
+            for it in pl.pipeline(ROPE_ITEMS_PER_CORE, stage=2):
+                ...                                # 写 k_cache / v_cache / all_q_padded
+    pl.system.syncall(core_type="mix")             # 把 cache/q 发布给全核
+
+    # ── phase-1: QK/SV (AIC) 与 softmax (AIV) 混合, C<->V 靠 tpush/tpop 握手 ──
+    for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
+        for gp in pl.pipeline(GP_SIZE, stage=3):
+            raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)  # AIC
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):                  # AIV
+                scores_h = pl.aiv_shard(raw_scores)     # C->V (tpush/tpop 就地)
+                ...
+                exp_full = pl.aic_gather(exp_scores)    # V->C
+            oi_tmp = pl.matmul(exp_full, v_tile, out_dtype=pl.FP32)                    # AIC
+    pl.system.syncall(core_type="mix")             # fence phase-1 -> phase-2
+
+    # ── phase-2: online-softmax (AIV) ──
+    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+        ...</code></pre></div>
+        </div>
+        <div class="win"><b>省 AICPU：</b>rope→attn→softmax 原本 3 次 kernel 派发 + 2 条跨 kernel dep 边，合并后只剩 1 次派发；AIC↔AIV 的 C2V/V2C 用 tpush/tpop 硬件握手，不再经 AICPU 转发。</div>
+        <figure class="diagram">
+          <div class="canvas-wrap"><canvas data-anim="mixkernel"></canvas></div>
+          <div class="dia-legend"><span><i style="background:var(--aic)"></i>AIC cube</span><span><i style="background:var(--aiv)"></i>AIV vector</span></div>
+          <figcaption>单 root 三相；phase-1 里 AIC/AIV 并行(tpush/tpop 握手)，两道 syncall 分相</figcaption>
+        </figure>
+      </article>
+
+      <!-- 7 split-K -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">核内 · 02</span>
+          <div class="titles">
+            <h3>matmul 切 K<span class="api">split-K + atomic Add</span></h3>
+            <p class="role">decode 的矩阵是 <b>M(=BATCH 16) / N 小、K 大的瘦高形</b>，光切 M/N 凑不满核。<b>切 K</b> 把 reduction 维分成多片，各片算部分和后用硬件原子加汇入同一零种子输出 —— 补足并行度、分片可跨核。QKV / out / gate / up / down 全用此形。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:1016-1034（down_proj）</span>
+<pre><code class="py">for n_out in pl.parallel(DOWN_ON):                 # N 轴只有 5 块 (太少)
+    n0 = n_out * DOWN_TN
+    for k_split in pl.range(K_SPLITS):             # -> 再切 17 个 K-slice 补并行
+        k0 = k_split * DOWN_TN
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj",
+                   deps=[seed_tid, silu_tids[k_split]]) as down_tid:
+            a0 = mlp_tile[:, k0 : k0 + DOWN_TK]
+            w0 = w_down[layer_inter_base + k0 : layer_inter_base + k0 + DOWN_TK,
+                        n0 : n0 + DOWN_TN]
+            c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)         # 首片
+            for lk in pl.pipeline(1, N_SUB_K, stage=2):         # 内层 16 个 K chunk
+                ks_off = lk * DOWN_TK
+                a_k = mlp_tile[:, k0 + ks_off : k0 + ks_off + DOWN_TK]
+                w_k = w_down[layer_inter_base + k0 + ks_off : ..., n0 : n0 + DOWN_TN]
+                c_acc = pl.matmul_acc(c_acc, a_k, w_k)          # 累加
+            down_acc_all = pl.assemble(down_acc_all, c_acc, [0, n0],
+                                       atomic=pl.AtomicType.Add) # 分片原子加
+        down_tids[n_out * K_SPLITS + k_split] = down_tid        # 收集 tid</code></pre></div>
+          <div class="block"><span class="blabel">配套 · 零种子（先清零才能 atomic-add）· :577-581</span>
+<pre><code class="py">with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_seed",
+           deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as seed_tid:
+    for nb in pl.pipeline(DOWN_ON, stage=2):
+        zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
+        down_acc_all = pl.assemble(down_acc_all, zero, [0, nb * DOWN_TN])
+# auto-dep 自动排序: seed(清零) -> down_proj(atomic add) -> dcr(消费)</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="canvas-wrap"><canvas data-anim="splitk"></canvas></div>
+          <figcaption>N 轴块太少 → 切 K 补并行：分片各算部分积 → atomic Add 汇入同一瓦片</figcaption>
+        </figure>
+      </article>
+
+      <!-- 8 pipeline -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">核内 · 03</span>
+          <div class="titles">
+            <h3>pl.pipeline<span class="api">软件流水 · stage=k</span></h3>
+            <p class="role">声明式软件流水：让一个核内的三条硬件流水线 —— <b>MTE2(load) → Cube/Vec(compute) → MTE3(store)</b> —— 跨迭代重叠起来（第 i+1 次的 load 与第 i 次的 compute、第 i-1 次的 store 并行）。<code style="font-family:var(--mono)">stage</code> = 保持在飞的迭代数。<span style="color:var(--faint)">（AIC/AIV 之间的重叠由 mix kernel 负责，不是 pipeline。）</span></p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">签名 · 两种形式</span>
+<pre><code class="py">for i in pl.pipeline(N_ITERS, stage=4):        # 0..N-1, 保持 4 级在飞
+    ...
+for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):   # 带起始偏移(首片在外)
+    ...</code></pre></div>
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:479-489（QKV split-K 内层，load/compute/store 流水）</span>
+<pre><code class="py">q_acc = pl.matmul(normed_in[:, q_k_base : q_k_base + TK],   # 首片
+                  wq[..., n0 : n0 + TN], out_dtype=pl.FP32)
+for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+    kk = q_k_base + kc * TK
+    # 每次迭代: MTE2 载 normed_in / wq 分块 -> Cube 做 matmul_acc -> (末尾)MTE3
+    # 编译器把第 i+1 次的 load 与第 i 次的 cube 重叠, 掩盖搬运延迟
+    q_acc = pl.matmul_acc(q_acc, normed_in[:, kk : kk + TK],
+                          wq[layer_hidden_base + kk : layer_hidden_base + kk + TK,
+                             n0 : n0 + TN])
+q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="canvas-wrap"><canvas data-anim="pipeline"></canvas></div>
+          <div class="dia-legend"><span><i style="background:var(--sched)"></i>MTE2 load</span><span><i style="background:var(--intra)"></i>Cube / Vec</span><span><i style="background:var(--algo)"></i>MTE3 store</span></div>
+          <figcaption>stage=3：第 i+1 次 load 与第 i 次 compute、第 i-1 次 store 在时间轴上重叠</figcaption>
+        </figure>
+      </article>
+
+      <!-- 9 split_aiv + shard/gather (merged) -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">核内 · 04</span>
+          <div class="titles">
+            <h3>split_aiv + aiv_shard / aic_gather<span class="api">dual-AIV lane</span></h3>
+            <p class="role">同一优化：把工作分到一个 group block 的两条 AIV lane。<b>UP_DOWN</b>=数据并行，一块张量对半算，靠 <code style="font-family:var(--mono)">aiv_shard</code>(C→V 取半) / <code style="font-family:var(--mono)">aic_gather</code>(V→C 合整) 做 cube↔vector 桥；<b>NONE</b>=任务并行，两 lane 各做不相交工作。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">UP_DOWN · 数据并行 + shard/gather · decode_fwd.py:754-766</span>
+<pre><code class="py"># QK (cube) 在 split_aiv 区外算整块 scores
+raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+    scores_h = pl.aiv_shard(raw_scores)               # C->V 取半 (16 行 softmax 减半)
+    scores_scaled = pl.mul(scores_h, ATTN_SCALE)
+    scores = pl.fillpad(pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len),
+                        pad_value=pl.PadValue.min)
+    cur_mi = pl.row_max(scores)
+    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+    cur_li = pl.row_sum(exp_scores)
+    mi_row = g_base + sb * Q_HEAD_PAD + aiv_id * (Q_HEAD_PAD // 2)  # 各写各半
+    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [mi_row, 0])
+    exp_full = pl.aic_gather(pl.cast(exp_scores, target_type=pl.BF16))  # V->C 合整
+oi_tmp = pl.matmul(exp_full, v_tile, out_dtype=pl.FP32)   # SV (cube) 用合整块</code></pre></div>
+          <div class="block"><span class="blabel">NONE · 任务并行 · decode_fwd.py:800-809</span>
+<pre><code class="py">for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+    os_aiv = fa_core * 2 + aiv_id                     # 0..47 全局 lane id
+    for os_spmd_idx in pl.range(os_aiv, OS_WORK, NUM_CORES * 2):
+        os_b  = os_spmd_idx // NUM_KV_HEADS
+        os_gi = os_spmd_idx % NUM_KV_HEADS            # 两 lane 各做不相交 (b,kvh)
+        ...                                           # 恢复 48 路归约并行</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="twin">
+            <div class="panel"><h4>UP_DOWN · 数据并行</h4>
+              <div class="schem"><div class="flowrow" style="gap:8px">
+                <div class="node aic" style="padding:7px 9px">QK<br>cube</div><span class="arrow">→</span>
+                <div class="node hot" style="padding:6px 9px">aiv_shard<span class="sub">C→V 取半</span></div><span class="arrow">→</span>
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  <div class="node aiv" style="padding:5px 9px">lane0 softmax</div>
+                  <div class="node aiv" style="padding:5px 9px">lane1 softmax</div>
+                </div><span class="arrow">→</span>
+                <div class="node hot" style="padding:6px 9px">aic_gather<span class="sub">V→C</span></div><span class="arrow">→</span>
+                <div class="node aic" style="padding:7px 9px">SV<br>cube</div>
+              </div></div>
+            </div>
+            <div class="panel"><h4>NONE · 任务并行</h4>
+              <div class="schem"><div class="flowrow">
+                <div style="display:flex;flex-direction:column;gap:6px">
+                  <div class="node aiv" style="padding:6px 10px">work A · lane0</div>
+                  <div class="node aiv" style="padding:6px 10px">work B · lane1</div>
+                </div>
+              </div><div style="font-family:var(--mono);font-size:.68rem;color:var(--faint);margin-top:8px">不相交 (b,kvh) → 48 路并行</div></div>
+            </div>
+          </div>
+          <figcaption>UP_DOWN 对半（cube→shard→vec→gather→cube）；NONE 两 lane 各干各的</figcaption>
+        </figure>
+      </article>
+    </section>
+
+    <!-- ============ 调度优化 ============ -->
+    <section id="sched" class="cat">
+      <div class="cat-head">
+        <span class="num">03</span>
+        <h2>调度优化</h2>
+        <span class="en">scheduling · offload the AICPU</span>
+      </div>
+      <p class="cat-sub">这一层的共同目标是<b>减少 AICPU 要调度的东西</b>：fan-out 铺核、spmd 缩减任务数、manual_scope 省 tensormap 建依赖、syncall 合并 kernel、手动 ring buffer 控内存、allow_early_resolve 提前下发。</p>
+
+      <!-- 11 parallel -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">调度 · 01</span>
+          <div class="titles">
+            <h3>pl.parallel<span class="api">independent task fan-out</span></h3>
+            <p class="role">把互不依赖的 N-tile 展开成 N 个独立任务并行派发。out_proj / gate / up / silu / down 都以 N 维 fan-out 铺满核。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:868-891（out_proj: 10×5 = 50 个 atomic-add 任务）</span>
+<pre><code class="py">for n_out_proj in pl.parallel(N_SPLITS_OUT):          # 10 个 N-tile 独立任务
+    n_op = n_out_proj * OUT_TN
+    for k_split_out in pl.range(K_SPLITS_OUT):        # 每个再切 5 段 K
+        k_op = k_split_out * OUT_TK
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj",
+                   deps=[out_seed_tid, attn_done_tid]) as out_tid:
+            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
+            out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK,
+                        n_op : n_op + OUT_TN]
+            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
+            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
+                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k)
+            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op],
+                                         atomic=pl.AtomicType.Add)
+        out_tids[n_out_proj * K_SPLITS_OUT + k_split_out] = out_tid</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="schem">
+            <div class="node hot">dispatch<span class="sub">pl.parallel(10)</span></div>
+            <div class="flowrow">
+              <div class="node">t0</div><div class="node">t1</div><div class="node">t2</div><div class="node">···</div><div class="node">t9</div>
+            </div>
+          </div>
+          <figcaption>一次派发 → 10 个不相依任务铺开到多核（每个再切 K）</figcaption>
+        </figure>
+      </article>
+
+      <!-- 12 spmd grid-stride -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">调度 · 02</span>
+          <div class="titles">
+            <h3>pl.spmd · grid-stride<span class="api">persistent grid</span></h3>
+            <p class="role">派发固定的 NUM_CORES 个持久块，核内用 grid-stride 遍历工作项。<b>关键收益：整个 spmd 对运行时（AICPU）只是 1 个任务</b>（不是 NUM_CORES 个，更不是逐工作项 N 个）—— 派发/调度成本降到常数；<code style="font-family:var(--mono)">core = w % N</code> 保证核间均衡领取。<span style="color:var(--faint)">对比：<code style="font-family:var(--mono)">pl.parallel(N)</code> 会 fan-out 成 N 个任务。</span></p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:600, 1066, 1100（三种用法）</span>
+<pre><code class="py"># 形1: 固定 NUM_CORES 持久块 + 核内 grid-stride (整个 spmd = AICPU 眼里 1 个任务)
+with pl.spmd(NUM_CORES, name_hint="fa_fused",
+             deps=[rope_dep_tids[i] for i in range(FA_NDEPS)]) as attn_done_tid:
+    fa_core = pl.get_block_idx()                          # 本核块号 0..23
+    for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):   # 跨步领取
+        ...
+
+# 形2: 一块一 slab, 天然并行 (替代 pl.parallel+per-iter pl.at 的 WAW 串行)
+with pl.spmd(DOWN_ON, name_hint="dcr_xgamma",
+             deps=[down_tids[i] for i in range(DOWN_ON * K_SPLITS)]) as dcr_tid:
+    n_out = pl.tile.get_block_idx()                      # 5 核各写一 slab
+    n0 = n_out * DOWN_TN
+    ...
+
+# 形3: 一核一 batch (embed / sample)
+for b in pl.spmd(BATCH, name_hint="token_embed"):
+    token_id = pl.read(sampled_ids, [b, 0])
+    ...</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="canvas-wrap"><canvas data-anim="gridstride"></canvas></div>
+          <figcaption>4 核持久块跨步遍历 12 个工作项：整个 spmd 对 AICPU 是 1 个任务</figcaption>
+        </figure>
+      </article>
+
+      <!-- 13 manual_scope + deps -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">调度 · 03</span>
+          <div class="titles">
+            <h3>manual_scope + deps<span class="api">explicit task edges</span></h3>
+            <p class="role">在 <code style="font-family:var(--mono)">manual_scope</code> 内关闭 tensormap 自动依赖，改用 <code style="font-family:var(--mono)">pl.at(deps=[tid])</code> 手工连边。<b>双重收益</b>：① 只连必要的边，避免整父张量 WAW 串行；② <b>跳过 AICPU 运行时建 tensormap 依赖的开销</b>（自动模式下每个 tensor 读写都要注册 / 匹配，量大时是可观的调度成本）。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:443, 468-490, 600（连边全流程）</span>
+<pre><code class="py">with pl.manual_scope():                          # 关 tensormap 自动依赖注册
+    down_tids     = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
+    rope_dep_tids = pl.array.create(FA_NDEPS, pl.TASK_ID)   # tid 收集数组
+    ...
+    for q_nt in pl.parallel(Q_ON):
+        for q_ks in pl.range(QKV_OK):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj",
+                       deps=[prev_normed_tids[q_ks], q_seed_tid]) as q_tid:  # 手工连边
+                q_acc = pl.matmul(normed_in[:, q_k_base : q_k_base + TK],
+                                  wq[...], out_dtype=pl.FP32)
+                for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+                    q_acc = pl.matmul_acc(q_acc, normed_in[:, kk : kk + TK], wq[...])
+                q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
+            rope_dep_tids[q_nt * QKV_OK + q_ks] = q_tid      # 收集 tid
+
+    # 下游只连需要的边; per-index 列表推导 (整数组 deps=[arr] 不支持)
+    with pl.spmd(NUM_CORES, name_hint="fa_fused",
+                 deps=[rope_dep_tids[i] for i in range(FA_NDEPS)]) as attn_done_tid:
+        ...</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <svg class="dag" viewBox="0 0 640 190" role="img" aria-label="任务依赖图">
+            <g>
+              <path class="edge" d="M120,44 H236"/>
+              <path class="edge" d="M120,146 H236"/>
+              <path class="edge" d="M356,44 C400,44 400,88 444,88"/>
+              <path class="edge" d="M356,146 C400,146 400,96 444,92"/>
+              <path class="edge" d="M356,95 H444"/>
+            </g>
+            <g>
+              <rect class="nodebox" x="16" y="26" width="104" height="36" rx="8"/><text x="34" y="49">rms_recip</text>
+              <rect class="nodebox" x="16" y="128" width="104" height="36" rx="8"/><text x="46" y="151">seed</text>
+              <rect class="nodebox" x="236" y="26" width="120" height="36" rx="8"/><text x="256" y="49">q/k/v_proj</text>
+              <rect class="nodebox" x="236" y="77" width="120" height="36" rx="8"/><text x="248" y="100">work_build</text>
+              <rect class="nodebox" x="236" y="128" width="120" height="36" rx="8"/><text x="262" y="151">rope dep</text>
+              <rect class="nodebox" x="444" y="70" width="160" height="44" rx="8" style="stroke:var(--cat);stroke-width:1.6"/><text x="470" y="97" style="fill:var(--cat)">fa_fused (spmd)</text>
+            </g>
+          </svg>
+          <figcaption>tid 收进 TASK_ID 数组，deps=[…] 只连真正需要的边（省自动 tensormap 匹配）</figcaption>
+        </figure>
+      </article>
+
+      <!-- 14 syncall -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">调度 · 04</span>
+          <div class="titles">
+            <h3>pl.system.syncall<span class="api">in-core barrier · merge kernels</span></h3>
+            <p class="role"><b>核心价值是"合并 kernel"</b>：原本要靠多个独立 kernel + AICPU 在其间同步的阶段，改成<b>一个 kernel 内用核内同步指令 (syncall) 分相</b> —— 省掉 AICPU 的跨 kernel 调度与等待。<code style="font-family:var(--mono)">core_type="mix"</code> 同步 AIC(oi) 与 AIV(mi/li)。<b>满占用契约</b>：NUM_CORES(24)=24 AIC+48 AIV=910B 全核，否则未到齐的核永不返回（507018）。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · decode_fwd.py:717, 781-792</span>
+<pre><code class="py"># 三个逻辑阶段(rope / attn / online-softmax)本可各是一个 kernel;
+# 合并进 fa_fused 后, 用两道核内 syncall 分相, 不再经 AICPU 跨 kernel 同步:
+pl.system.syncall(core_type="mix")     # phase-0 -> phase-1 (发布 cache/q)
+
+# ── FULL-OCCUPANCY 契约 ──
+# NUM_CORES(24) group blocks == 24 AIC + 48 AIV == 910B 全核 => full-occupancy;
+# 部分派发 (或 NUM_CORES 偏离物理 AIC 数) 会留核未达, 等待永不返回 => 507018 超时。
+
+pl.system.syncall(core_type="mix")     # phase-1 -> phase-2 (fence attn/softmax)</code></pre></div>
+        </div>
+        <div class="win"><b>为什么省 AICPU：</b>N 个 kernel → 1 个 kernel，AICPU 的派发次数与跨 kernel 依赖同步都随之减少；核内 syncall 是硬件 barrier，不占 AICPU。</div>
+        <figure class="diagram">
+          <div class="canvas-wrap"><canvas data-anim="syncall"></canvas></div>
+          <figcaption>合并后：快核先到 barrier 等待，全核到齐一起放行（部分占用会 hang 507018）</figcaption>
+        </figure>
+      </article>
+
+      <!-- 15 ring buffer -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">调度 · 05</span>
+          <div class="titles">
+            <h3>关 auto_scope · 手动管 ring buffer<span class="api">auto_scope=False + pl.scope()</span></h3>
+            <p class="role">PTO2 每个 scope 嵌套深度对应一套 ring allocator（heap / task_window / tensormap）。<code style="font-family:var(--mono)">auto_scope=False</code> 交出自动作用域管理，再用 <code style="font-family:var(--mono)">with pl.scope()</code> <b>显式给每层套一个 scope</b>：每层用完即释放该 ring，长序列/多层不会把 task_window 堆爆。<span style="color:var(--faint)">decode 把层 inline 进单 scope；prefill 用它逐层隔离。</span></p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · prefill_fwd.py:977-1019（逐层 scope 隔离）</span>
+<pre><code class="py">@pl.jit(auto_scope=False)                    # 关闭自动作用域, 手动管 ring
+def prefill_fwd(hidden_states, ..., out):
+    ...
+    for layer_idx in pl.range(num_layers_actual):
+        with pl.scope():                     # 每层一个 scope -> 独立 ring
+            layer_next_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
+            hidden_states = prefill_layer(hidden_states, ..., layer_idx)
+            # 本层的 task_window / tensormap 出 scope 即回收, 不累积到下一层</code></pre></div>
+          <div class="block"><span class="blabel">嵌套 · 内层子任务也关 auto_scope · prefill_fwd.py:128, 451</span>
+<pre><code class="py">@pl.jit.inline(auto_scope=False)
+def _attention_phase_window(...):            # attention 相位窗口
+    ...                                      # 手工控制内层 scope 深度, 避免多余 ring 层级</code></pre></div>
+        </div>
+        <div class="win"><b>调参：</b>ring COUNT 编译期常量 <code style="font-family:var(--mono);font-size:.85em">PTO2_MAX_RING_DEPTH=4</code>；每 ring SIZE 运行时可调 <code style="font-family:var(--mono);font-size:.85em">PTO2_RING_HEAP / PTO2_RING_TASK_WINDOW / PTO2_RING_DEP_POOL</code>。over-nesting 会把内存挤到 ring-3。</div>
+      </article>
+
+      <!-- 16 allow_early_resolve -->
+      <article class="card">
+        <div class="card-top">
+          <span class="chip">调度 · 06</span>
+          <div class="titles">
+            <h3>allow_early_resolve<span class="api">critical-path pre-dispatch</span></h3>
+            <p class="role">任务定义上的布尔开关（<code style="font-family:var(--mono)">pl.spmd / pl.at</code>）。打开后该任务把 <code style="font-family:var(--mono)">dispatch_fanin</code> 提前传播给下游消费者，<b>让下游在生产者真正完成前就开始 pre-staging / 下发</b> —— 压缩关键路径延迟。沿 q_proj → fa_fused → out_proj → 下一层 这条链逐级打开。</p>
+          </div>
+        </div>
+        <div class="blocks">
+          <div class="block"><span class="blabel">示例 · PR #691（沿关键路径逐级打开）</span>
+<pre><code class="py"># 关键路径链上的任务打开 allow_early_resolve, 提前把下发窗口推给消费者
+with pl.spmd(Q_ON * QKV_OK, name_hint="q_proj",
+             allow_early_resolve=True):          # q_proj -> fa_fused 提前 stage
+    ...
+with pl.spmd(NUM_CORES, name_hint="fa_fused",
+             allow_early_resolve=True):          # fa_fused -> out_proj
+    ...
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj",
+           allow_early_resolve=True):            # down -> 下一层 rms/QKV
+    ...
+# 每个被标记的任务把 dispatch_fanin 传给下游, 使其 "在生产者真正完成前预下发"</code></pre></div>
+          <div class="block"><span class="blabel">命名说明</span>
+<pre><code class="py"># 实际 API 名是 allow_early_resolve (本次口头称 auto_early_resolve);
+# 语义: critical-path 上提前 resolve/下发, 减少下游等待 -> 缩短关键路径。</code></pre></div>
+        </div>
+        <figure class="diagram">
+          <div class="schem"><div class="flowrow">
+            <div class="node hot">q_proj<span class="sub">early_resolve</span></div><span class="arrow">⇢</span>
+            <div class="node hot">fa_fused<span class="sub">early_resolve</span></div><span class="arrow">⇢</span>
+            <div class="node hot">out_proj<span class="sub">early_resolve</span></div><span class="arrow">⇢</span>
+            <div class="node">下一层<span class="sub">提前下发</span></div>
+          </div></div>
+          <figcaption>关键路径逐级提前传播 dispatch_fanin —— 下游不必等生产者完全完成</figcaption>
+        </figure>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span>Qwen3-14B decode · pypto 性能优化语法图鉴</span>
+      <span>algo · intra · sched — 15 条 + 总览</span>
+    </div>
+  </footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var MONO = 'ui-monospace, Menlo, Consolas, monospace';
+  var INKON = '#0b0f16';
+  var reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function hl(src){
+    return src.split('\n').map(function(line){
+      var code=line, com='';
+      var ci=line.indexOf('#');
+      if(ci>=0){com=line.slice(ci); code=line.slice(0,ci);}
+      code=esc(code)
+        .replace(/\b(pl)\.([A-Za-z_][\w.]*)/g,'<span class="tok-ns">pl</span>.<span class="tok-fn">$2</span>')
+        .replace(/(?<![\w.])(for|in|with|as|return|if|def|True|False)(?![\w])/g,'<span class="tok-k">$1</span>')
+        .replace(/(?<![\w.>"])(\d+\.?\d*)/g,'<span class="tok-num">$1</span>');
+      return code + (com? '<span class="tok-com">'+esc(com)+'</span>' : '');
+    }).join('\n');
+  }
+  document.querySelectorAll('code.py').forEach(function(c){ c.innerHTML = hl(c.textContent); });
+
+  var PAL={};
+  function readPal(){
+    var s=getComputedStyle(document.documentElement), g=function(n){return s.getPropertyValue(n).trim();};
+    PAL={ink:g('--ink'),muted:g('--muted'),faint:g('--faint'),line:g('--line'),
+      surf:g('--surface'),surf2:g('--surface-2'),bg:g('--bg'),
+      aic:g('--aic'),aiv:g('--aiv'),algo:g('--algo'),intra:g('--intra'),sched:g('--sched'),accent:g('--accent')};
+  }
+  readPal();
+
+  function rr(ctx,x,y,w,h,r){ r=Math.min(r,w/2,h/2); ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+  function lerp(a,b,t){return a+(b-a)*t;}
+  function easeIO(t){return t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;}
+
+  var ANIM={};
+
+  // hardware-pipe pipeline: MTE2 -> Cube/Vec -> MTE3
+  ANIM.pipeline=function(ctx,w,h,u){
+    ctx.clearRect(0,0,w,h);
+    var padL=66,padR=18,padT=22,padB=24, x0=padL,x1=w-padR, N=4, total=N+2, uw=(x1-x0)/total;
+    var laneH=Math.min(30,(h-padT-padB-20)/3), gap=10;
+    var yL=padT, yC=padT+laneH+gap, yS=padT+2*(laneH+gap);
+    var labels=[['MTE2',yL,PAL.sched],['Cube/Vec',yC,PAL.intra],['MTE3',yS,PAL.algo]];
+    ctx.textBaseline='middle'; ctx.textAlign='right'; ctx.font='11px '+MONO; ctx.fillStyle=PAL.muted;
+    labels.forEach(function(l){ ctx.fillText(l[0],x0-9,l[1]+laneH/2); });
+    var ph=u*total;
+    function blk(s,e,y,col,lbl){
+      var bx=x0+s*uw, bw=(e-s)*uw, act=ph>=s&&ph<e, done=ph>=e;
+      ctx.globalAlpha= act?1: done?0.9:0.2;
+      ctx.fillStyle=col; rr(ctx,bx+2,y,bw-4,laneH,6); ctx.fill();
+      if(act){ctx.globalAlpha=1;ctx.lineWidth=2;ctx.strokeStyle=col;rr(ctx,bx+2,y,bw-4,laneH,6);ctx.stroke();}
+      ctx.globalAlpha=1; ctx.fillStyle=INKON; ctx.textAlign='center'; ctx.font='10px '+MONO;
+      ctx.fillText(lbl,bx+bw/2,y+laneH/2); ctx.textAlign='right';
+    }
+    for(var i=0;i<N;i++){
+      blk(i,i+1,yL,PAL.sched,'ld'+i);
+      blk(i+1,i+2,yC,PAL.intra,'cmp'+i);
+      blk(i+2,i+3,yS,PAL.algo,'st'+i);
+    }
+    // overlap shading columns where 3 stages coincide
+    ctx.globalAlpha=0.09; ctx.fillStyle=PAL.accent;
+    for(var k=2;k<N+1;k++){ ctx.fillRect(x0+k*uw,yL-4,uw,yS+laneH-yL+8); }
+    ctx.globalAlpha=1;
+    var phx=x0+ph*uw;
+    ctx.strokeStyle=PAL.accent; ctx.lineWidth=1.5; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(phx,yL-8); ctx.lineTo(phx,yS+laneH+6); ctx.stroke(); ctx.setLineDash([]);
+    ctx.textAlign='center'; ctx.fillStyle=PAL.faint; ctx.font='10px '+MONO;
+    ctx.fillText('time →', w-padR-18, yS+laneH+16);
+  };
+
+  ANIM.splitk=function(ctx,w,h,u){
+    ctx.clearRect(0,0,w,h);
+    var K=5, padT=24,padB=22, leftX=40, bw=110, bh=(h-padT-padB-(K-1)*8)/K;
+    var outX=w-150, outW=110, outY=padT+8, outH=h-padT-padB-16, cy=h/2;
+    var seg=u*K, idx=Math.min(Math.floor(seg),K-1), frac=seg-Math.floor(seg);
+    var fill=Math.min(seg,K)/K;
+    ctx.font='11px '+MONO; ctx.textBaseline='middle'; ctx.textAlign='center';
+    for(var i=0;i<K;i++){
+      var y=padT+i*(bh+8);
+      ctx.globalAlpha= i<idx?0.85: i===idx?1:0.3;
+      ctx.fillStyle=PAL.surf2; rr(ctx,leftX,y,bw,bh,8); ctx.fill();
+      ctx.lineWidth= i===idx?2:1; ctx.strokeStyle= i===idx?PAL.intra:PAL.line; rr(ctx,leftX,y,bw,bh,8); ctx.stroke();
+      ctx.globalAlpha=1; ctx.fillStyle= i<=idx?PAL.intra:PAL.muted; ctx.fillText('K'+i+' · matmul',leftX+bw/2,y+bh/2);
+    }
+    ctx.fillStyle=PAL.surf2; rr(ctx,outX,outY,outW,outH,10); ctx.fill();
+    ctx.save(); rr(ctx,outX,outY,outW,outH,10); ctx.clip();
+    ctx.globalAlpha=0.9; ctx.fillStyle=PAL.intra;
+    ctx.fillRect(outX, outY+outH*(1-fill), outW, outH*fill); ctx.restore();
+    ctx.globalAlpha=1; ctx.lineWidth=1.5; ctx.strokeStyle=PAL.intra; rr(ctx,outX,outY,outW,outH,10); ctx.stroke();
+    ctx.fillStyle=PAL.ink; ctx.fillText('output', outX+outW/2, outY+outH+12);
+    ctx.fillStyle=INKON; ctx.font='12px '+MONO; ctx.fillText(Math.round(fill*100)+'%', outX+outW/2, outY+outH/2);
+    var sy=padT+idx*(bh+8)+bh/2, px=lerp(leftX+bw, outX, easeIO(frac)), py=lerp(sy, cy, easeIO(frac));
+    ctx.strokeStyle=PAL.intra; ctx.lineWidth=1.5; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(leftX+bw,sy); ctx.lineTo(px,py); ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.fillStyle=PAL.intra; ctx.arc(px,py,4,0,7); ctx.fill();
+    var pulse= frac>0.75?1:0.4;
+    ctx.globalAlpha=pulse; ctx.fillStyle=PAL.accent; rr(ctx, outX-6, cy-40, outW+12, 22, 11); ctx.fill();
+    ctx.globalAlpha=1; ctx.fillStyle=INKON; ctx.font='10px '+MONO; ctx.fillText('atomic Add', outX+outW/2, cy-29);
+  };
+
+  ANIM.gridstride=function(ctx,w,h,u){
+    ctx.clearRect(0,0,w,h);
+    var M=12,C=4, cols=[PAL.aic,PAL.aiv,PAL.algo,PAL.sched];
+    var padL=24,padR=24, y=52, cw=(w-padL-padR)/M, chh=40;
+    // enclosing frame: the whole spmd = ONE task to the runtime
+    ctx.strokeStyle=PAL.accent; ctx.lineWidth=1.4; ctx.setLineDash([5,4]);
+    rr(ctx, padL-8, y-10, w-2*padL+16, chh+56, 10); ctx.stroke(); ctx.setLineDash([]);
+    ctx.font='10px '+MONO; ctx.textBaseline='alphabetic'; ctx.textAlign='left';
+    ctx.fillStyle=PAL.accent; ctx.fillText('spmd → 1 task (AICPU)', padL-6, y-16);
+    ctx.font='11px '+MONO; ctx.textBaseline='middle'; ctx.textAlign='center';
+    ctx.fillStyle=PAL.faint; ctx.fillText('work items  w = 0 … 11', w/2, y-18);
+    for(var i=0;i<M;i++){
+      var x=padL+i*cw, col=cols[i%C];
+      ctx.globalAlpha=0.16; ctx.fillStyle=col; rr(ctx,x+2,y,cw-4,chh,7); ctx.fill();
+      ctx.globalAlpha=0.5; ctx.lineWidth=1; ctx.strokeStyle=col; rr(ctx,x+2,y,cw-4,chh,7); ctx.stroke();
+      ctx.globalAlpha=1; ctx.fillStyle=PAL.muted; ctx.fillText(i, x+cw/2, y+chh/2);
+    }
+    var t=u*3, stop=Math.min(Math.floor(t),2), frac=t-Math.floor(t);
+    for(var c=0;c<C;c++){
+      var wi=c+stop*4; if(wi>=M) continue;
+      var x=padL+wi*cw;
+      ctx.fillStyle=cols[c]; ctx.globalAlpha=0.9; rr(ctx,x+2,y,cw-4,chh,7); ctx.fill();
+      ctx.globalAlpha=1; ctx.fillStyle=INKON; ctx.fillText(wi,x+cw/2,y+chh/2);
+      var prevWi = c+Math.max(stop-1,0)*4;
+      var cx = lerp(padL+prevWi*cw+cw/2, x+cw/2, easeIO(frac));
+      ctx.fillStyle=cols[c];
+      ctx.beginPath(); ctx.moveTo(cx,y+chh+10); ctx.lineTo(cx-5,y+chh+20); ctx.lineTo(cx+5,y+chh+20); ctx.fill();
+      ctx.font='10px '+MONO; ctx.fillText('core'+c, cx, y+chh+30);
+      ctx.font='11px '+MONO;
+    }
+  };
+
+  ANIM.loadbalance=function(ctx,w,h,u){
+    ctx.clearRect(0,0,w,h);
+    var cols=[PAL.aic,PAL.aiv,PAL.algo,PAL.sched];
+    var counts=[5,2,7,3], B=4, C=4;
+    var blocks=[]; for(var b=0;b<B;b++) for(var j=0;j<counts[b];j++) blocks.push({b:b,j:j});
+    var N=blocks.length;
+    var bw=Math.min(20,(w-60)/9), bh=15, gapx=4, gapy=6;
+    var ragged=[], dense=[], core=[];
+    var raggedX=30, raggedY=24;
+    for(var b2=0;b2<B;b2++){ for(var j2=0;j2<counts[b2];j2++){
+      ragged.push({x:raggedX+j2*(bw+gapx), y:raggedY+b2*(bh+gapy), b:b2}); } }
+    var denseY=h/2-bh/2, denseX=30;
+    for(var i=0;i<N;i++){ dense.push({x:denseX+i*(bw+gapx), y:denseY, b:blocks[i].b}); }
+    var perc=[[],[],[],[]]; for(var i2=0;i2<N;i2++) perc[i2%C].push(i2);
+    var coreX0=40, colW=(w-70)/C, coreY=h-30;
+    for(var cc=0;cc<C;cc++){ for(var r=0;r<perc[cc].length;r++){ var gi=perc[cc][r];
+      core[gi]={x:coreX0+cc*colW+colW/2-bw/2, y:coreY-r*(bh+2), b:blocks[gi].b}; } }
+    var p=u*2, half=p<1?0:1, tt=easeIO(p<1?p:p-1);
+    var from = half===0?ragged:dense, to = half===0?dense:core;
+    ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.font='10px '+MONO;
+    ctx.fillStyle=PAL.faint;
+    ctx.fillText(half===0? 'ragged  →  无缝 work table' : 'work table  →  按核轮询均分', w/2, 12);
+    for(var i3=0;i3<N;i3++){
+      var x=lerp(from[i3].x,to[i3].x,tt), y=lerp(from[i3].y,to[i3].y,tt);
+      ctx.fillStyle=cols[blocks[i3].b]; ctx.globalAlpha=0.85;
+      rr(ctx,x,y,bw,bh,4); ctx.fill();
+    }
+    ctx.globalAlpha=1;
+    if(half===1){ ctx.fillStyle=PAL.faint; ctx.font='10px '+MONO;
+      for(var cc2=0;cc2<C;cc2++) ctx.fillText('core'+cc2, coreX0+cc2*colW+colW/2, coreY+16); }
+  };
+
+  ANIM.syncall=function(ctx,w,h,u){
+    ctx.clearRect(0,0,w,h);
+    var C=4, arrive=[0.30,0.45,0.58,0.40], release=0.62;
+    var padL=52,padR=30, x0=padL, barrierX=x0+(w-padL-padR)*0.52, x1=w-padR;
+    var laneH=Math.min(26,(h-40)/C - 8), gap=(h-40-C*laneH)/(C+1), topY=30;
+    var cols=[PAL.aic,PAL.aiv,PAL.algo,PAL.sched];
+    var flash = (u>release-0.03 && u<release+0.10);
+    ctx.strokeStyle= flash?PAL.accent:PAL.line; ctx.lineWidth= flash?2.5:1.5; ctx.setLineDash([5,4]);
+    ctx.beginPath(); ctx.moveTo(barrierX,18); ctx.lineTo(barrierX,h-14); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle= flash?PAL.accent:PAL.muted; ctx.font='10px '+MONO; ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+    ctx.fillText('syncall', barrierX, 14);
+    ctx.textAlign='right'; ctx.textBaseline='middle';
+    for(var c=0;c<C;c++){
+      var y=topY+gap+c*(laneH+gap);
+      ctx.fillStyle=PAL.muted; ctx.font='11px '+MONO; ctx.fillText('core'+c, x0-10, y+laneH/2);
+      ctx.fillStyle=PAL.surf2; rr(ctx,x0,y,x1-x0,laneH,laneH/2); ctx.fill();
+      var xEnd;
+      if(u<release){ var pr=Math.min(u/arrive[c],1); xEnd=lerp(x0,barrierX,pr); }
+      else { var pr2=(u-release)/(1-release); xEnd=lerp(barrierX,x1,easeIO(pr2)); }
+      ctx.fillStyle=cols[c]; ctx.globalAlpha=0.9; rr(ctx,x0,y,xEnd-x0,laneH,laneH/2); ctx.fill(); ctx.globalAlpha=1;
+      if(u<release && u/arrive[c]>=1){ ctx.fillStyle=PAL.accent; ctx.beginPath(); ctx.arc(barrierX+8,y+laneH/2,3,0,7); ctx.fill(); }
+    }
+    ctx.textAlign='center'; ctx.fillStyle=PAL.faint; ctx.font='10px '+MONO;
+    ctx.fillText(u<release?'phase-1 · 各核推进 (等最慢)':'phase-2 · 全核同步放行', w/2, h-4);
+  };
+
+  ANIM.mixkernel=function(ctx,w,h,u){
+    ctx.clearRect(0,0,w,h);
+    var padL=52,padR=18,padT=28,padB=26, x0=padL,x1=w-padR;
+    var laneH=Math.min(38,(h-padT-padB-14)/2), gap=14, yA=padT, yV=padT+laneH+gap;
+    ctx.font='12px '+MONO; ctx.textBaseline='middle'; ctx.textAlign='right'; ctx.fillStyle=PAL.muted;
+    ctx.fillText('AIC',x0-10,yA+laneH/2); ctx.fillText('AIV',x0-10,yV+laneH/2);
+    var span=x1-x0, b1=x0+span*0.27, b2=x0+span*0.80;
+    ctx.globalAlpha=0.06;
+    ctx.fillStyle=PAL.aiv; ctx.fillRect(x0,yA-8,b1-x0,yV+laneH-yA+16);
+    ctx.fillStyle=PAL.accent; ctx.fillRect(b1,yA-8,b2-b1,yV+laneH-yA+16);
+    ctx.fillStyle=PAL.aiv; ctx.fillRect(b2,yA-8,x1-b2,yV+laneH-yA+16);
+    ctx.globalAlpha=1;
+    var ph=x0+u*span;
+    function blk(xs,xe,y,col,lbl){ var act=ph>=xs&&ph<xe, done=ph>=xe;
+      ctx.globalAlpha=act?1:done?0.9:0.25; ctx.fillStyle=col; rr(ctx,xs+3,y,xe-xs-6,laneH,7); ctx.fill();
+      ctx.globalAlpha=1; ctx.fillStyle=INKON; ctx.textAlign='center'; ctx.font='10px '+MONO; ctx.fillText(lbl,(xs+xe)/2,y+laneH/2); }
+    // phase-0: AIV rope
+    blk(x0,b1,yV,PAL.aiv,'RoPE');
+    // phase-1: AIC (QK,SV alternating) AND AIV (softmax) CONCURRENT -> mix
+    var p1=b1+6, p1e=b2-6, seg=(p1e-p1)/2;
+    blk(p1,p1+seg,yA,PAL.aic,'QK'); blk(p1+seg,p1e,yA,PAL.aic,'SV');
+    blk(p1+seg*0.5,p1+seg*1.5,yV,PAL.aiv,'softmax');   // overlaps AIC in time
+    // tpush/tpop label between lanes in phase-1
+    ctx.fillStyle=PAL.accent; ctx.font='9px '+MONO; ctx.textAlign='center';
+    ctx.fillText('tpush/tpop', (p1+p1e)/2, (yA+laneH+yV)/2);
+    // phase-2: AIV online-softmax
+    blk(b2,x1,yV,PAL.aiv,'online-sm');
+    // barriers
+    ctx.strokeStyle=PAL.accent; ctx.lineWidth=1.5; ctx.setLineDash([4,3]);
+    [b1,b2].forEach(function(bx){ ctx.beginPath(); ctx.moveTo(bx,yA-12); ctx.lineTo(bx,yV+laneH+10); ctx.stroke(); });
+    ctx.setLineDash([]); ctx.fillStyle=PAL.accent; ctx.font='9px '+MONO; ctx.textAlign='center';
+    ctx.fillText('syncall',b1,yV+laneH+20); ctx.fillText('syncall',b2,yV+laneH+20);
+    ctx.strokeStyle=PAL.ink; ctx.globalAlpha=0.5; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(ph,yA-8); ctx.lineTo(ph,yV+laneH+6); ctx.stroke(); ctx.globalAlpha=1;
+  };
+
+  var PERIOD={pipeline:4800,splitk:5000,gridstride:4200,loadbalance:6000,syncall:4600,mixkernel:5400};
+
+  function setup(canvas){
+    var name=canvas.getAttribute('data-anim'), fn=ANIM[name], per=PERIOD[name]||4000;
+    var ctx=canvas.getContext('2d'), running=false, start=0, raf=0, cssW=0,cssH=0;
+    function resize(){ var r=canvas.getBoundingClientRect(), dpr=Math.min(window.devicePixelRatio||1,2);
+      cssW=r.width; cssH=r.height; canvas.width=Math.round(cssW*dpr); canvas.height=Math.round(cssH*dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0); if(!running) fn(ctx,cssW,cssH, reduce?0.62:0); }
+    function frame(ts){ if(!start) start=ts; var u=((ts-start)%per)/per; fn(ctx,cssW,cssH,u);
+      if(running) raf=requestAnimationFrame(frame); }
+    function play(){ if(running||reduce) return; running=true; start=0; raf=requestAnimationFrame(frame); }
+    function stop(){ running=false; if(raf) cancelAnimationFrame(raf); }
+    return {resize:resize,play:play,stop:stop,canvas:canvas,
+      redraw:function(){ if(!running) fn(ctx,cssW,cssH, reduce?0.62:0); }};
+  }
+
+  var insts=[].map.call(document.querySelectorAll('canvas[data-anim]'), setup);
+  function resizeAll(){ insts.forEach(function(i){i.resize();}); }
+  window.addEventListener('resize', resizeAll);
+  resizeAll();
+
+  if('IntersectionObserver' in window){
+    var io=new IntersectionObserver(function(ents){ ents.forEach(function(e){
+      var inst=insts.filter(function(i){return i.canvas===e.target;})[0]; if(!inst) return;
+      if(e.isIntersecting){ inst.resize(); inst.play(); } else inst.stop();
+    }); },{threshold:0.25});
+    insts.forEach(function(i){ io.observe(i.canvas); });
+  } else insts.forEach(function(i){i.play();});
+
+  document.addEventListener('visibilitychange',function(){
+    if(document.hidden) insts.forEach(function(i){i.stop();});
+  });
+
+  function onTheme(){ readPal(); insts.forEach(function(i){ i.redraw(); }); }
+  new MutationObserver(onTheme).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change',onTheme);
+})();
+</script>
+</body>
+</html>
