@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3-14B Decode · 性能优化语法图鉴</title>
 </head>
 <body>
-<title>Qwen3-14B Decode · 性能优化语法图鉴</title>
 <style>
   :root{
     --bg:#e9edf1; --surface:#ffffff; --surface-2:#f2f5f9; --code-bg:#eef2f7;
@@ -892,7 +892,7 @@ def _attention_phase_window(...):            # attention 相位窗口
           </div>
         </div>
         <div class="blocks">
-          <div class="block"><span class="blabel">示例 · PR #691（沿关键路径逐级打开）</span>
+          <div class="block"><span class="blabel">示例 · <a href="https://github.com/hw-native-sys/pypto-lib/pull/691">pypto-lib PR #691</a>（沿关键路径逐级打开）</span>
 <pre><code class="py"># 关键路径链上的任务打开 allow_early_resolve, 提前把下发窗口推给消费者
 with pl.spmd(Q_ON * QKV_OK, name_hint="q_proj",
              allow_early_resolve=True):          # q_proj -> fa_fused 提前 stage
