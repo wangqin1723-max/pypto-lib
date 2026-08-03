@@ -468,6 +468,55 @@ def lm_head_with_sampling_test(
 
 
 @pl.jit.host
+def l3_lm_head_projection(
+    hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+):
+    hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
+    logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
+    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(
+            hidden_window_buf,
+            [GROUP_LOGIT_ROWS, D],
+            dtype=pl.BF16,
+        )
+        hidden_done = pld.window(
+            hidden_done_buf,
+            [TP_SIZE, 1],
+            dtype=pl.INT32,
+        )
+        logits_window = pld.window(
+            logits_window_buf,
+            [MAX_LOGIT_ROWS, VOCAB],
+            dtype=pl.FP32,
+        )
+        logits_done = pld.window(
+            logits_done_buf,
+            [TP_SIZE, 1],
+            dtype=pl.INT32,
+        )
+        lm_head_test(
+            hidden_states[r],
+            lm_head_weight[r],
+            logit_row_indices[r],
+            logits[r],
+            hidden_window,
+            hidden_done,
+            logits_window,
+            logits_done,
+            r // TP_SIZE * TP_SIZE,
+            r % TP_SIZE,
+            DONE_VALUE,
+            device=r,
+        )
+
+
+@pl.jit.host
 def l3_lm_head(
     hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
@@ -523,7 +572,7 @@ def golden_lm_head(tensors):
         ).to(torch.int32)
 
 
-def build_tensor_specs(num_tokens=TEST_TOKENS):
+def build_tensor_specs(num_tokens=TEST_TOKENS, *, with_sampling=True):
     import torch
     from golden import TensorSpec
 
@@ -541,7 +590,7 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         return indices
 
-    return [
+    specs = [
         TensorSpec(
             "hidden_states",
             [DP_SIZE, TEST_TOKENS, D],
@@ -564,19 +613,25 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             torch.float32,
             is_output=True,
         ),
-        TensorSpec(
-            "sampled_ids",
-            [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
-            torch.int32,
-            is_output=True,
-        ),
+    ]
+    if with_sampling:
+        specs.append(
+            TensorSpec(
+                "sampled_ids",
+                [DP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+                torch.int32,
+                is_output=True,
+            )
+        )
+    specs.append(
         TensorSpec(
             "logit_row_indices",
             [DP_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
             init_value=init_logit_row_indices,
-        ),
-    ]
+        )
+    )
+    return specs
 
 
 def compare_logits(actual, expected, **_):
@@ -630,6 +685,11 @@ if __name__ == "__main__":
                         help="Attention-DP world size (hidden-row owners)")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
                         help="Active hidden rows each owner projects")
+    parser.add_argument(
+        "--projection-only",
+        action="store_true",
+        help="Benchmark LM-head projection without greedy sampling",
+    )
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(DP_SIZE)),
                         help=f"comma-separated device ids; need at least {DP_SIZE}")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0,
@@ -647,13 +707,20 @@ if __name__ == "__main__":
     assert args.tp == TP_SIZE and args.dp == DP_SIZE
     assert 1 <= args.num_tokens <= TEST_TOKENS
 
-    fn = l3_lm_head
-    specs = build_tensor_specs(args.num_tokens)
     golden_fn = golden_lm_head
-    compare_fn = {
-        "logits": compare_logits,
-        "sampled_ids": compare_sampled_ids,
-    }
+    if args.projection_only:
+        fn = l3_lm_head_projection
+        specs = build_tensor_specs(args.num_tokens, with_sampling=False)
+        compare_fn = {
+            "logits": compare_logits,
+        }
+    else:
+        fn = l3_lm_head
+        specs = build_tensor_specs(args.num_tokens)
+        compare_fn = {
+            "logits": compare_logits,
+            "sampled_ids": compare_sampled_ids,
+        }
 
     result = run_jit(
         fn=fn,
