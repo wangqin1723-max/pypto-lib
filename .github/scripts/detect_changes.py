@@ -44,6 +44,12 @@ from collections import defaultdict
 # Directories whose .py files participate in the bare-name sibling-import graph.
 SOURCE_ROOTS = ("examples", "models")
 
+# Model trees exercised only through dedicated, explicit allowlists.
+MODEL_RUNNER_EXCLUDED_PREFIXES = (
+    "models/deepseek/v4-pro/",
+    "models/deepseek/v4-pro-w8a8/",
+)
+
 # Paths that can change documentation or repository guidance but cannot change
 # generated kernels or runtime behavior. Keep this list explicit: an unknown
 # path must continue to select the full examples suite.
@@ -155,18 +161,16 @@ def select_runnable(changed):
     )
     # Only models/ uses the reverse-import graph: a changed examples/ file is
     # already covered by the full-suite run above, so it needs no closure here.
-    # models/deepseek/v4-pro is the A5-only variant: it is exercised by the
-    # dedicated model-tests-a5 daily job, not by PR a2a3/sim (PR CI has no A5
-    # runner, and on 910B it would just duplicate v4-flash). Exclude it from
-    # PR selection so it neither doubles the sim/a2a3 load nor runs on the
-    # wrong backend. Revisit once a PR A5 job exists.
+    # Dedicated model variants are excluded from the broad PR runner matrix.
+    # V4-Pro is covered by its A5 daily job. V4-Pro-W8A8 admits only explicitly
+    # validated cases while its 128K bring-up is incomplete.
     models_changed = [
         c
         for c in changed
         if c.endswith(".py")
         and "draft" not in os.path.basename(c)
         and c.startswith("models/")
-        and not c.startswith("models/deepseek/v4-pro/")
+        and not c.startswith(MODEL_RUNNER_EXCLUDED_PREFIXES)
         and os.path.isfile(c)
     ]
 
