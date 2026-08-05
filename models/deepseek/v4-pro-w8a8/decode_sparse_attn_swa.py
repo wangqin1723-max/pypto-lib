@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
@@ -478,7 +478,6 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    ori_block_num = pl.tensor.dim(ori_kv, 0)
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
         v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
@@ -749,16 +748,19 @@ if __name__ == "__main__":
                         help="Amplify the S=2 future-window-slot regression.")
     parser.add_argument("--short-window-fixture", action="store_true", default=False,
                         help="Use a short-window topk row with valid prefix + -1 padding.")
-    parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Persist inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Directory containing cached in/ and out/ tensors.")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4),
+                        help="L2 swimlane level; the bare flag selects the merged level-4 trace.")
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
                              "converter draws fanout/fanin arrows from the sibling file.")
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-
-    print(f"TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
         fn=sparse_attn_test,
@@ -767,6 +769,8 @@ if __name__ == "__main__":
             args.short_window_fixture,
         ),
         golden_fn=golden_sparse_attn,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
         golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(

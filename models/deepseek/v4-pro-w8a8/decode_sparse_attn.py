@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
@@ -57,10 +57,8 @@ COMPRESS_RATIO_INV = 1.0 / DEFAULT_COMPRESS_RATIO
 CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
 # tiling
 ROPE_OUT_TOK_TILE = 8
@@ -128,7 +126,7 @@ QUANT_TOKEN_TILE = 8
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE   # proj_a cube N-frags per group
 # proj_b is one task per (D-chunk, group): the D-chunk's N-frags loop INSIDE the task,
 # so the per-group split does not multiply the task count by N-frags. A 512-column
-# chunk produces 8 * (4096 / 512) = 64 balanced cube blocks.
+# chunk produces 16 * (7168 / 512) = 224 balanced cube blocks.
 PROJ_B_D_CHUNK = 512
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # proj_b_act uses one block per 512-column output region, eight blocks in total.
@@ -182,11 +180,11 @@ QK_ITEMS = T * SPARSE_BLOCKS
 @pl.jit.inline
 def sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
+    idx_topk: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -200,10 +198,8 @@ def sparse_attn(
     # Gather the sliding-window + compressed-cache rows. Compressed index contract:
     #   -1              invalid
     #   [0, ...)        compressed KV slots
-    ori_block_num = pl.tensor.dim(ori_kv, 0)
-    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
 
     # WAR marker (pypto-lib#481): the fused gather reads ori_kv inside qk_pv, but a
@@ -386,20 +382,7 @@ def sparse_attn(
     # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    # The j^1 lane-swap index for merge_norm's rotation gather is a pure constant
-    # (no token/head dependence), so it is built once here instead of rebuilding
-    # the same arange/cast chain on each of the T*(H//H_TILE) merge blocks. Shaped
-    # [H_TILE, ROPE_DIM] because gather's index must match its source rows.
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
-        sw_col = pl.col_expand_mul(
-            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
-        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(
-            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)              # j^1
-
         cs_col = pl.col_expand_mul(
             pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0),
             pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
@@ -430,17 +413,20 @@ def sparse_attn(
         m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
         m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-        for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
-            m_row = m_blk_base + m_sb * H_TILE
-            m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-            m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-            m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-            m_mi_new = pl.maximum(m_mi, m_cur_mi)
-            m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-            m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-            m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-            m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-            m_mi = m_mi_new
+        # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
+        # single block's stats directly instead of an empty merge loop.
+        if SPARSE_BLOCKS > 1:
+            for m_sb in pl.range(1, SPARSE_BLOCKS):
+                m_row = m_blk_base + m_sb * H_TILE
+                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                m_mi = m_mi_new
 
         n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
@@ -450,23 +436,29 @@ def sparse_attn(
 
         # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
-        # rope_swap_idx (j^1, prebuilt above) pairs the interleaved real/imag lanes.
-        # Rounded to bf16 (golden also rounds inverse-RoPE to bf16) and packed into
-        # o_packed's rope columns.
+        # swap_idx (j^1) pairs the interleaved real/imag lanes. Rounded to bf16 (golden
+        # also rounds inverse-RoPE to bf16) and packed into o_packed's rope columns.
+        m_col = pl.col_expand_mul(
+            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        m_dup_f = pl.cast(pl.cast(pl.mul(m_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        m_lane = pl.sub(m_col, pl.mul(m_dup_f, 2.0))                                              # j%2
+        m_swap_idx = pl.cast(pl.sub(pl.add(m_col, 1.0), pl.mul(m_lane, 2.0)), target_type=pl.INT32)  # j^1
         m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM])
+        m_swapped = pl.gather(m_rope, dim=-1, index=m_swap_idx)
         m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-        n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
 
-        for n_hi in pl.unroll(H_TILE):
-            n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T + m_t
-            n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
-            # one HEAD_DIM-wide store per head row instead of two: concat the nope and
-            # inverse-RoPE halves on chip so o_packed takes a single contiguous write.
-            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
+        for n_hi in pl.range(H_TILE):
+            n_gh = m_h0 + n_hi
+            n_g = n_gh // HEADS_PER_GROUP
+            n_hh = n_gh - n_g * HEADS_PER_GROUP
+            n_pack_row = n_g * T + m_t
+            n_col = n_hh * HEAD_DIM
+            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
+            o_packed[n_pack_row : n_pack_row + 1, n_col + NOPE_DIM : n_col + HEAD_DIM] = n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM]
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
@@ -599,11 +591,11 @@ def sparse_attn(
 @pl.jit
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
+    idx_topk: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -879,9 +871,7 @@ def build_tensor_specs(
         """Raw indexer topk feeding sparse_attn's compressed-slot masking. Only the
         first CMP_TOPK cols are read; identity mask here (see init_position_ids), so
         the masked output equals this fixture pattern."""
-        topk = torch.full((T, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
-        topk[:, :CMP_TOPK] = init_cmp_sparse_indices()
-        return topk
+        return init_cmp_sparse_indices()
 
     def init_position_ids():
         """Large enough that floor((pos + 1) / COMPRESS_RATIO) >= CMP_TOPK, so the
@@ -917,7 +907,7 @@ def build_tensor_specs(
         TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_topk", [T, INDEXER_SCORE_LEN], torch.int32, init_value=init_idx_topk),
+        TensorSpec("idx_topk", [T, IDX_TOPK], torch.int32, init_value=init_idx_topk),
         TensorSpec("position_ids", [T, 1], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
@@ -950,7 +940,10 @@ if __name__ == "__main__":
     parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
                         help="Place a sentinel row inside the cache window prefix.")
     parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
                              "converter draws fanout/fanin arrows from the sibling file.")
@@ -972,7 +965,10 @@ if __name__ == "__main__":
             args.cache_window_replacement_fixture,
         ),
         golden_fn=golden_sparse_attn,
+        runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,

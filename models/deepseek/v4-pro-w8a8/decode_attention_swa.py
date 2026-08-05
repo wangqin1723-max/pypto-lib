@@ -6,19 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 SWA (Sliding Window Attention) decode orchestration — `compress_ratio == 0` path.
-Active in layers 0/1/7 of the model (3 of the 8 layers in demo). No KV compression, so neither
-compressor nor indexer is invoked; topk for sparse_attn is window_topk_idxs only and the KV cache
-holds only the sliding window (no compressed portion). YaRN frequency scaling is also disabled
-in this path (model.py:478-479 selects base rope_theta when compress_ratio==0).
-Companion files: attention_csa_draft.py (ratio=4)
-                 attention_hca_draft.py (ratio=128)."""
+"""DeepSeek-V4 Pro W8A8 ratio-0 SWA decode orchestration for the separate MTP layer."""
 
 
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_ORI_BLOCK_NUM,
     DECODE_SEQ,
@@ -84,7 +78,7 @@ def attention_swa(
     # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[H, HEAD_DIM, Q_LORA], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -177,7 +171,7 @@ def attention_swa_test(
     # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[H, HEAD_DIM, Q_LORA], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -237,11 +231,8 @@ def golden_attention_swa(tensors):
         "post": post_t,
         "comb": comb_t,
     })
-
     # ===== Attention.forward (model.py:484-543), ratio==0 branch =====
     position_ids = tensors["position_ids"].to(torch.int64)
-    bsz, seqlen = B, S
-    win = WIN
     rd = ROPE_HEAD_DIM
 
     freqs_cos = tensors["freqs_cos"]
@@ -274,7 +265,6 @@ def golden_attention_swa(tensors):
         "qr": qr,                                                              # qr unused on SWA path
         "qr_scale": qr_scale,
     })
-
     kv_cache = tensors["kv_cache"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
 
@@ -301,7 +291,6 @@ def golden_attention_swa(tensors):
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
-
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
     golden_hc_post({
@@ -331,9 +320,9 @@ def build_tensor_specs(start_pos=None):
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, 0, dtype=torch.bfloat16)
 
     def quant_w_per_output_channel(w):
-        amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
+        amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
         scale_quant = INT8_SCALE_MAX / amax
-        scaled = w.float() * scale_quant.view(1, H * HEAD_DIM)
+        scaled = w.float() * scale_quant.unsqueeze(-1)
         w_i32 = torch.round(scaled).to(torch.int32)
         w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
         w_i8 = w_i32.to(torch.float16).to(torch.int8)
@@ -371,7 +360,7 @@ def build_tensor_specs(start_pos=None):
     def init_wq_a():
         return torch.randn(D, Q_LORA) / D ** 0.5
     def init_wq_b():
-        return torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA ** 0.5
+        return torch.randn(H, HEAD_DIM, Q_LORA) / Q_LORA ** 0.5
     def init_wkv():
         return torch.randn(D, HEAD_DIM) / D ** 0.5
     def init_gamma_cq():
@@ -391,7 +380,7 @@ def build_tensor_specs(start_pos=None):
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
-        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -432,6 +421,7 @@ def build_tensor_specs(start_pos=None):
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
+    wq_b_scale = wq_b_scale.reshape(H * HEAD_DIM)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
@@ -442,7 +432,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
         TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_b", [H, HEAD_DIM, Q_LORA], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
@@ -473,9 +463,14 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch SWA set that includes the 8k point.")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4),
+                        help="L2 swimlane level; the bare flag selects the merged level-4 trace.")
     parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Persist inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Directory containing cached in/ and out/ tensors.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -483,7 +478,9 @@ if __name__ == "__main__":
         fn=attention_swa_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_swa,
+        compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
+        save_data=args.save_data,
         golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(

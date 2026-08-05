@@ -11,15 +11,22 @@
 import pypto.language as pl
 
 from config import (
+    ACTIVE as M,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    CSA_INNER_STATE_TABLE_MAX_BLOCKS,
+    CSA_STATE_PHYSICAL_BLOCKS,
+    CSA_STATE_TABLE_MAX_BLOCKS,
     DECODE_BATCH,
     DECODE_SEQ,
-    FLASH as M,
+    HCA_STATE_PHYSICAL_BLOCKS,
+    HCA_STATE_TABLE_MAX_BLOCKS,
     IDX_CACHE_MAX_BLOCKS,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_TABLE_MAX_BLOCKS,
+    ORI_KV_BLOCK_NUM,
 )
 
 
@@ -30,9 +37,9 @@ WIN = M.sliding_window
 ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
-HCA_STATE_MAX_BLOCKS = 2048
-CSA_STATE_MAX_BLOCKS = 4096
-CSA_INNER_STATE_MAX_BLOCKS = 4096
+HCA_STATE_MAX_BLOCKS = HCA_STATE_TABLE_MAX_BLOCKS
+CSA_STATE_MAX_BLOCKS = CSA_STATE_TABLE_MAX_BLOCKS
+CSA_INNER_STATE_MAX_BLOCKS = CSA_INNER_STATE_TABLE_MAX_BLOCKS
 
 GROUP_ORI = 0
 GROUP_CMP = 1
@@ -354,17 +361,18 @@ def decode_metadata(
 def _test_inputs():
     import torch
 
+    # Request 0 is the frozen 128K target.  Request 1 ends at the full
+    # 131584-position capacity so the final 128-entry indexer tail is covered.
     positions = torch.tensor(
-        [126, 127, 3, 4, 8191, 8192, 16382, 16383],
+        [131072, 131073, 131074, 131075, 131580, 131581, 131582, 131583],
         dtype=torch.int32,
     )
     counts = torch.tensor(
         [
-            [2, 3, 4, 5, 6, 7],
-            [3, 4, 5, 6, 7, 8],
-            [4, 5, 6, 7, 8, 9],
-            [5, 6, 7, 8, 9, 10],
-        ],
+            [ORI_KV_BLOCK_NUM // B, CMP_MAX_BLOCKS, IDX_MAX_BLOCKS,
+             HCA_STATE_PHYSICAL_BLOCKS // B, CSA_STATE_PHYSICAL_BLOCKS // B,
+             CSA_INNER_STATE_PHYSICAL_BLOCKS // B],
+        ] * B,
         dtype=torch.int32,
     )
 
@@ -372,7 +380,7 @@ def _test_inputs():
         out = torch.zeros((B, width), dtype=torch.int32)
         for request in range(B):
             count = int(counts[request, group])
-            ids = torch.arange(count, dtype=torch.int32) + 1000 * (group + 1) + 100 * request
+            ids = torch.arange(count, dtype=torch.int32) * B + request
             if repeat:
                 out[request] = ids.repeat((width + count - 1) // count)[:width]
             else:
@@ -517,6 +525,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     args = parser.parse_args()
 
     result = run_jit(
@@ -524,7 +535,13 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_decode_metadata,
         compile_only=args.compile_only,
-        runtime_cfg={"platform": args.platform, "device_id": args.device},
+        save_data=args.save_data,
+        golden_data=args.golden_data,
+        runtime_cfg={
+            "platform": args.platform,
+            "device_id": args.device,
+            "enable_l2_swimlane": args.enable_l2_swimlane,
+        },
     )
     if not result.passed:
         if result.error:

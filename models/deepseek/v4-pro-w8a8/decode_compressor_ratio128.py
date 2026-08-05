@@ -15,14 +15,15 @@ import pypto.language as pl
 
 from rope_interleave import rope_interleave
 from config import (
-    FLASH as M,
+    ACTIVE as M,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
-    KV_CMP_MAX_BLOCKS,
+    HCA_STATE_PHYSICAL_BLOCKS,
+    HCA_STATE_TABLE_MAX_BLOCKS,
+    KV_HCA_MAX_BLOCKS,
 )
 
 # Dynamic shape variables.
@@ -60,12 +61,12 @@ STATE_LEN = COFF * COMPRESS_RATIO
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 # Logical state block tables cover MAX_SEQ_LEN while the physical state pool
 # remains bounded to the per-request rolling state capacity.
-COMPRESS_STATE_PHYSICAL_BLOCKS = 64
-COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
+COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
+COMPRESS_STATE_MAX_BLOCKS = HCA_STATE_TABLE_MAX_BLOCKS
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+CMP_MAX_BLOCKS = KV_HCA_MAX_BLOCKS
+CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
 
@@ -148,28 +149,28 @@ def compressor_ratio128(
     compress_state_rows_num = compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE
     compress_state_rows = pl.reshape(compress_state, [compress_state_rows_num, COMPRESS_STATE_DIM])
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    # The target decode point is start_pos=8192, where the ratio-128 boundary branch
-    # is inactive. Keep scatter and all pool gates in one task to minimize dispatches.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool") as pool_tid:
         for global_c_idx in pl.range(b_dim):
-            for s_sc in pl.pipeline(s_dim, stage=2):
-                proj_row = global_c_idx * s_dim + s_sc
-                token_pos = pl.read(position_ids, [global_c_idx, s_sc])
-                token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                state_row_i64 = pl.read(state_slot_mapping, [global_c_idx, s_sc])
-                if state_row_i64 >= 0:
-                    state_row = pl.cast(state_row_i64, target_type=pl.INDEX)
-                    kv_row = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
-                    score_row = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
-                    ape_row = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
-                    compress_state_rows[state_row : state_row + 1, 0 : OUT_DIM] = kv_row
-                    compress_state_rows[
-                        state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM
-                    ] = pl.add(score_row, ape_row)
-
             first_pos_gate = pl.read(position_ids, [global_c_idx, 0])
             pos_gate = first_pos_gate % COMPRESS_RATIO
             if pos_gate + s_dim >= COMPRESS_RATIO:
+                boundary_s = COMPRESS_RATIO - 1 - pos_gate
+                # Pool before post-boundary state writes reuse the oldest live ring page.
+                for s_sc in pl.range(s_dim):
+                    if s_sc <= boundary_s:
+                        prefix_proj_row = global_c_idx * s_dim + s_sc
+                        prefix_token_pos = pl.read(position_ids, [global_c_idx, s_sc])
+                        prefix_ape_idx = pl.cast(prefix_token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                        prefix_state_i64 = pl.read(state_slot_mapping, [global_c_idx, s_sc])
+                        if prefix_state_i64 >= 0:
+                            prefix_state_row = pl.cast(prefix_state_i64, target_type=pl.INDEX)
+                            prefix_kv = kv_proj_pad[prefix_proj_row : prefix_proj_row + 1, 0 : OUT_DIM]
+                            prefix_score = score_proj_pad[prefix_proj_row : prefix_proj_row + 1, 0 : OUT_DIM]
+                            prefix_ape = ape[prefix_ape_idx : prefix_ape_idx + 1, 0 : OUT_DIM]
+                            compress_state_rows[prefix_state_row : prefix_state_row + 1, 0 : OUT_DIM] = prefix_kv
+                            prefix_score_ape = pl.add(prefix_score, prefix_ape)
+                            compress_state_rows[prefix_state_row : prefix_state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = prefix_score_ape
+
                 compress_pos = first_pos_gate + (COMPRESS_RATIO - 1 - pos_gate)
                 state_pos0 = compress_pos - (COMPRESS_RATIO - 1)
                 base_logical_blk = state_pos0 // COMPRESS_STATE_BLOCK_SIZE
@@ -223,6 +224,35 @@ def compressor_ratio128(
                         global_c_idx : global_c_idx + 1, h0 : h0 + POOL_HEAD_TILE
                     ] = pooled_chunk
 
+                for s_sc in pl.range(s_dim):
+                    if s_sc > boundary_s:
+                        tail_proj_row = global_c_idx * s_dim + s_sc
+                        tail_token_pos = pl.read(position_ids, [global_c_idx, s_sc])
+                        tail_ape_idx = pl.cast(tail_token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                        tail_state_i64 = pl.read(state_slot_mapping, [global_c_idx, s_sc])
+                        if tail_state_i64 >= 0:
+                            tail_state_row = pl.cast(tail_state_i64, target_type=pl.INDEX)
+                            tail_kv = kv_proj_pad[tail_proj_row : tail_proj_row + 1, 0 : OUT_DIM]
+                            tail_score = score_proj_pad[tail_proj_row : tail_proj_row + 1, 0 : OUT_DIM]
+                            tail_ape = ape[tail_ape_idx : tail_ape_idx + 1, 0 : OUT_DIM]
+                            compress_state_rows[tail_state_row : tail_state_row + 1, 0 : OUT_DIM] = tail_kv
+                            tail_score_ape = pl.add(tail_score, tail_ape)
+                            compress_state_rows[tail_state_row : tail_state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = tail_score_ape
+            else:
+                for s_sc in pl.pipeline(s_dim, stage=2):
+                    all_proj_row = global_c_idx * s_dim + s_sc
+                    all_token_pos = pl.read(position_ids, [global_c_idx, s_sc])
+                    all_ape_idx = pl.cast(all_token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                    all_state_i64 = pl.read(state_slot_mapping, [global_c_idx, s_sc])
+                    if all_state_i64 >= 0:
+                        all_state_row = pl.cast(all_state_i64, target_type=pl.INDEX)
+                        all_kv = kv_proj_pad[all_proj_row : all_proj_row + 1, 0 : OUT_DIM]
+                        all_score = score_proj_pad[all_proj_row : all_proj_row + 1, 0 : OUT_DIM]
+                        all_ape = ape[all_ape_idx : all_ape_idx + 1, 0 : OUT_DIM]
+                        compress_state_rows[all_state_row : all_state_row + 1, 0 : OUT_DIM] = all_kv
+                        all_score_ape = pl.add(all_score, all_ape)
+                        compress_state_rows[all_state_row : all_state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = all_score_ape
+
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     kv_flat = pl.reshape(kv, [bs, HEAD_DIM])
@@ -232,6 +262,10 @@ def compressor_ratio128(
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]
     ):
+        for kv_zero_t in pl.range(bs):
+            kv_zero_row = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            kv_flat[kv_zero_t : kv_zero_t + 1, 0 : HEAD_DIM] = kv_zero_row
+
         # cos/sin arrive interleave-duplicated and sign-folded, so these land at the full
         # ROPE_HEAD_DIM width and feed the rotation with no in-scope dup-gather.
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
@@ -402,9 +436,12 @@ def golden_compressor(tensors):
             pos = int(position_ids[b, s].item())
             token_ape_row = pos % ratio
             score[b, s, :] = score[b, s, :] + ape[token_ape_row]
-            write_state_row(int(state_slot_mapping[b, s].item()), kv[b, s, :], score[b, s, :])
             if (pos + 1) % ratio == 0:
                 boundary_s = s
+
+        state_prefix = S if boundary_s is None else boundary_s + 1
+        for s in range(state_prefix):
+            write_state_row(int(state_slot_mapping[b, s].item()), kv[b, s, :], score[b, s, :])
 
         if boundary_s is not None:
             should_compress_rows[b] = True
@@ -418,6 +455,9 @@ def golden_compressor(tensors):
             kv_state = torch.stack(kv_rows, dim=0).unsqueeze(0)
             score_state = torch.stack(score_rows, dim=0).unsqueeze(0)
             pooled[b : b + 1] = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+
+        for s in range(state_prefix, S):
+            write_state_row(int(state_slot_mapping[b, s].item()), kv[b, s, :], score[b, s, :])
     tensors["compress_state"][:] = compress_state
 
     if not bool(should_compress_rows.any()):
@@ -510,11 +550,11 @@ def build_tensor_specs(start_pos=None):
         return block_table(
             batch=B,
             table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
             permuted=True,
         )
     def init_default_start_pos():
-        # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
+        # Canonical HCA start-position set with the 128K target and ratio-128 boundaries.
         return hca_decode_start_set(
             batch=B, compress_ratio=COMPRESS_RATIO, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
     def init_start_pos():
@@ -569,8 +609,15 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
-                             "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+                             "use 131072 for the target or 131071 for boundary coverage.")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4),
+                        help="L2 swimlane level; the bare flag selects the merged level-4 trace.")
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Persist inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Directory containing cached in/ and out/ tensors.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -578,6 +625,10 @@ if __name__ == "__main__":
         fn=compressor_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_compressor,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,

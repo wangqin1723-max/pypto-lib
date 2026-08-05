@@ -137,6 +137,9 @@ def test_128k_cache_contract() -> None:
     assert config["HCA_STATE_PHYSICAL_BLOCKS"] == 32
     assert config["CSA_STATE_PHYSICAL_BLOCKS"] == 4
     assert config["CSA_INNER_STATE_PHYSICAL_BLOCKS"] == 4
+    assert config["HCA_STATE_TABLE_MAX_BLOCKS"] == 16448
+    assert config["CSA_STATE_TABLE_MAX_BLOCKS"] == 32896
+    assert config["CSA_INNER_STATE_TABLE_MAX_BLOCKS"] == 32896
 
 
 def test_unvalidated_model_tree_is_excluded_from_broad_ci(

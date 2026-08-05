@@ -12,13 +12,12 @@
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
-    DECODE_CMP_BLOCK_NUM,
     DECODE_ORI_BLOCK_NUM,
-    KV_CMP_MAX_BLOCKS,
+    KV_HCA_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
@@ -49,8 +48,8 @@ DEFAULT_COMPRESS_RATIO = 128
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+CMP_MAX_BLOCKS = KV_HCA_MAX_BLOCKS
+CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
 # tiling
@@ -912,8 +911,14 @@ if __name__ == "__main__":
                         help="Use -1-padded window slots with valid compressed raw indices.")
     parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
                         help="Place a sentinel row inside the cache window prefix.")
-    parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Persist inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Directory containing cached in/ and out/ tensors.")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4),
+                        help="L2 swimlane level; the bare flag selects the merged level-4 trace.")
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
                              "converter draws fanout/fanin arrows from the sibling file.")
@@ -935,6 +940,9 @@ if __name__ == "__main__":
             args.cache_window_replacement_fixture,
         ),
         golden_fn=golden_sparse_attn,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        save_data=args.save_data,
         golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE routed local expert compute (decode, EP single-card).
+"""DeepSeek-V4 Pro W8A8 routed-expert compute proxy for one deployment-EP128 shard.
 
 Only the routed-expert path lives here. The shared expert was split out
 into ``expert_shared.py``; both kernels are composed in ``moe.py``.
@@ -15,8 +15,16 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 
 import pypto.language as pl
 
-from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
-                    EP_WORLD_SIZE, RECV_MAX)
+from config import (
+    ACTIVE as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
+    MOE_BALANCED_ROWS_PER_SHARD,
+    MOE_DEPLOYMENT_RECV_MAX,
+    MOE_LOCAL_EXPERTS,
+)
 
 
 # model config
@@ -28,7 +36,8 @@ MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # EP layout / recv buffers (single-card view: kernel only sees the local shard)
-N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
+N_LOCAL_EXPERTS = MOE_LOCAL_EXPERTS
+RECV_MAX = MOE_DEPLOYMENT_RECV_MAX
 
 # tiling
 RECV_TILE = 16
@@ -39,15 +48,31 @@ MM_GATE_INNER = 4
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
 D_OUT_TILE = 256
-# h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
-# line (perf_hint PH001 flagged the prior 256B store as sub-line).
 QUANT_TILE = 512
 D_OUT_TILE_ACT = 512
 W2_INNER = 4
-W2_ACT_INNER = 8
-TILES_PER_EXPERT = RECV_MAX // RECV_TILE
+W2_ACT_INNER = 14
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+if D % (W2_ACT_INNER * D_OUT_TILE_ACT) != 0:
+    raise ValueError("W2_ACT_INNER must cover the full hidden dimension")
+if D % K_TILE != 0 or D % D_OUT_TILE != 0 or D % D_OUT_TILE_ACT != 0:
+    raise ValueError("routed-expert hidden tiles must cover the full hidden dimension")
+if MOE_INTER % INTER_K != 0 or MOE_INTER % MM_INTER_TILE != 0 or MOE_INTER % QUANT_TILE != 0:
+    raise ValueError("routed-expert intermediate tiles must cover the full intermediate dimension")
+
+ROUTED_WORKLOAD_COUNTS = {
+    "balanced": (16, 16, 16),
+    "skewed": (48, 0, 0),
+    "tail": (17, 16, 15),
+}
+for _workload_name, _workload_counts in ROUTED_WORKLOAD_COUNTS.items():
+    if len(_workload_counts) != N_LOCAL_EXPERTS:
+        raise ValueError(f"{_workload_name} must define one count per local expert")
+    if sum(_workload_counts) != MOE_BALANCED_ROWS_PER_SHARD:
+        raise ValueError(f"{_workload_name} must preserve the 48-row shard load")
+    if min(_workload_counts) < 0 or max(_workload_counts) > RECV_MAX:
+        raise ValueError(f"{_workload_name} exceeds the production receive capacity")
 
 
 @pl.jit.inline
@@ -65,7 +90,6 @@ def expert_routed(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     # gate (w1) / up (w3) INT32 accumulators for every (expert, row-tile), flat
     # row-addressed so they survive the parallel nest that produces them.
@@ -88,7 +112,6 @@ def expert_routed(
 
         for t in pl.parallel(n_tiles):
             t0 = t * RECV_TILE
-            flat_t0 = flat_base + t0
 
             with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
                 nb_idx = pl.tile.get_block_idx()
@@ -97,7 +120,7 @@ def expert_routed(
                     n0 = n_base + ng * MM_INTER_TILE
                     gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_k = recv_x_flat[flat_t0 : flat_t0 + RECV_TILE, k0 : k0 + K_TILE]
+                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
                         w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                         if k0 == 0:
                             gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
@@ -114,7 +137,7 @@ def expert_routed(
                     u0 = u_base + ug * MM_INTER_TILE
                     up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_u = recv_x_flat[flat_t0 : flat_t0 + RECV_TILE, uk0 : uk0 + K_TILE]
+                        x_u = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, uk0 : uk0 + K_TILE]
                         w3_k = routed_w3[local_i : local_i + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
                         if uk0 == 0:
                             up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
@@ -147,7 +170,8 @@ def expert_routed(
                     a0 = a_base + ag * ACT_INTER_TILE
                     gate_2d_i32 = gate_slab[tt0 : tt0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
                     up_2d_i32 = up_slab[tt0 : tt0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
-                    recv_x_scale_dq = pl.reshape(recv_scale_dq[local_e : local_e + 1, tt0 : tt0 + RECV_TILE], [RECV_TILE, 1])
+                    recv_x_scale_slice = recv_scale_dq[local_e : local_e + 1, tt0 : tt0 + RECV_TILE]
+                    recv_x_scale_dq = pl.reshape(recv_x_scale_slice, [RECV_TILE, 1])
                     w1_scale_chunk = routed_w1_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
                     w3_scale_chunk = routed_w3_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
                     gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
@@ -276,16 +300,16 @@ def golden_expert_routed(tensors):
     import torch
     import torch.nn.functional as F
 
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
-
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
     recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
     recv_weights = tensors["recv_weights"].float()  # [E, RECV_MAX]
     recv_expert_count = tensors["recv_expert_count"]  # [E, 1] int32
-    w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
-    w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
-    w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
+    w1_i8 = tensors["routed_w1"]
+    w1_scale = tensors["routed_w1_scale"].float()
+    w3_i8 = tensors["routed_w3"]
+    w3_scale = tensors["routed_w3_scale"].float()
+    w2_i8 = tensors["routed_w2"]
+    w2_scale = tensors["routed_w2_scale"].float()
 
     recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
     for e in range(N_LOCAL_EXPERTS):
@@ -294,89 +318,57 @@ def golden_expert_routed(tensors):
             continue
         x_sub_i8 = recv_x_i8[e, :n_rows, :]
         x_sub_sd = recv_scale_dq[e, :n_rows].reshape(-1, 1)
-        x_sub_q = x_sub_i8.float() * x_sub_sd
         w_per_row = recv_weights[e, :n_rows].reshape(-1, 1)
 
-        gate = x_sub_q @ w1[e].T
-        up = x_sub_q @ w3[e].T
+        gate_int = x_sub_i8.to(torch.int32) @ w1_i8[e].to(torch.int32).T
+        gate = gate_int.float() * x_sub_sd * w1_scale[e].unsqueeze(0)
+        up_int = x_sub_i8.to(torch.int32) @ w3_i8[e].to(torch.int32).T
+        up = up_int.float() * x_sub_sd * w3_scale[e].unsqueeze(0)
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
         h = F.silu(gate) * up
         # A8 requant before w2 matmul.
         h_i8, h_sd = _int8_quant_per_row(h)
-        h = h_i8.float() * (h_sd * w_per_row)
-        recv_y[e, :n_rows, :] = h @ w2[e].T
+        y_int = h_i8.to(torch.int32) @ w2_i8[e].to(torch.int32).T
+        recv_y[e, :n_rows, :] = y_int.float() * h_sd * w_per_row * w2_scale[e].unsqueeze(0)
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
 
 def gen_routed_weight(shape, dequant_std):
-    """Synthesize a routed-expert per-channel-symmetric INT8 weight + FP32 scale by
-    simulating the real DeepSeek-V4-Flash MXFP4 routed-expert quant grid (e2m1, per-32-group
-    E8M0 scale), then re-quantizing per-output-channel. A plain ``randn`` INT8 is wrong:
-    routed collapses onto ~37 discrete levels with an ~11.6% zero spike (the FP4 grid) and a
-    per-channel scale CV ~0.09 (the fine group scale flattens it). Per-output-channel INT8 is
-    scale-invariant, so the level structure / zero spike emerge from the grid alone and
-    ``dequant_std`` only sets the absolute scale magnitude. (shared experts use a different
-    grid -- see expert_shared.gen_shared_weight.)
-
-    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
-    scale shape ([E, out, in] -> scale [E, out]).
-    """
+    """Synthesize per-output-channel symmetric INT8 weights and FP32 dequant scales."""
     import torch
 
-    FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
-    FP4_MAX, TINY = 6.0, 1e-20
-    GROUP = 32
-    CHUNK_ELEMS = 1 << 25    # elements per pass; unchunked this walks GiB-sized temporaries
+    reduction = shape[-1]
+    output_shape = shape[:-1]
+    output_rows = 1
+    for dim in output_shape:
+        output_rows *= dim
 
-    *lead, out, inn = shape
-    n_lead = 1
-    for dim in lead:
-        n_lead *= dim
-
-    W = torch.randn(*shape).reshape(n_lead, out, inn)
-    w_i8 = torch.empty(n_lead, out, inn, dtype=torch.int8)
-    scale = torch.empty(n_lead, out, 1, dtype=torch.float32)
-
-    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim, then per-output-channel
-    # INT8. Chunked over the leading dim: every reduction here is confined to one
-    # (out, in) row, so the chunk boundary cannot change a result.
-    step = max(1, CHUNK_ELEMS // (out * inn))
-    for i0 in range(0, n_lead, step):
-        w = W[i0:i0 + step]
-        wg = w.reshape(-1, out, inn // GROUP, GROUP)
-        absw = wg.abs()
-        grp_scale = torch.exp2(torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY))))
-        idx = torch.bucketize(absw.div_(grp_scale), FP4_MID).clamp_max_(7)
-        wq = (torch.sign(wg) * FP4_MAG[idx]).mul_(grp_scale).reshape(w.shape)
-        amax = wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        chan_scale = amax / INT8_SCALE_MAX
-        w_i8[i0:i0 + step] = torch.round(wq.div_(chan_scale)).clamp_(
-            -INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
-        scale[i0:i0 + step] = chan_scale
-    del W
-
-    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8.reshape(*shape), scale.reshape(*lead, out)
+    w_i8 = torch.empty(output_rows, reduction, dtype=torch.int8)
+    scale = torch.empty(output_rows, dtype=torch.float32)
+    rows_per_chunk = max(1, (1 << 24) // reduction)
+    for row0 in range(0, output_rows, rows_per_chunk):
+        row1 = min(output_rows, row0 + rows_per_chunk)
+        weight = torch.randn(row1 - row0, reduction)
+        row_scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS) / INT8_SCALE_MAX
+        quant = torch.round(weight / row_scale).clamp(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+        row_std = (quant.float() * row_scale).std(dim=-1).clamp_min(INT8_AMAX_EPS)
+        w_i8[row0:row1] = quant
+        scale[row0:row1] = row_scale.squeeze(-1) * (dequant_std / row_std)
+    return w_i8.reshape(*shape), scale.reshape(*output_shape)
 
 
-def build_tensor_specs():
+def build_tensor_specs(workload="balanced"):
     import torch
     from golden import TensorSpec
 
-    # Across-layer-mean dequant std (typical layer) of the real DeepSeek-V4-Flash MXFP4
-    # routed experts; gen_routed_weight simulates the FP4 grid (see its docstring).
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
 
-    # Distribute B*S*TOPK token-expert pairs uniformly across local experts.
-    total = B * S * M.num_experts_per_tok
-    counts = torch.bincount(
-        torch.randint(0, N_LOCAL_EXPERTS, (total,)),
-        minlength=N_LOCAL_EXPERTS,
-    ).to(torch.int32)
+    if workload not in ROUTED_WORKLOAD_COUNTS:
+        raise ValueError(f"unknown routed workload {workload!r}")
+    counts = torch.tensor(ROUTED_WORKLOAD_COUNTS[workload], dtype=torch.int32)
     counts_2d = counts.reshape(N_LOCAL_EXPERTS, 1)
 
     # Build a consistent INT8 recv_x + per-row dequant scale (dispatch is
@@ -414,8 +406,6 @@ def build_tensor_specs():
     def init_recv_weights():
         return recv_weights_pre
 
-    # Synthesize (int8, per-channel scale) by simulating the real MXFP4 routed-expert
-    # quant grid (see gen_routed_weight). The kernel + golden both consume int8+scale.
     w1_i8, w1_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
     w3_i8, w3_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
     w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
@@ -443,14 +433,21 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--workload", choices=tuple(ROUTED_WORKLOAD_COUNTS), default="balanced")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=expert_routed_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.workload),
         golden_fn=golden_expert_routed,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,

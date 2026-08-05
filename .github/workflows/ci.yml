@@ -51,7 +51,16 @@ jobs:
       - name: Run unit tests
         run: |
           pytest tests/golden \
-            tests/contract/test_deepseek_v4_pro_w8a8_bringup_contract.py -v
+            tests/contract/test_deepseek_v4_pro_w8a8_bringup_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_metadata.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase2_leaf_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase3_hca_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase4_csa_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase5_moe_compute_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase5_moe_communication_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase6_manifest_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase6_layer_contract.py \
+            tests/contract/test_deepseek_v4_pro_w8a8_phase6_main_forward_contract.py -v
 
   detect-changes:
     runs-on: ubuntu-latest

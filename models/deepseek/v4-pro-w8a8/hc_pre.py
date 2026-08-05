@@ -72,7 +72,7 @@ import os
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from config import ACTIVE as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
 
 
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -110,7 +110,7 @@ NUM_CORES = 24
 T_TILE = 8  # vector row-tile (RMS / cast / split / mix_x)
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
 COMB_T_TILE = 8  # sinkhorn row-tile
-RMS_K_CHUNK = 512  # cast / rms K-fragment
+RMS_K_CHUNK = 256  # cast / rms K-fragment
 LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fits L0B)
 D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
@@ -188,7 +188,6 @@ def _hc_pre_syncall(
 
     # Per-phase grid-stride bounds (dynamic in t_dim; grid-stride round-robins any T over cores).
     tt_n = t_dim // T_TILE            # token-tiles (pre / post / comb / rsqrt / sinkhorn / write_post base)
-    cast_n = tt_n * CAST_KS           # cast fans over token-tile x K-slice
     seed_n = t_linear // T_TILE       # seed zeros t_linear rows (includes the 8->16 pad rows)
     lin_n = (t_linear // LINEAR_T_TILE) * LINEAR_OK  # linear fans over row-block x OK K-slice
     rms_n = tt_n * RMS_OK             # rms fans over token-tile x K-slice (split-K sum-of-squares)

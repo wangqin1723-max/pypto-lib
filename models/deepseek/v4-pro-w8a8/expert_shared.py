@@ -21,7 +21,7 @@ amax+rescale of the same tokens.
 
 import pypto.language as pl
 
-from config import (FLASH as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
+from config import (ACTIVE as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
 # model config
@@ -50,9 +50,18 @@ MM_INTER_TILE = 256
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
-QUANT_TILE = 2048
+QUANT_TILE = 1024
 D_OUT_TILE_ACT = 512
-W2_ACT_INNER = 8
+W2_ACT_INNER = 14
+
+if MOE_INTER % QUANT_TILE != 0:
+    raise ValueError("QUANT_TILE must cover the full expert intermediate dimension")
+if D % (W2_ACT_INNER * D_OUT_TILE_ACT) != 0:
+    raise ValueError("W2_ACT_INNER must cover the full hidden dimension")
+if D % K_TILE != 0 or D % D_OUT_TILE != 0 or D % D_OUT_TILE_ACT != 0:
+    raise ValueError("shared-expert hidden tiles must cover the full hidden dimension")
+if MOE_INTER % INTER_K != 0 or MOE_INTER % MM_INTER_TILE != 0 or MOE_INTER % ACT_INTER_TILE != 0:
+    raise ValueError("shared-expert intermediate tiles must cover the full intermediate dimension")
 
 
 @pl.jit.inline
@@ -311,25 +320,26 @@ def golden_expert_shared(tensors):
     import torch
     import torch.nn.functional as F
 
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
-
     x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
     x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
-    x_local = x_local_i8.float() * x_local_scale_dq
-    sw1 = dequant_w(tensors["shared_w1"], tensors["shared_w1_scale"].float())
-    sw3 = dequant_w(tensors["shared_w3"], tensors["shared_w3_scale"].float())
-    sw2 = dequant_w(tensors["shared_w2"], tensors["shared_w2_scale"].float())
+    w1_i8 = tensors["shared_w1"]
+    w1_scale = tensors["shared_w1_scale"].float()
+    w3_i8 = tensors["shared_w3"]
+    w3_scale = tensors["shared_w3_scale"].float()
+    w2_i8 = tensors["shared_w2"]
+    w2_scale = tensors["shared_w2_scale"].float()
 
-    sh_gate = x_local @ sw1.T
-    sh_up = x_local @ sw3.T
+    gate_int = x_local_i8.to(torch.int32) @ w1_i8.to(torch.int32).T
+    sh_gate = gate_int.float() * x_local_scale_dq * w1_scale.unsqueeze(0)
+    up_int = x_local_i8.to(torch.int32) @ w3_i8.to(torch.int32).T
+    sh_up = up_int.float() * x_local_scale_dq * w3_scale.unsqueeze(0)
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
     sh_h_i8, sh_h_sd = _int8_quant_per_row(sh_h)
-    sh_h = sh_h_i8.float() * sh_h_sd
-    sh = sh_h @ sw2.T
+    sh_int = sh_h_i8.to(torch.int32) @ w2_i8.to(torch.int32).T
+    sh = sh_int.float() * sh_h_sd * w2_scale.unsqueeze(0)
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
 
@@ -406,14 +416,20 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=expert_shared_test,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_shared,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,

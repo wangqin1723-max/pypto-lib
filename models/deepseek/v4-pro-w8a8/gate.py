@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
+from config import (ACTIVE as M, MOE_TOKENS, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
@@ -19,9 +19,7 @@ from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
 T = MOE_TOKENS
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
-# Routing space: every rank routes over the full global expert set so dispatch
-# can fan tokens across ranks. moe.py shrinks config.FLASH.n_routed_experts to
-# 32*EP before importing this module, so N_EXPERTS follows the active EP world.
+# Routing covers the full deployment expert set.
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
@@ -39,10 +37,12 @@ D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
-GATE_D_TILE = 2048
+GATE_D_TILE = 512
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
+assert (D // GATE_D_TILE) % 2 == 0, "gate K-loop must have an even stage-2 trip count"
 QUANT_TILE = 256
-SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
+SCORE_PAD = 512         # padded expert row for sort32 + mrgsort
+assert SCORE_PAD == 512, "route_sort uses a fixed four-way final merge"
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
@@ -241,17 +241,18 @@ def gate(
             # the batched pl.gather below accepts it — Tile-against-Tensor src
             # is rejected.
             topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-            # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
-            # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
-            # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+            sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+            # ptoas pto.tmrgsort requires one-row inputs. sort32 emits sixteen
+            # 64-value runs; two four-way format-1 merges produce one 512-value run.
             for sr_tt in pl.range(GATE_T_TILE):
                 sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
-                sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
                 sr_sorted = pl.sort32(sr_row, sr_idx_init)
                 sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                sr_sorted = pl.mrgsort(sr_sorted, block_len=256)
                 sr_pairs = sr_sorted[:, 0:SORT_PAD]
-                sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                # The odd sort lanes store expert IDs as integer bits.
+                sr_pairs_i32 = pl.reinterpret_view(sr_pairs, pl.INT32)
+                sr_i = pl.gather(sr_pairs_i32, mask_pattern=pl.tile.MaskPattern.P1010)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
             # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
             # tail so the normalize sum below sees only real TOPK entries.
@@ -307,7 +308,7 @@ def _per_token_int8_quant(x_bf16):
     import torch
     x_f32 = x_bf16.float()
     amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_q = INT8_SCALE_MAX / amax
+    scale_q = torch.full_like(amax, INT8_SCALE_MAX) / amax
     scaled = x_f32 * scale_q
     x_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq = (1.0 / scale_q).reshape(-1)  # [T]
@@ -368,22 +369,41 @@ def golden_gate_core(tensors):
     tensors["weights"][:] = weights.to(torch.float32)
 
 
-def build_tensor_specs(layer_id=0, num_tokens=T):
+GATE_FIXTURES = ("random", "tail-expert")
+
+
+def build_tensor_specs(layer_id=0, num_tokens=T, fixture="random"):
     import torch
     from golden import ScalarSpec, TensorSpec
 
+    if fixture not in GATE_FIXTURES:
+        raise ValueError(f"unknown gate fixture: {fixture}")
+
     def init_x_mixed():
+        if fixture == "tail-expert":
+            return torch.ones(T, D)
         # Mirror post-RMSNorm activation magnitude (~ N(0, 1)).
         return torch.randn(T, D)
     def init_norm_w():
         return torch.ones(D)
     def init_gate_w():
+        if fixture == "tail-expert":
+            return torch.zeros(N_EXPERTS, D)
         return torch.randn(N_EXPERTS, D) / D ** 0.5
     def init_gate_bias():
+        if fixture == "tail-expert":
+            bias = torch.zeros(N_EXPERTS)
+            bias[N_EXPERTS - TOPK:] = torch.arange(1, TOPK + 1, dtype=torch.float32)
+            return bias
         return torch.randn(N_EXPERTS) * 0.1
     def init_tid2eid():
+        if fixture == "tail-expert":
+            tail_ids = torch.arange(N_EXPERTS - 1, N_EXPERTS - TOPK - 1, -1, dtype=torch.int32)
+            return tail_ids.reshape(1, TOPK).repeat(VOCAB, 1)
         return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
     def init_input_ids():
+        if fixture == "tail-expert":
+            return torch.zeros(T, dtype=torch.int64)
         return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
     return [
         TensorSpec("x_mixed", [T, D], torch.bfloat16, init_value=init_x_mixed),
@@ -424,13 +444,34 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=10)
     parser.add_argument("--num-tokens", type=int, default=T)
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--fixture", choices=GATE_FIXTURES, default="random")
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs and golden outputs for replay")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="directory containing cached in/ and out/ tensors")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=4, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.fixture == "tail-expert" and args.layer_id < N_HASH_LAYERS:
+        parser.error("--fixture tail-expert requires a score-routing layer")
+
+    compare_fn = {
+        "x_norm_i8": gate_tile_prefix_compare(
+            args.num_tokens,
+            ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
+        ),
+    }
+    if args.fixture != "tail-expert":
+        compare_fn["indices"] = topk_pair_compare("weights")
 
     result = run_jit(
         fn=gate_test,
-        specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
+        specs=build_tensor_specs(
+            layer_id=args.layer_id,
+            num_tokens=args.num_tokens,
+            fixture=args.fixture,
+        ),
         golden_fn=golden_gate_core,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
@@ -440,13 +481,10 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            "x_norm_i8": gate_tile_prefix_compare(
-                args.num_tokens,
-                ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
-            ),
-            "indices": topk_pair_compare("weights"),
-        },
+        compare_fn=compare_fn,
+        compile_only=args.compile_only,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
     )
     if not result.passed:
         if result.error:
