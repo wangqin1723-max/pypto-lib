@@ -1,0 +1,372 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ci: devices=4
+"""DeepSeek-V4 SWA decode DSA-CP attention output half."""
+
+import pypto.language as pl
+import pypto.language.distributed as pld
+
+from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from decode_attention_cp import (
+    ATTENTION_WINDOW_ROWS,
+    D,
+    GROUP_T_PAD,
+    H,
+    HEAD_DIM,
+    HEADS_PER_GROUP,
+    LOCAL_O_GROUPS,
+    LOCAL_T,
+    LOCAL_T_PAD,
+    O_GROUPS,
+    O_GROUP_IN,
+    O_WINDOW_ROWS,
+    SP_SIZE,
+    attention_token_head_all_to_all_step,
+    o_projection_reduce_scatter_step,
+)
+from decode_o_projection_cp import LOCAL_O_WIDTH, decode_o_projection_cp
+from decode_sparse_attn_swa import (
+    ATTN_K_TILE,
+    BIAS_T_TILE,
+    NEG_INF,
+    ORI_BLOCK_NUM,
+    ORI_BLOCK_NUM_DYN,
+    PADDED_TOPK,
+    ROPE_DIM,
+    S,
+    T,
+    T_DYN,
+    T_PAD,
+    WIN,
+    sparse_attn_swa_heads,
+)
+
+
+# model config
+O_LORA = M.o_lora_rank
+
+# fixture
+FIXTURE_WINDOW_BLOCKS = (WIN + BLOCK_SIZE - 1) // BLOCK_SIZE
+FIXTURE_OUTPUT_SENTINEL = -7.0
+
+if T != LOCAL_T:
+    raise ValueError(f"SWA token capacity {T} must equal CP local token capacity {LOCAL_T}")
+if T_PAD != LOCAL_T_PAD:
+    raise ValueError(f"SWA padded token capacity {T_PAD} must equal CP capacity {LOCAL_T_PAD}")
+if FIXTURE_WINDOW_BLOCKS > ORI_BLOCK_NUM:
+    raise ValueError("SWA fixture window exceeds the original KV cache capacity")
+
+
+@pl.jit
+def decode_swa_output_cp(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    o_local: pl.InOut[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
+    attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    attention_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
+    o_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
+    o_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    sp_rank: pl.Scalar[pl.INT32],
+):
+    """Run rank-local SWA heads, output A2A, sharded O projection, and RS."""
+    q.bind_dynamic(0, T_DYN)
+    swa_indices.bind_dynamic(0, T_DYN)
+    swa_lens.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+
+    local_t = pl.tensor.dim(q, 0)
+    bias_blocks = local_t // BIAS_T_TILE
+    sparse_bias = pl.create_tensor([local_t, PADDED_TOPK], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
+        valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
+        for bias_block in pl.range(bias_blocks):
+            token_start = bias_block * BIAS_T_TILE
+            zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
+            valid_cols = pl.col_expand(zero_rows, valid_col)
+            lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
+            lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
+            lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
+            valid = pl.neg(pl.row_expand_sub(valid_cols, lens_fp32))
+            valid = pl.maximum(valid, 0.0)
+            valid = pl.minimum(valid, 1.0)
+            invalid = pl.sub(valid, 1.0)
+            sparse_bias[token_start : token_start + BIAS_T_TILE, 0:ATTN_K_TILE] = pl.mul(invalid, -NEG_INF)
+
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
+    o_packed_heads, _ = sparse_attn_swa_heads(
+        q, ori_kv, swa_indices, sparse_bias,
+        attn_sink, freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+
+    attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
+    attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+    attention_local_flat, attention_signal = attention_token_head_all_to_all_step(
+        attention_grouped, attention_local_flat,
+        attention_window, attention_signal,
+        group_base, sp_rank, local_t,
+    )
+
+    attention_local_groups = pl.reshape(attention_local_flat, [LOCAL_O_GROUPS, GROUP_T_PAD, O_GROUP_IN])
+    o_partial = pl.create_tensor([GROUP_T_PAD, D], dtype=pl.FP32)
+    o_partial, _ = decode_o_projection_cp(
+        attention_local_groups,
+        wo_a, wo_b, wo_b_scale,
+        local_t, o_partial,
+    )
+
+    o_local, o_signal = o_projection_reduce_scatter_step(
+        o_partial, o_local,
+        o_window, o_signal,
+        group_base, sp_rank, local_t,
+    )
+    return o_local, attention_signal, o_signal
+
+
+@pl.jit.host
+def l3_decode_swa_output_cp(
+    q: pl.Tensor[[SP_SIZE, T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[SP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[SP_SIZE, T_DYN, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[SP_SIZE, T_DYN], pl.INT32],
+    attn_sink: pl.Tensor[[SP_SIZE, H], pl.FP32],
+    freqs_cos: pl.Tensor[[SP_SIZE, T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[SP_SIZE, T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[SP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[SP_SIZE, D, LOCAL_O_WIDTH], pl.INT8],
+    wo_b_scale: pl.Tensor[[SP_SIZE, D], pl.FP32],
+    o_local: pl.InOut[pl.Tensor[[SP_SIZE, LOCAL_T_PAD, D], pl.BF16]],
+):
+    """Launch the SWA output half on one physical SP group."""
+    q.bind_dynamic(1, T_DYN)
+    swa_indices.bind_dynamic(1, T_DYN)
+    swa_lens.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(1, T_DYN)
+    freqs_sin.bind_dynamic(1, T_DYN)
+
+    attention_window_buf = pld.alloc_window_buffer([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+    attention_signal_buf = pld.alloc_window_buffer([SP_SIZE, 1], dtype=pl.INT32)
+    o_window_buf = pld.alloc_window_buffer([O_WINDOW_ROWS, D], dtype=pl.FP32)
+    o_signal_buf = pld.alloc_window_buffer([SP_SIZE, 1], dtype=pl.INT32)
+
+    for rank in pl.range(pld.world_size()):
+        attention_window = pld.window(attention_window_buf, [ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
+        attention_signal = pld.window(attention_signal_buf, [SP_SIZE, 1], dtype=pl.INT32)
+        o_window = pld.window(o_window_buf, [O_WINDOW_ROWS, D], dtype=pl.FP32)
+        o_signal = pld.window(o_signal_buf, [SP_SIZE, 1], dtype=pl.INT32)
+        decode_swa_output_cp(
+            q[rank], ori_kv[rank], swa_indices[rank], swa_lens[rank],
+            attn_sink[rank], freqs_cos[rank], freqs_sin[rank],
+            wo_a[rank], wo_b[rank], wo_b_scale[rank], o_local[rank],
+            attention_window, attention_signal, o_window, o_signal,
+            0, rank, device=rank,
+        )
+
+
+def build_tensor_specs(local_t):
+    """Build deterministic four-rank SWA output-half inputs."""
+    import torch
+
+    from golden import TensorSpec
+
+    if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
+        raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
+
+    def init_q():
+        q = torch.zeros(SP_SIZE, local_t, H, HEAD_DIM, dtype=torch.bfloat16)
+        rank = torch.arange(SP_SIZE, dtype=torch.float32).reshape(SP_SIZE, 1, 1)
+        token = torch.arange(local_t, dtype=torch.float32).reshape(1, local_t, 1)
+        head = torch.arange(H, dtype=torch.float32).reshape(1, 1, H)
+        q[..., 0] = (rank + token * 0.25 + head * 0.0625).to(torch.bfloat16)
+        return q
+
+    def init_ori_kv():
+        shape = (ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache = torch.full(shape, float("nan"), dtype=torch.bfloat16)
+        cache[:FIXTURE_WINDOW_BLOCKS, :, 0, :] = 0.0
+        cache[:FIXTURE_WINDOW_BLOCKS, :, 0, 0] = 0.25
+        return cache.unsqueeze(0).expand(SP_SIZE, *shape).clone()
+
+    def init_swa_indices():
+        window_row = torch.arange(WIN, dtype=torch.int32)
+        return window_row.reshape(1, 1, WIN).expand(SP_SIZE, local_t, WIN).clone()
+
+    def init_swa_lens():
+        return torch.full((SP_SIZE, local_t), WIN, dtype=torch.int32)
+
+    def init_attn_sink():
+        head = torch.arange(H, dtype=torch.int32).remainder(HEADS_PER_GROUP).to(torch.float32)
+        sink = 4.0 + head * 0.125
+        return sink.reshape(1, H).expand(SP_SIZE, H).clone()
+
+    def init_freqs_cos():
+        cos = torch.ones(local_t, ROPE_DIM, dtype=torch.bfloat16)
+        return cos.unsqueeze(0).expand(SP_SIZE, local_t, ROPE_DIM).clone()
+
+    def init_freqs_sin():
+        sin = torch.zeros(local_t, ROPE_DIM, dtype=torch.bfloat16)
+        return sin.unsqueeze(0).expand(SP_SIZE, local_t, ROPE_DIM).clone()
+
+    def init_wo_a():
+        wo_a = torch.zeros(SP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
+        for rank in range(SP_SIZE):
+            for local_group in range(LOCAL_O_GROUPS):
+                shard_scale = (rank + 1) * (local_group + 1) * 0.125
+                for head in range(HEADS_PER_GROUP):
+                    wo_a[rank, local_group, head, head * HEAD_DIM] = shard_scale * (head + 1)
+        return wo_a
+
+    def init_wo_b():
+        base = torch.arange(D * LOCAL_O_WIDTH, dtype=torch.int32).reshape(D, LOCAL_O_WIDTH)
+        rank = torch.arange(SP_SIZE, dtype=torch.int32).reshape(SP_SIZE, 1, 1)
+        return (base.unsqueeze(0) + rank).remainder(7).sub(3).to(torch.int8)
+
+    def init_wo_b_scale():
+        channel_scale = torch.arange(D, dtype=torch.int32).remainder(4).to(torch.float32) * 0.25 + 0.5
+        return channel_scale.reshape(1, D).expand(SP_SIZE, D).clone()
+
+    return [
+        TensorSpec("q", [SP_SIZE, local_t, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
+        TensorSpec("ori_kv", [SP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
+        TensorSpec("swa_indices", [SP_SIZE, local_t, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec("swa_lens", [SP_SIZE, local_t], torch.int32, init_value=init_swa_lens),
+        TensorSpec("attn_sink", [SP_SIZE, H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("freqs_cos", [SP_SIZE, local_t, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [SP_SIZE, local_t, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("wo_a", [SP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [SP_SIZE, D, LOCAL_O_WIDTH], torch.int8, init_value=init_wo_b),
+        TensorSpec("wo_b_scale", [SP_SIZE, D], torch.float32, init_value=init_wo_b_scale),
+        TensorSpec(
+            "o_local", [SP_SIZE, LOCAL_T_PAD, D], torch.bfloat16,
+            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
+        ),
+    ]
+
+
+def golden_decode_swa_output_cp(tensors):
+    """Compute the controlled SWA heads, sharded O projection, and reduced rows."""
+    import torch
+
+    local_t = tensors["q"].shape[1]
+    group_t = SP_SIZE * local_t
+    q0 = tensors["q"][..., 0].float()
+    kv0 = tensors["ori_kv"][:, 0, 0, 0, 0].float()
+    sink = tensors["attn_sink"].float()
+    score = q0 * kv0.reshape(SP_SIZE, 1, 1) * M.softmax_scale
+    numerator = WIN * kv0.reshape(SP_SIZE, 1, 1)
+    head_value = numerator / (WIN + torch.exp(sink.reshape(SP_SIZE, 1, H) - score))
+    head_value = head_value.to(torch.bfloat16)
+
+    attention_grouped = torch.zeros(SP_SIZE, O_GROUPS, local_t, O_GROUP_IN, dtype=torch.bfloat16)
+    for group in range(O_GROUPS):
+        for head in range(HEADS_PER_GROUP):
+            global_head = group * HEADS_PER_GROUP + head
+            group_col = head * HEAD_DIM
+            attention_grouped[:, group, :, group_col] = head_value[:, :, global_head]
+
+    attention_local = torch.zeros(SP_SIZE, LOCAL_O_GROUPS, group_t, O_GROUP_IN, dtype=torch.bfloat16)
+    for destination_rank in range(SP_SIZE):
+        for local_group in range(LOCAL_O_GROUPS):
+            global_group = destination_rank * LOCAL_O_GROUPS + local_group
+            group_rows = attention_grouped[:, global_group].reshape(group_t, O_GROUP_IN)
+            attention_local[destination_rank, local_group] = group_rows
+
+    partials = torch.zeros(SP_SIZE, group_t, D, dtype=torch.float32)
+    for rank in range(SP_SIZE):
+        attention = attention_local[rank].float()
+        o_a = torch.einsum("gti,gri->gtr", attention, tensors["wo_a"][rank].float())
+        row_amax = o_a.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        scale_q = INT8_SCALE_MAX / row_amax
+        o_a_i8 = torch.round(o_a * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
+        scale_dq = 1.0 / scale_q
+        wo_b = tensors["wo_b"][rank].reshape(D, LOCAL_O_GROUPS, O_LORA)
+        for local_group in range(LOCAL_O_GROUPS):
+            group_i32 = o_a_i8[local_group].to(torch.int32)
+            weight_i32 = wo_b[:, local_group].to(torch.int32)
+            group_partial = group_i32 @ weight_i32.T
+            partials[rank] += group_partial.float() * scale_dq[local_group]
+        partials[rank] *= tensors["wo_b_scale"][rank].float().reshape(1, D)
+
+    reduced = partials.sum(dim=0)
+    tensors["o_local"].fill_(FIXTURE_OUTPUT_SENTINEL)
+    for rank in range(SP_SIZE):
+        row_start = rank * local_t
+        tensors["o_local"][rank, :local_t] = reduced[row_start : row_start + local_t].to(torch.bfloat16)
+
+
+def build_o_local_compare(local_t):
+    """Compare valid token rows and require the poisoned capacity tail to survive."""
+    import torch
+
+    from golden import ratio_allclose
+
+    prefix_compare = ratio_allclose(
+        atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0,
+        valid_rows=local_t, valid_axis=1,
+    )
+
+    def compare(actual, expected, **kwargs):
+        actual_tail = actual[:, local_t:]
+        expected_tail = expected[:, local_t:]
+        if not torch.equal(actual_tail, expected_tail):
+            mismatch_count = int((actual_tail != expected_tail).sum().item())
+            return False, f"    inactive token tail mismatch count={mismatch_count}"
+        return prefix_compare(actual, expected, **kwargs)
+
+    compare.__name__ = f"swa_output_prefix_and_tail(local_t={local_t})"
+    return compare
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from golden import run_jit
+    from pypto.ir.distributed_compiled_program import DistributedConfig
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(SP_SIZE)))
+    parser.add_argument("--case", choices=("all", "max", "subcapacity"), default="all")
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    device_ids = [int(device) for device in args.device.split(",")]
+    if len(device_ids) != SP_SIZE:
+        parser.error(f"need exactly {SP_SIZE} devices, got {device_ids}")
+    case_local_t = {"max": LOCAL_T, "subcapacity": LOCAL_T - BIAS_T_TILE}
+    selected_cases = tuple(case_local_t) if args.case == "all" else (args.case,)
+    for case in selected_cases:
+        local_t = case_local_t[case]
+        result = run_jit(
+            fn=l3_decode_swa_output_cp,
+            specs=build_tensor_specs(local_t),
+            golden_fn=golden_decode_swa_output_cp,
+            compile_only=args.compile_only,
+            compile_cfg=dict(
+                dump_passes=args.dump_passes,
+                distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            ),
+            runtime_cfg=dict(platform=args.platform),
+            compare_fn={"o_local": build_o_local_compare(local_t)},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
