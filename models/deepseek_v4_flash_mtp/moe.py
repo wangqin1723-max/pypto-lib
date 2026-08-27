@@ -201,7 +201,7 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -261,10 +261,13 @@ def dispatch(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_wait",
+        deps=[_push_tid],
+        allow_early_resolve=True,
     ) as _wait_tid:
+        _idx_anchor = pl.read(indices, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=data_arrived,
                     offsets=[src, 0],
                     expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
