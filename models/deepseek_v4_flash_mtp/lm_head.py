@@ -162,10 +162,14 @@ def lm_head_core(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
+    # Barrier on the group's publishes. The hidden_states read is an anchor, not
+    # data: it deps this task on the hidden-state producer so the wait runs
+    # alongside our own push instead of trailing it.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait") as _dwait_tid:
+        _hidden_anchor = pl.read(hidden_states, [0, 0])
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=hidden_done,
                     offsets=[owner_tp, 0],
                     expected=pl.cast(done_epoch * MAX_LOGIT_ROWS, pl.INT32),
@@ -190,7 +194,7 @@ def lm_head_core(
         FUSED_LM_HEAD_CORES,
         name_hint="lm_head_matmul_push",
         optimizations=[pl.cross_core_slot(slot_num=2)],
-    ):
+    ) as _push_tid:
         lm_core = pl.tile.get_block_idx()
         vocab_base = tp_rank * VOCAB_PER_TP
         for mm_ob in pl.range(lm_core, VOCAB_TILES, FUSED_LM_HEAD_CORES):
@@ -273,10 +277,15 @@ def lm_head_core(
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait") as _cwait_tid:
+    # Wait only (the notify rides inside the push). deps on the push scope so the
+    # wait runs alongside our own push; an unanchored wait dispatches immediately
+    # and spins holding a core group.
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
+    ) as _cwait_tid:
         for src_tp in pl.range(TP_SIZE):
             if src_tp != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=logits_done,
                     offsets=[src_tp, 0],
                     expected=pl.cast(done_epoch * FUSED_LM_HEAD_CORES, pl.INT32),
