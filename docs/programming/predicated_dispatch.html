@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Predicated Dispatch：让运行时条件不再卡住编排线程</title>
+  <style>
+    :root {
+      --ink: #17212b;
+      --muted: #5d6975;
+      --paper: #f7f5ef;
+      --card: #fffdf8;
+      --line: #d9d5ca;
+      --blue: #166b8f;
+      --blue-soft: #e5f3f7;
+      --green: #237a57;
+      --green-soft: #e7f4ec;
+      --amber: #a86016;
+      --amber-soft: #fff1dc;
+      --red: #a13b35;
+      --red-soft: #fbe9e6;
+      --code: #172431;
+      --shadow: 0 12px 34px rgba(23, 33, 43, .09);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(23, 33, 43, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(23, 33, 43, .035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 30px 30px;
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      line-height: 1.72;
+    }
+    a { color: var(--blue); }
+    code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
+    code { font-size: .92em; }
+    .wrap { width: min(1120px, calc(100% - 36px)); margin: 0 auto; }
+
+    header {
+      padding: 72px 0 46px;
+      color: white;
+      background:
+        radial-gradient(circle at 84% 20%, rgba(94, 211, 207, .28), transparent 27%),
+        linear-gradient(128deg, #152b3a, #174f67 60%, #166b75);
+      border-bottom: 5px solid #e4b560;
+    }
+    .eyebrow { font-weight: 750; letter-spacing: .12em; color: #9ee1dc; }
+    h1 { max-width: 900px; margin: 13px 0 16px; font-size: clamp(34px, 5vw, 64px); line-height: 1.12; }
+    .lead { max-width: 830px; margin: 0; color: #dcebf0; font-size: 20px; }
+    .hero-note {
+      display: inline-block; margin-top: 27px; padding: 9px 14px;
+      color: #173342; background: #f3d394; border-radius: 4px; font-weight: 760;
+    }
+
+    nav {
+      position: sticky; top: 0; z-index: 5;
+      background: rgba(247, 245, 239, .94); border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(8px);
+    }
+    nav .wrap { display: flex; gap: 8px; overflow-x: auto; padding: 11px 0; }
+    nav a { flex: 0 0 auto; padding: 5px 10px; color: var(--ink); text-decoration: none; font-size: 14px; }
+    nav a:hover { color: var(--blue); background: var(--blue-soft); }
+
+    main { padding: 38px 0 80px; }
+    section { scroll-margin-top: 70px; margin: 0 0 68px; }
+    h2 { margin: 0 0 20px; font-size: clamp(26px, 3vw, 38px); line-height: 1.22; }
+    h3 { margin: 4px 0 9px; font-size: 20px; }
+    .kicker { margin-bottom: 7px; color: var(--blue); font-weight: 780; letter-spacing: .06em; text-transform: uppercase; }
+    .summary { max-width: 880px; color: var(--muted); font-size: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card { padding: 23px; background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .card p:last-child { margin-bottom: 0; }
+    .tag { display: inline-block; padding: 2px 8px; color: var(--blue); background: var(--blue-soft); font-size: 13px; font-weight: 760; }
+    .metric { font-size: 42px; line-height: 1; font-weight: 820; color: var(--amber); }
+    .callout { padding: 18px 21px; border-left: 5px solid var(--blue); background: var(--blue-soft); }
+    .callout.warn { border-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-color: var(--red); background: var(--red-soft); }
+
+    .flow { margin: 24px 0; padding: 24px; overflow-x: auto; background: #edf1f1; border: 1px solid #cdd7d7; }
+    .flow-row { min-width: 760px; display: flex; align-items: center; justify-content: center; gap: 12px; }
+    .flow-row + .flow-row { margin-top: 15px; }
+    .box { min-width: 145px; padding: 13px 16px; text-align: center; background: white; border: 2px solid #70808a; box-shadow: 4px 4px 0 #cbd3d4; }
+    .box small { display: block; margin-top: 3px; color: var(--muted); }
+    .box.blue { border-color: var(--blue); background: #f0f9fb; }
+    .box.green { border-color: var(--green); background: var(--green-soft); }
+    .box.red { border-color: var(--red); background: var(--red-soft); }
+    .box.dashed { border-style: dashed; }
+    .arrow { flex: 0 0 auto; color: #53616a; font-size: 28px; font-weight: 800; }
+    .lane-label { width: 105px; flex: 0 0 105px; color: var(--muted); font-weight: 760; }
+    .lane-track { flex: 1; display: flex; align-items: center; gap: 8px; }
+    .segment { padding: 9px 12px; text-align: center; border: 1px solid; white-space: nowrap; }
+    .segment.wait { flex: 2; color: var(--red); border-color: #dfa39d; background: var(--red-soft); }
+    .segment.work { flex: 1; color: var(--green); border-color: #94c6ac; background: var(--green-soft); }
+    .segment.submit { flex: 1; color: var(--blue); border-color: #8dc0d1; background: var(--blue-soft); }
+    .timeline { margin: 24px 0; overflow-x: auto; }
+    .timeline table { min-width: 930px; table-layout: fixed; }
+    .timeline th, .timeline td { padding: 10px 9px; text-align: center; vertical-align: middle; font-size: 14px; line-height: 1.45; }
+    .timeline th:first-child, .timeline td:first-child { width: 92px; color: var(--muted); font-weight: 780; background: #f2f0e8; }
+    .timeline .time-head th { color: var(--muted); background: #e9ece9; font-weight: 780; }
+    .timeline .blank { background: #faf8f1; color: #b6ada0; }
+    .timeline .sync { color: var(--red); background: var(--red-soft); border-color: #dfa39d; font-weight: 760; }
+    .timeline .submit-cell { color: var(--blue); background: var(--blue-soft); border-color: #8dc0d1; font-weight: 760; }
+    .timeline .work-cell { color: var(--green); background: var(--green-soft); border-color: #94c6ac; font-weight: 760; }
+    .timeline .saved { color: var(--green); background: #dff1e6; border-color: #80b99c; font-weight: 780; }
+    .timeline .waste { color: var(--red); background: var(--red-soft); border-color: #dfa39d; font-weight: 780; }
+
+    pre { margin: 15px 0 0; padding: 19px; overflow-x: auto; color: #e8f1f5; background: var(--code); border-left: 4px solid #50b8b1; line-height: 1.55; }
+    .comment { color: #9fb4bf; }
+    .kw { color: #75d7d1; }
+    .fn { color: #f1c879; }
+    .str { color: #b9df91; }
+    table { width: 100%; border-collapse: collapse; background: var(--card); }
+    th, td { padding: 14px 16px; text-align: left; vertical-align: top; border: 1px solid var(--line); }
+    th { background: #e9ece9; }
+    .yes { color: var(--green); font-weight: 780; }
+    .no { color: var(--red); font-weight: 780; }
+    .footnotes { color: var(--muted); font-size: 14px; }
+    footer { padding: 25px 0 45px; color: var(--muted); border-top: 1px solid var(--line); }
+
+    @media (max-width: 800px) {
+      header { padding-top: 48px; }
+      .grid, .grid.three { grid-template-columns: 1fr; }
+      .flow { margin-inline: -8px; padding: 18px 10px; }
+    }
+    @media print {
+      nav { display: none; }
+      body { background: white; }
+      header { padding: 35px 0; }
+      section { break-inside: avoid; }
+      .card { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+<aside style="position:relative;z-index:10000;padding:10px 16px;background:#eef2f7;color:#17212b;font:14px/1.6 sans-serif">学习资料归档 · 2026-09-15 · <a style="color:#1459a0" href="../README.md">返回阅读索引</a><br>来源：<code>pypto-lib/local_archive/20260817-main-cleanup/predicated_dispatch.html</code>；实现与实验结论按原文时间阅读。</aside>
+
+  <header>
+    <div class="wrap">
+      <div class="eyebrow">SIMPLER · PR #1314</div>
+      <h1>让“值还没算出来”<br>不再卡住编排线程</h1>
+      <p class="lead">Predicated Dispatch 把“这个任务到底要不要发射”的判断推迟到任务真正 ready 的时刻。上层仍可静态铺开任务图，同时跳过运行时为空的工作，并保持 orch pipeline 向前流动。</p>
+      <div class="hero-note">一句话：提交条件，不在 orch 里等待条件。</div>
+    </div>
+  </header>
+
+  <nav aria-label="页面导航">
+    <div class="wrap">
+      <a href="#scene">三阶段流程</a>
+      <a href="#use">上层如何表达</a>
+      <a href="#examples">更多适用形态</a>
+      <a href="#cost">收益与边界</a>
+      <a href="#checklist">采用检查</a>
+    </div>
+  </nav>
+
+  <main class="wrap">
+    <section id="scene">
+      <div class="kicker">From MoE to the common pattern</div>
+      <h2>生产者 tensor 决定消费者是否下发：看三个阶段的流水变化</h2>
+      <p class="summary">MoE 只是这个问题的来源：上游路由/dispatch 产生 <code>recv_expert_count</code>，记录每个 local expert 接收到多少 token row。这个 tensor 的值决定后续 expert stage 是否有实际工作。抽象出来就是：一个 producer 的输出 tensor 决定一个 consumer task 是否需要下发。</p>
+
+      <div class="callout"><strong>要优化的不是 kernel 内的一行 if。</strong>真正的目标是让“空 consumer”尽早停在调度侧：既不要让 orch 为了读条件而阻塞，也不要把必然空的任务继续下发到 AICore。</div>
+
+      <h3>阶段一：PR #738 之前，orch 用 <code>get_tensor_data</code> 决定是否提交消费者</h3>
+      <p>这条路能跳过空 consumer，但判断发生在 orch 线程。<code>get_tensor_data</code> 必须拿到 producer 已完成的 tensor 值；如果值还没 ready，orch 就等在这里。producer 完成、count 可读之后，orch 才能判断是否提交 consumer；consumer 一旦提交，后续仍按“scheduler 下发 → AICore 执行”的正常链路推进。</p>
+      <div class="timeline" aria-label="PR738 之前使用 get_tensor_data 的时间线">
+        <table>
+          <tr class="time-head"><th>角色 / 时间</th><th>T0</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th><th>T6</th></tr>
+          <tr><td>Count</td><td class="blank">尚未 ready</td><td class="work-cell">count tensor ready</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>orch</td><td class="sync">get_tensor_data 等 producer ready</td><td class="sync">producer 完成后读 count</td><td class="submit-cell">count &gt; 0 后提交 Consumer</td><td class="submit-cell">继续提交后续任务</td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>scheduler</td><td class="blank">未收到 Consumer</td><td class="blank">未收到 Consumer</td><td class="submit-cell">收到 Consumer</td><td class="submit-cell">下发到 AICore</td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>AICore</td><td class="work-cell">Producer 执行中</td><td class="work-cell">Producer 完成</td><td class="blank">等待下发</td><td class="blank"></td><td class="work-cell">开始执行 Consumer</td><td class="work-cell">Consumer 完成</td><td class="blank"></td></tr>
+          <tr><td>瓶颈</td><td class="waste" colspan="2">orch 阻塞在 get_tensor_data，等待 producer 产出 count</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+        </table>
+      </div>
+
+      <h3>阶段二：PR #738 之后，上层不再读 count，消费者全部提交</h3>
+      <p>PR #738 的优化方向是把判断下沉到 consumer kernel 内：每个 expert stage 统一提交一次，kernel 里读取 <code>recv_expert_count</code>，算出 <code>n_tiles</code>，再执行 <code>for t in range(n_tiles)</code>。这样 orch 不再被 <code>get_tensor_data</code> 卡住，能更快把任务图铺出去；但副作用是空 consumer 也会进入 scheduler 和 AICore。</p>
+      <div class="timeline" aria-label="PR738 后全部下发的时间线">
+        <table>
+          <tr class="time-head"><th>角色 / 时间</th><th>T0</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th><th>T6</th></tr>
+          <tr><td>Producer</td><td class="work-cell">写出 count tensor</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>orch</td><td class="submit-cell">提交所有 Consumer</td><td class="saved">不读 count</td><td class="saved">继续铺后续任务图</td><td class="saved">可与 scheduler 重叠</td><td class="saved">可与 AICore 重叠</td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>scheduler</td><td class="blank"></td><td class="submit-cell">依赖 ready</td><td class="submit-cell">下发非空 Consumer</td><td class="blank"></td><td class="submit-cell">下发空 Consumer</td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>AICore</td><td class="work-cell">Producer 完成</td><td class="blank"></td><td class="blank"></td><td class="work-cell">执行非空 Consumer</td><td class="blank"></td><td class="waste">空 Consumer 进 kernel</td><td class="waste">n_tiles = 0，返回</td></tr>
+          <tr><td>效果</td><td class="blank"></td><td class="saved" colspan="3">省掉 orch get_tensor_data 同步阻塞</td><td class="waste" colspan="3">仍浪费空任务下发和空 kernel 启停</td></tr>
+        </table>
+      </div>
+
+      <h3>阶段三：加上 PR #1314，orch 提交条件，scheduler 在 ready 点判断</h3>
+      <p>Predicated Dispatch 保留 PR #738 的流水优势：orch 不同步读取 count，只提交“consumer + predicate 地址”。等 count producer 依赖完成、consumer 到达 ready 点时，scheduler 读取这个 tensor 元素并比较；真值才下发到 AICore，假值直接退休。这样同时得到两件事：orch 不被 <code>get_tensor_data</code> 阻塞，空任务也不再下发。</p>
+      <div class="timeline" aria-label="PR1314 predicated dispatch 的时间线">
+        <table>
+          <tr class="time-head"><th>角色 / 时间</th><th>T0</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th><th>T6</th></tr>
+          <tr><td>Producer</td><td class="work-cell">写出 count tensor</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>orch</td><td class="submit-cell">提交 Consumer + predicate</td><td class="saved">不读 count</td><td class="saved">继续铺后续任务图</td><td class="saved">可与调度判断重叠</td><td class="saved">可与 true 执行重叠</td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>scheduler</td><td class="blank"></td><td class="submit-cell">依赖 ready</td><td class="submit-cell">ready 点读 count</td><td class="submit-cell">true 才下发</td><td class="saved">false 直接退休</td><td class="blank"></td><td class="blank"></td></tr>
+          <tr><td>AICore</td><td class="work-cell">Producer 完成</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="work-cell">执行 true Consumer</td><td class="saved">false 不进 kernel</td><td class="blank"></td></tr>
+          <tr><td>效果</td><td class="blank"></td><td class="saved" colspan="3">保留阶段二的 orch 流水</td><td class="saved" colspan="3">省掉 false task 的下发和空 kernel 时间</td></tr>
+        </table>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <span class="tag">MoE 里的具体例子</span>
+          <div class="metric">≈ 47%</div>
+          <p>路由后有的 local expert 收到 token，<code>recv_expert_count &gt; 0</code>；有的 expert 本轮没有 token，<code>recv_expert_count == 0</code>。在 issue #1347 的 DSv4 FLASH、decode batch 8、EP2 案例里，约 47% 的 <code>exp_w2_mm_spmd</code> 类任务 <code>n_tiles == 0</code>。这个比例说明该场景有优化空间，不是所有 workload 的承诺。</p>
+        </div>
+        <div class="card">
+          <span class="tag">性能效果怎么理解</span>
+          <h3>流水恢复 + 空任务不下发</h3>
+          <p>阶段二已经去掉了 orch 同步读 count 的阻塞，但留下空任务下发；阶段三在不牺牲 orch 流水的前提下，把 false consumer 截在 scheduler ready 点，进一步省掉冗余下发和空 kernel 启停。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="use">
+      <div class="kicker">How upper layers express it</div>
+      <h2>上层表达的是“发射条件”，不是提前读取的布尔值</h2>
+      <p class="summary">条件由一个 GM tensor 元素、比较操作和常量目标组成。关键是把 predicate operand 的 producer 纳入被条件化任务的依赖，保证 task ready 时该值已经可读。</p>
+
+      <div class="grid">
+        <div class="card">
+          <span class="tag">面向 pypto / lib 的目标形态</span>
+          <pre><span class="comment"># 前端跟进接口；不属于 simpler PR #1314 本身</span>
+<span class="kw">with</span> pl.<span class="fn">spmd</span>(
+    block_num,
+    name_hint=<span class="str">"exp_w2_mm"</span>,
+    predicate=(recv_expert_count[local_i] &gt; 0),
+):
+    <span class="comment"># 只有该 expert 有有效 row 时才发射</span>
+    ...</pre>
+          <p class="footnotes">这是 issue #1347 约定的 frontend follow-up 方向，用来说明上层意图；最终 pypto 语法应以后续前端 PR 为准。</p>
+        </div>
+        <div class="card">
+          <span class="tag">当前 simpler L0 能力</span>
+          <pre>L0TaskPredicate pred;
+pred.operand.tensor = &amp;recv_expert_count;
+pred.operand.ndims = 1;
+pred.operand.indices[0] = local_i;
+pred.op = PredicateOp::GT;
+pred.target = 0;
+
+args.<span class="fn">set_predicate</span>(pred);
+args.<span class="fn">set_dependencies</span>(deps, dep_count);
+rt_submit_aic_task(kernel_id, args);</pre>
+        </div>
+      </div>
+
+      <div class="flow">
+        <div class="flow-row">
+          <div class="box blue">Count Producer<small>写 count[i]</small></div>
+          <div class="arrow">→ 依赖</div>
+          <div class="box green">Predicated Task<small>count[i] &gt; 0</small></div>
+          <div class="arrow">→</div>
+          <div class="box">Consumer<small>仅使用合法结果</small></div>
+        </div>
+      </div>
+      <div class="callout danger"><strong>最重要的正确性契约：</strong>predicate operand 的 producer 必须是 predicated task 的依赖。否则“task ready”不能证明条件值已更新，判断可能读到旧值。运行时不会替上层推断这条依赖。</div>
+
+      <h3>当前支持的比较条件</h3>
+      <table>
+        <thead><tr><th>PredicateOp</th><th>表达含义</th><th>典型用途</th></tr></thead>
+        <tbody>
+          <tr><td><code>NONE</code></td><td>无条件，总是发射</td><td>默认任务；不需要 predicate</td></tr>
+          <tr><td><code>EQ</code></td><td><code>operand == target</code></td><td>只处理某个精确状态值</td></tr>
+          <tr><td><code>NE</code></td><td><code>operand != target</code></td><td>状态非空、flag 非默认值</td></tr>
+          <tr><td><code>GT</code></td><td><code>operand &gt; target</code></td><td>MoE expert count 大于 0 才发射</td></tr>
+          <tr><td><code>LT</code></td><td><code>operand &lt; target</code></td><td>低于阈值才运行某个分支</td></tr>
+          <tr><td><code>GE</code></td><td><code>operand &gt;= target</code></td><td>达到阈值才运行后处理</td></tr>
+          <tr><td><code>LE</code></td><td><code>operand &lt;= target</code></td><td>不超过阈值才运行轻量路径</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="examples">
+      <div class="kicker">Pattern catalog</div>
+      <h2>它适合“图可静态展开、工作是否为空由设备侧结果决定”的任务</h2>
+      <div class="grid three">
+        <div class="card">
+          <span class="tag">例 1 · MoE 空 expert</span>
+          <h3><code>expert_count[i] &gt; 0</code></h3>
+          <p>固定提交每个 local expert 的 stage；无 token 的 expert 不发射。条件对整个 SPMD task 一致：通过则所有 block 正常发射，失败则一个 block 都不发射。</p>
+        </div>
+        <div class="card">
+          <span class="tag">例 2 · 稀疏分桶</span>
+          <h3><code>bucket_size[i] != 0</code></h3>
+          <p>上游统计各 bucket 的元素数，下游为每个 bucket 静态准备处理任务。空 bucket 直接退休；非空 bucket 保持原计算路径。</p>
+        </div>
+        <div class="card">
+          <span class="tag">例 3 · 可选后处理</span>
+          <h3><code>valid_count &gt; threshold</code></h3>
+          <p>上游产生有效元素计数，只有达到阈值才运行后处理。前提是跳过后不会让消费者读取本应由该任务生成的新输出。</p>
+        </div>
+      </div>
+
+      <div class="callout warn" style="margin-top: 18px"><strong>不要把它当成通用 if。</strong>它控制的是“整个 task 是否 dispatch”，不是 kernel 内每个 block、每个 tile 或每个元素的分支。需要细粒度条件时，仍应在 kernel 内处理。</div>
+    </section>
+
+    <section id="cost">
+      <div class="kicker">Performance accounting</div>
+      <h2>它省掉什么，又明确不省什么</h2>
+      <table>
+        <thead><tr><th>开销 / 行为</th><th>Predicate 为真</th><th>Predicate 为假</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr><td><code>get_tensor_data</code> 等待 producer ready 的同步开销</td><td class="yes">省去</td><td class="yes">省去</td><td>orch 只提交 predicate 的地址、比较符和 target，不在 orch 线程里读取 tensor 值；等待 producer 完成这件事交回任务依赖图。</td></tr>
+          <tr><td>向 AICore 下发 / 空 kernel 执行路径</td><td class="no">不省</td><td class="yes">省去</td><td>真值照常发射；假值在 scheduler 判断后直接退休，不再把空任务下发到 AICore。</td></tr>
+          <tr><td>任务创建、提交、payload 与依赖记账</td><td class="no">不省</td><td class="no">不省</td><td>任务仍是静态图中的真实节点，只有最后的发射被条件化。</td></tr>
+          <tr><td>调度时读取一个 GM 元素并比较</td><td class="no">新增少量</td><td class="no">新增少量</td><td>每个带 predicate 的 task 在 ready-routing 点要完成一次条件判断。</td></tr>
+          <tr><td>有效 kernel 的计算量</td><td class="no">不变</td><td>不发生</td><td>该功能不优化 kernel body，只决定是否发射整个 task。</td></tr>
+        </tbody>
+      </table>
+
+      <div class="grid" style="margin-top: 20px">
+        <div class="card">
+          <h3>收益更容易成立</h3>
+          <ul>
+            <li>空任务比例可观，且空任务下发 / 空 kernel 启停成本不可忽略；</li>
+            <li>旧路径需要在 orch 中用 <code>get_tensor_data</code> 读取 producer 输出；</li>
+            <li>orch 被 <code>get_tensor_data</code> 卡住时，本来还有其他独立任务可继续提交；</li>
+            <li>保持静态任务图比在 orch 动态决定任务数量更合适。</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>收益可能很小，甚至不合适</h3>
+          <ul>
+            <li>条件在 submit 前已是现成的 host / orch 标量，无需等待；</li>
+            <li>几乎所有 predicate 都为真，只额外增加调度侧 GM 读取；</li>
+            <li>跳过任务后，后继仍会读取该任务本应写出的新结果；</li>
+            <li>需要按 block 或 tile 分别决定执行，而不是 task-level 统一条件。</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="callout" style="margin-top: 18px"><strong>如何理解端到端收益：</strong>大致来自两部分：一是 orch 不再为 <code>get_tensor_data</code> 等 producer ready；二是 false task 不再下发到 AICore，也没有空 kernel 启停。需要扣掉的成本是 scheduler 在 ready 点读取一个 GM 元素并比较，以及仍然存在的任务创建、提交、payload 和依赖记账。具体数值取决于 false 比例、producer 延迟、可重叠工作和 kernel 粒度，需要在目标 workload 上测量。</div>
+    </section>
+
+    <section id="checklist">
+      <div class="kicker">Adoption checklist</div>
+      <h2>准备把一个上层算子改成 predicated dispatch 前</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>语义检查</h3>
+          <ol>
+            <li>条件是否来自一个已生产的 GM tensor 元素？</li>
+            <li>是否已把该 producer 显式放进 task 依赖？</li>
+            <li>predicate false 时，任务不写输出是否仍然正确？</li>
+            <li>后继解锁后是否不会读取未生成或过期的数据？</li>
+            <li>条件是否对整个 SPMD task 的所有 blocks 一致？</li>
+          </ol>
+        </div>
+        <div class="card">
+          <h3>性能检查</h3>
+          <ol>
+            <li>先统计 false / 空任务比例，而不是只凭直觉；</li>
+            <li>确认旧路径确实在 orch 的 <code>get_tensor_data</code> 等待上形成气泡；</li>
+            <li>分别观察 orch/scheduler 时间、dispatch 数和端到端时延；</li>
+            <li>同时覆盖 predicate true 与 false 两条正确性路径；</li>
+            <li>对 SPMD 验证 false 时没有 block 被发射。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="callout warn" style="margin-top: 18px"><strong>当前能力范围（PR #1314）：</strong>落在 a2a3 与 a5 的 <code>tensormap_and_ringbuffer</code> runtime；支持 task-level <code>EQ / NE / GT / LT / GE / LE</code> 比较。当前实现按有符号整数读取 1/2/4/8 字节 operand。前端 <code>pl.spmd(predicate=...)</code> 是独立 follow-up，不应把本文示意语法当作已经发布的 pypto API。</div>
+    </section>
+
+    <section>
+      <div class="kicker">Sources</div>
+      <h2>事实来源</h2>
+      <div class="card footnotes">
+        <p><a href="https://github.com/hw-native-sys/simpler/pull/1314">simpler PR #1314</a>：runtime 能力与最终代码；<a href="https://github.com/hw-native-sys/simpler/issues/1347">simpler issue #1347</a>：最终问题定义、性能案例与前端 follow-up；<a href="https://github.com/hw-native-sys/pypto-lib/pull/738">pypto-lib PR #738</a>：DeepSeek-V4 MoE 上层优化背景。</p>
+        <p>本文刻意不展开 runtime 内部数据布局和调度实现，只描述上层使用所需的行为契约与性能边界。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">Predicated Dispatch feature brief · 基于 simpler PR #1314 最终提交与 issue #1347</div>
+  </footer>
+</body>
+</html>

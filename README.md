@@ -21,6 +21,12 @@ docs/            Coding-style and workflow reference
 
 Files ending in `_draft.py` are works-in-progress and excluded from CI.
 
+## Learning notes
+
+See the [categorized learning notes](docs/README.md) for archived
+PyPTO programming, profiling, distributed attention, model architecture,
+precision investigations, and tuning case studies.
+
 ## Quick start
 
 Install pypto + simpler + ptoas (see [.claude/skills/setup_env/SKILL.md](.claude/skills/setup_env/SKILL.md)

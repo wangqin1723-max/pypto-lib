@@ -1,0 +1,1535 @@
+<meta charset="utf-8" />
+<title>关键路径分析 · Critical Path</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<style>
+/* ============================ Design tokens ============================ */
+:root, :root[data-theme="light"] {
+  --paper:      #eceff5;
+  --surface:    #ffffff;
+  --surface-2:  #f5f7fb;
+  --ink:        #14171e;
+  --ink-2:      #3a4150;
+  --muted:      #5c6577;
+  --hairline:   #d9dfea;
+  --hairline-2: #e7ebf3;
+  --brand:      #0a897c;   /* teal — compute / links */
+  --brand-ink:  #076e63;
+  --path:       #b7830a;   /* gold — the critical-path thread */
+  --path-glow:  rgba(210, 158, 30, .22);
+  --compute:    #12a08f;
+  --data-wait:  #dd7a34;
+  --core-wait:  #d54763;
+  --front-gap:  #7b8497;
+  --idle:       #c7cedb;   /* off-path / muted bars */
+  --idle-ink:   #8a93a4;
+  --grid:       rgba(20,23,30,.07);
+  --shadow:     0 1px 2px rgba(20,30,50,.05), 0 8px 30px rgba(20,30,50,.06);
+  --code-bg:    #0d1119;
+  --code-ink:   #cdd6e6;
+  --code-dim:   #79879e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:      #0c0f15;
+    --surface:    #141922;
+    --surface-2:  #10151d;
+    --ink:        #e7ecf4;
+    --ink-2:      #bcc6d5;
+    --muted:      #93a0b4;
+    --hairline:   #232a35;
+    --hairline-2: #1b212b;
+    --brand:      #33c9ba;
+    --brand-ink:  #55d7c9;
+    --path:       #ffc24a;
+    --path-glow:  rgba(255, 194, 74, .20);
+    --compute:    #2ac2b1;
+    --data-wait:  #f0954b;
+    --core-wait:  #f0637c;
+    --front-gap:  #8b95a8;
+    --idle:       #2b3341;
+    --idle-ink:   #7e8a9c;
+    --grid:       rgba(230,236,244,.06);
+    --shadow:     0 1px 2px rgba(0,0,0,.3), 0 12px 40px rgba(0,0,0,.35);
+    --code-bg:    #080b10;
+    --code-ink:   #cdd6e6;
+    --code-dim:   #6b7a91;
+  }
+}
+:root[data-theme="dark"] {
+  --paper:#0c0f15; --surface:#141922; --surface-2:#10151d; --ink:#e7ecf4; --ink-2:#bcc6d5;
+  --muted:#93a0b4; --hairline:#232a35; --hairline-2:#1b212b; --brand:#33c9ba; --brand-ink:#55d7c9;
+  --path:#ffc24a; --path-glow:rgba(255,194,74,.20); --compute:#2ac2b1; --data-wait:#f0954b;
+  --core-wait:#f0637c; --front-gap:#8b95a8; --idle:#2b3341; --idle-ink:#7e8a9c;
+  --grid:rgba(230,236,244,.06); --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 40px rgba(0,0,0,.35);
+  --code-bg:#080b10; --code-ink:#cdd6e6; --code-dim:#6b7a91;
+}
+
+/* ============================ Base ============================ */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo,
+    Consolas, "Liberation Mono", monospace;
+  --wrap: 1200px;
+  --measure: 86ch;
+}
+
+a { color: var(--brand); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; border-radius: 3px; }
+
+.mono { font-family: var(--font-mono); }
+code, kbd {
+  font-family: var(--font-mono);
+  font-size: .86em;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline-2);
+  padding: .08em .38em;
+  border-radius: 5px;
+  color: var(--ink-2);
+  word-break: break-word;
+}
+
+/* ============================ Top bar ============================ */
+.topbar {
+  position: sticky; top: 0; z-index: 40;
+  display: flex; align-items: center; gap: 18px;
+  padding: 10px max(20px, calc(50vw - var(--wrap)/2));
+  background: color-mix(in srgb, var(--paper) 84%, transparent);
+  backdrop-filter: saturate(1.4) blur(10px);
+  border-bottom: 1px solid var(--hairline);
+}
+.topbar .brand {
+  font-family: var(--font-mono); font-weight: 600; font-size: 13px;
+  letter-spacing: .04em; display: flex; align-items: center; gap: 9px; color: var(--ink);
+}
+.topbar .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--path);
+  box-shadow: 0 0 0 3px var(--path-glow); flex: none; }
+.topbar nav { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+.topbar nav a {
+  font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .03em;
+  color: var(--muted); padding: 5px 9px; border-radius: 7px; white-space: nowrap;
+}
+.topbar nav a:hover { background: var(--surface-2); text-decoration: none; color: var(--ink); }
+.topbar nav a.active { color: var(--brand-ink); background: color-mix(in srgb, var(--brand) 12%, transparent); }
+.theme-btn {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .04em;
+  color: var(--muted); background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 7px; padding: 5px 10px; cursor: pointer;
+}
+.theme-btn:hover { color: var(--ink); border-color: var(--muted); }
+@media (max-width: 760px) { .topbar nav { display: none; } }
+
+/* ============================ Layout ============================ */
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 20px; }
+.prose { max-width: none; }
+.prose p { margin: 0 0 1.05em; }
+section { padding: 62px 0 8px; scroll-margin-top: 64px; }
+section + section { border-top: 1px solid var(--hairline-2); }
+
+h1, h2, h3 { text-wrap: balance; line-height: 1.18; }
+.eyebrow {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--brand-ink);
+  display: flex; align-items: baseline; gap: 12px; margin: 0 0 14px;
+}
+.eyebrow .num {
+  color: var(--path); font-size: 12px;
+  border: 1px solid color-mix(in srgb, var(--path) 40%, transparent);
+  border-radius: 20px; padding: 2px 9px; letter-spacing: .08em;
+}
+h2 { font-size: clamp(26px, 4.2vw, 38px); font-weight: 700; letter-spacing: -.02em; margin: 0 0 .5em; }
+h3 { font-size: 20px; font-weight: 650; letter-spacing: -.01em; margin: 2em 0 .5em; color: var(--ink); }
+.lead { font-size: clamp(18px, 2.4vw, 21px); color: var(--ink-2); line-height: 1.55; }
+strong { color: var(--ink); font-weight: 650; }
+.prose ul { margin: 0 0 1.1em; padding-left: 1.15em; }
+.prose li { margin: .35em 0; }
+.prose li::marker { color: var(--brand); }
+
+/* term chips referencing the semantic colors */
+.tterm { font-family: var(--font-mono); font-weight: 600; font-size: .92em; white-space: nowrap; }
+.tterm::before { content: ""; display: inline-block; width: .62em; height: .62em; border-radius: 2px;
+  margin-right: .4em; vertical-align: baseline; background: var(--c, currentColor); }
+.t-compute  { color: var(--compute);  --c: var(--compute); }
+.t-data     { color: var(--data-wait);--c: var(--data-wait); }
+.t-core     { color: var(--core-wait);--c: var(--core-wait); }
+.t-front    { color: var(--front-gap);--c: var(--front-gap); }
+.t-path     { color: var(--path);     --c: var(--path); }
+
+/* ============================ Hero ============================ */
+.hero { padding: 54px 0 26px; }
+.hero h1 {
+  font-size: clamp(38px, 8vw, 76px); font-weight: 780; letter-spacing: -.035em;
+  margin: 12px 0 0; line-height: 1.02;
+}
+.hero h1 .en { display: block; font-family: var(--font-mono); font-weight: 600;
+  font-size: clamp(15px, 2.6vw, 22px); letter-spacing: .02em; color: var(--muted);
+  margin-top: 16px; }
+.hero .lead { margin-top: 22px; max-width: 60ch; }
+.hero .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+.chip {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .02em;
+  border: 1px solid var(--hairline); background: var(--surface);
+  color: var(--muted); border-radius: 20px; padding: 5px 12px;
+}
+.chip b { color: var(--ink); font-weight: 600; }
+
+/* ============================ Cards & figures ============================ */
+.card {
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 14px; box-shadow: var(--shadow); padding: 22px;
+}
+figure { margin: 26px 0; }
+.figframe {
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
+}
+.figframe .head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 13px 18px; border-bottom: 1px solid var(--hairline-2); background: var(--surface-2);
+}
+.figframe .head .t { font-family: var(--font-mono); font-size: 12.5px; font-weight: 600;
+  letter-spacing: .03em; color: var(--ink); }
+.figframe .head .s { font-size: 12.5px; color: var(--muted); }
+.figbody { padding: 18px; }
+.scroll { overflow-x: auto; overflow-y: hidden; }
+.scroll svg { display: block; width: 100%; height: auto; }
+figcaption { font-size: 13.5px; color: var(--muted); margin-top: 12px; line-height: 1.5; }
+figcaption b { color: var(--ink-2); }
+
+/* legend */
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 4px; }
+.legend .it { display: inline-flex; align-items: center; gap: 7px; font-family: var(--font-mono);
+  font-size: 11.5px; color: var(--muted); }
+.legend .sw { width: 13px; height: 13px; border-radius: 3px; flex: none; }
+.legend .sw.line { height: 0; border-top: 3px solid var(--path); border-radius: 0; }
+
+/* ============================ Tooltip ============================ */
+#tip {
+  position: fixed; z-index: 60; pointer-events: none; opacity: 0;
+  transform: translate(-50%, -118%); transition: opacity .09s;
+  background: var(--code-bg); color: var(--code-ink);
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  border: 1px solid rgba(255,255,255,.12); border-radius: 8px; padding: 8px 11px;
+  box-shadow: 0 10px 34px rgba(0,0,0,.4); white-space: nowrap; max-width: 88vw;
+}
+#tip b { color: #fff; }
+#tip .k { display: inline-block; padding: 0 5px; border-radius: 4px; margin-left: 4px; color: #0b0d12; font-weight: 600; }
+
+/* ============================ SVG element styles ============================ */
+svg text { font-family: var(--font-mono); fill: var(--ink); }
+.axis-line { stroke: var(--hairline); stroke-width: 1; }
+.grid-line { stroke: var(--grid); stroke-width: 1; }
+.axis-tick { fill: var(--muted); font-size: 10px; }
+.lane-bg { fill: var(--surface-2); }
+.lane-label { fill: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .04em; }
+.lane-sub { fill: var(--muted); font-size: 9px; letter-spacing: .06em; opacity: .8; }
+.bar { cursor: default; transition: filter .12s; }
+.bar:hover { filter: brightness(1.08); }
+.bar-idle rect { fill: var(--idle); }
+.bar-idle text { fill: var(--idle-ink); }
+.bar-crit rect { fill: color-mix(in srgb, var(--compute) 24%, var(--surface)); stroke: var(--compute); stroke-width: 1.4; }
+.bar-crit text { fill: var(--ink); font-weight: 600; }
+.bar text { font-size: 11px; pointer-events: none; }
+.thread-under { fill: none; stroke: var(--path); stroke-width: 7; opacity: .16; stroke-linecap: round; stroke-linejoin: round; }
+.thread { fill: none; stroke: var(--path); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round;
+  filter: drop-shadow(0 0 5px var(--path-glow)); }
+.thread-node { fill: var(--path); stroke: var(--surface); stroke-width: 1.6; }
+
+/* DAG */
+.dag-edge { fill: none; stroke: var(--hairline); stroke-width: 1.6; }
+.dag-edge.cpm { stroke: var(--path); stroke-width: 3; }
+.dag-node rect { fill: var(--surface); stroke: var(--hairline); stroke-width: 1.5; }
+.dag-node.cpm rect { stroke: var(--path); stroke-width: 2.2; fill: color-mix(in srgb, var(--path) 10%, var(--surface)); }
+.dag-node .nm { font-size: 12px; font-weight: 600; fill: var(--ink); }
+.dag-node .du { font-size: 10.5px; fill: var(--muted); }
+.arrow-h { fill: var(--hairline); }
+.arrow-h.cpm { fill: var(--path); }
+
+/* tiling segments */
+.seg { transition: opacity .4s ease, transform .4s ease; }
+.seg-compute  { fill: var(--compute); }
+.seg-data-wait{ fill: var(--data-wait); }
+.seg-core-wait{ fill: var(--core-wait); }
+.seg-front-gap{ fill: var(--front-gap); }
+.seg-label { font-size: 10px; fill: #fff; font-weight: 600; pointer-events: none; }
+.sweeper { stroke: var(--path); stroke-width: 2; stroke-dasharray: 3 3; }
+
+/* ============================ Decomposition bars (why) ============================ */
+.decomp { display: grid; gap: 20px; }
+.dcase { display: flex; flex-direction: column; gap: 8px; }
+.dcase + .dcase { padding-top: 18px; border-top: 1px solid var(--hairline-2); }
+.dcase .dh { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.dcase .dh .nm { font-weight: 650; }
+.dcase .dh .verdict { font-family: var(--font-mono); font-size: 12px; color: var(--brand-ink); }
+.drow { display: grid; grid-template-columns: 104px 1fr; gap: 12px; align-items: center; }
+.rlab { font-family: var(--font-mono); font-size: 10.5px; line-height: 1.25; color: var(--muted); text-align: right; }
+.dbar { display: flex; height: 30px; border-radius: 7px; overflow: hidden; border: 1px solid var(--hairline);
+  background: var(--surface-2); }
+.dseg { display: flex; align-items: center; justify-content: center; color: #fff;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600; min-width: 0; overflow: hidden;
+  transition: flex-basis .8s cubic-bezier(.2,.7,.2,1); }
+.dseg.compute { background: var(--compute); }
+.dseg.data    { background: var(--data-wait); }
+.dseg.core    { background: var(--core-wait); }
+.dseg.front   { background: var(--front-gap); }
+.cpmtrack { display: flex; height: 26px; border-radius: 7px; overflow: hidden;
+  border: 1px dashed var(--hairline); background: var(--surface-2); }
+.cpmfill { display: flex; gap: 1.5px; height: 100%; width: 0; flex: none; box-sizing: border-box;
+  background: var(--surface); border-right: 2px solid var(--path);
+  transition: width .9s cubic-bezier(.2,.7,.2,1); }
+.ctask { flex: 1 1 0; min-width: 2px; background: color-mix(in srgb, var(--path) 62%, var(--surface)); }
+.ctask:nth-child(even) { background: color-mix(in srgb, var(--path) 38%, var(--surface)); }
+.cpmhead { flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono); font-size: 9.5px; color: var(--muted); white-space: nowrap; }
+.dread { font-size: 12.5px; color: var(--ink-2); line-height: 1.45; }
+
+/* ============================ Pipeline (how) ============================ */
+.pipe { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 720px) { .pipe { grid-template-columns: repeat(4, 1fr); align-items: stretch; } }
+.pstep { position: relative; background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 12px; padding: 16px 15px; box-shadow: var(--shadow); }
+.pstep .pn { font-family: var(--font-mono); font-size: 11px; color: var(--path); letter-spacing: .1em; }
+.pstep h4 { margin: 6px 0 6px; font-size: 15.5px; letter-spacing: -.01em; }
+.pstep p { margin: 0; font-size: 13.5px; color: var(--muted); line-height: 1.5; }
+.pstep code { font-size: 11.5px; }
+.pstep .art { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 5px; }
+.pstep .art span { font-family: var(--font-mono); font-size: 10.5px; padding: 2px 7px; border-radius: 6px;
+  background: var(--surface-2); border: 1px solid var(--hairline-2); color: var(--ink-2); }
+@media (min-width: 720px) {
+  .pstep:not(:last-child)::after { content: "→"; position: absolute; right: -12px; top: 50%;
+    transform: translateY(-50%); color: var(--muted); font-family: var(--font-mono); z-index: 2; }
+}
+
+/* ============================ Two-column compare ============================ */
+.two { display: grid; gap: 18px; grid-template-columns: 1fr; }
+@media (min-width: 820px) { .two { grid-template-columns: 1fr 1fr; } }
+.pane { background: var(--surface); border: 1px solid var(--hairline); border-radius: 14px;
+  box-shadow: var(--shadow); padding: 20px; }
+.pane .tag { font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  display: inline-block; padding: 3px 9px; border-radius: 20px; margin-bottom: 10px; }
+.pane.static .tag { color: var(--path); background: color-mix(in srgb, var(--path) 14%, transparent); }
+.pane.observed .tag { color: var(--brand-ink); background: color-mix(in srgb, var(--brand) 14%, transparent); }
+.pane h3 { margin: 0 0 6px; }
+.pane p { margin: 0 0 .7em; font-size: 14.5px; color: var(--ink-2); }
+.pane .formula { font-family: var(--font-mono); font-size: 12.5px; color: var(--muted);
+  background: var(--surface-2); border: 1px solid var(--hairline-2); border-radius: 8px; padding: 10px 12px; margin-top: 4px; }
+
+/* callout */
+.note { display: flex; gap: 13px; background: var(--surface-2); border: 1px solid var(--hairline);
+  border-left: 3px solid var(--brand); border-radius: 10px; padding: 15px 17px; margin: 22px 0; }
+.note .ic { font-family: var(--font-mono); color: var(--brand-ink); font-weight: 700; flex: none; }
+.note p { margin: 0; font-size: 14.5px; color: var(--ink-2); }
+.note.gold { border-left-color: var(--path); }
+.note.gold .ic { color: var(--path); }
+
+/* academic / theory blocks */
+.lineage { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px; }
+.lin { background: var(--surface); border: 1px solid var(--hairline); border-radius: 11px; padding: 12px 14px; box-shadow: var(--shadow); }
+.lin .yr { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .05em; color: var(--path); }
+.lin .tt { font-weight: 650; font-size: 14px; margin-top: 3px; letter-spacing: -.01em; }
+.lin .ds { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.45; }
+.lin.here { border-color: var(--brand); background: color-mix(in srgb, var(--brand) 9%, var(--surface)); }
+.lin.here .yr { color: var(--brand-ink); }
+.ctable { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 460px; }
+.ctable th, .ctable td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--hairline-2); }
+.ctable th { font-family: var(--font-mono); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.ctable td.cx { font-family: var(--font-mono); font-weight: 600; white-space: nowrap; }
+.ctable td.np { color: var(--core-wait); }
+.ctable td.poly { color: var(--compute); }
+.ctable tr:last-child td { border-bottom: none; }
+.ctable tr.mine td { background: color-mix(in srgb, var(--brand) 7%, transparent); }
+.fgrid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+.fcard { background: var(--surface); border: 1px solid var(--hairline); border-radius: 11px; padding: 14px 16px; box-shadow: var(--shadow); }
+.fcard .lab { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--brand-ink); }
+.fcard .fx { font-family: var(--font-mono); font-size: 13.5px; color: var(--ink); margin-top: 9px; line-height: 1.55; word-break: break-word; }
+.fcard .ds { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+.thmgrid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+@media (min-width: 780px) { .thmgrid { grid-template-columns: 1fr 1fr; } }
+.thm { border: 1px solid var(--hairline); border-left: 3px solid var(--brand); background: var(--surface); border-radius: 9px; padding: 13px 16px; box-shadow: var(--shadow); }
+.thm.gold { border-left-color: var(--path); }
+.thm .h { font-family: var(--font-mono); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--brand-ink); }
+.thm.gold .h { color: var(--path); }
+.thm .c { font-size: 13.5px; margin-top: 5px; line-height: 1.5; }
+.thm .pf { font-size: 12.5px; color: var(--muted); margin-top: 7px; line-height: 1.55; }
+.thm .pf b { color: var(--ink-2); }
+.pane .thline { font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+  margin: 12px 0 0; padding-top: 10px; border-top: 1px dashed var(--hairline-2); line-height: 1.55; }
+.pane .thline b { color: var(--ink-2); }
+.fcard .dim { color: var(--muted); }
+.algogrid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+@media (min-width: 820px) { .algogrid { grid-template-columns: 1fr 1fr; } }
+.algo { background: var(--surface); border: 1px solid var(--hairline); border-radius: 11px; box-shadow: var(--shadow); overflow: hidden; }
+.algo .ahead { padding: 9px 15px; border-bottom: 1px solid var(--hairline-2); background: var(--surface-2);
+  font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: var(--brand-ink); }
+.algo pre { margin: 0; background: none; border: none; box-shadow: none; padding: 13px 15px; border-radius: 0; }
+.algo code { color: var(--ink-2); font-size: 12px; line-height: 1.75; }
+.algo .kw { color: var(--brand-ink); font-weight: 600; }
+.algo .cm { color: var(--muted); }
+
+/* concept diagram (intro) */
+.panel-t { font-family: var(--font-mono); font-size: 11px; font-weight: 600; fill: var(--muted); letter-spacing: .02em; }
+.cc-div { stroke: var(--hairline); stroke-width: 1; stroke-dasharray: 2 3; }
+.cc-edge { fill: none; stroke: var(--hairline); stroke-width: 1.6; }
+.cc-edge.crit { stroke: var(--path); stroke-width: 3; }
+.cc-ah { fill: var(--hairline); }
+.cc-ah.crit { fill: var(--path); }
+.cc-node rect { fill: var(--surface); stroke: var(--hairline); stroke-width: 1.5; }
+.cc-node.crit rect { stroke: var(--path); stroke-width: 2.2; fill: color-mix(in srgb, var(--path) 10%, var(--surface)); }
+.cc-nm { font-size: 13px; font-weight: 700; fill: var(--ink); }
+.cc-du { font-size: 9.5px; fill: var(--muted); }
+.cc-grid { stroke: var(--grid); stroke-width: 1; }
+.cc-tick { font-size: 9.5px; fill: var(--muted); }
+.cc-slack { fill: color-mix(in srgb, var(--path) 13%, transparent); stroke: var(--path); stroke-width: 1; stroke-dasharray: 3 2; }
+.cc-slacktx { font-size: 9.5px; fill: var(--path); font-family: var(--font-mono); }
+.cc-bar rect { fill: var(--idle); }
+.cc-bar text { fill: var(--idle-ink); font-size: 11px; font-weight: 600; }
+.cc-bar.crit rect { fill: color-mix(in srgb, var(--path) 30%, var(--surface)); stroke: var(--path); stroke-width: 1.4; }
+.cc-bar.crit text { fill: var(--ink); }
+.cc-mk { stroke: var(--path); stroke-width: 1.5; }
+.cc-cap { font-family: var(--font-mono); font-size: 10.5px; fill: var(--muted); }
+.cc-cap.gold { fill: var(--path); }
+
+/* ============================ Code blocks ============================ */
+pre { margin: 20px 0; background: var(--code-bg); border: 1px solid rgba(255,255,255,.07);
+  border-radius: 12px; padding: 16px 18px; overflow-x: auto; box-shadow: var(--shadow); }
+pre code { background: none; border: none; padding: 0; color: var(--code-ink); font-size: 13px; line-height: 1.7; }
+.tok-c { color: var(--code-dim); }        /* comment */
+.tok-k { color: #7cd5c8; }                /* keyword/flag */
+.tok-s { color: #e0a05a; }                /* string */
+.tok-p { color: #9aa7bd; }                /* punctuation/path */
+
+/* ============================ Report anatomy ============================ */
+.report { background: var(--code-bg); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow);
+  border: 1px solid rgba(255,255,255,.07); }
+.report .rhead { padding: 11px 16px; border-bottom: 1px solid rgba(255,255,255,.08);
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--code-dim); display: flex; gap: 8px; align-items: center; }
+.report .rhead .fn { color: var(--code-ink); }
+.report .rbody { padding: 16px 18px; overflow-x: auto; }
+.report pre { margin: 0; background: none; border: none; box-shadow: none; padding: 0; }
+.report .rline { color: var(--code-ink); }
+.report .anno { color: #ffce6a; }         /* annotation callouts */
+.report .h1 { color: #fff; font-weight: 700; }
+.report .lbl { color: #7cd5c8; }
+.report .num { color: #e6ad6b; }
+.report .kind-d { color: var(--data-wait); }
+.report .kind-c { color: var(--core-wait); }
+.report .ok { color: #74d99f; }
+
+/* ============================ Glossary ============================ */
+.glo { display: grid; gap: 0; border: 1px solid var(--hairline); border-radius: 12px; overflow: hidden; background: var(--surface); }
+.glo .row { display: grid; grid-template-columns: 190px 1fr; gap: 14px; padding: 13px 16px; border-top: 1px solid var(--hairline-2); }
+.glo .row:first-child { border-top: none; }
+.glo .term { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--brand-ink); }
+.glo .def { font-size: 14px; color: var(--ink-2); }
+@media (max-width: 620px) { .glo .row { grid-template-columns: 1fr; gap: 4px; } }
+
+/* ============================ Footer ============================ */
+footer { margin-top: 40px; padding: 34px 0 60px; border-top: 1px solid var(--hairline); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 14px 26px; align-items: baseline; }
+footer .mono { color: var(--muted); font-size: 12.5px; }
+
+/* reveal */
+.reveal { opacity: 0; transform: translateY(14px); transition: opacity .6s ease, transform .6s ease; }
+.reveal.in { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .reveal { opacity: 1; transform: none; transition: none; }
+  .seg, .dseg, .cpmfill, .thread { transition: none !important; }
+}
+</style>
+
+<!-- ==================================================================== -->
+<div class="topbar">
+  <span class="brand"><span class="dot"></span>critical_path.py</span>
+  <nav id="nav">
+    <a href="#bg">00·导论</a>
+    <a href="#what">01·定义</a>
+    <a href="#why">02·分析动机</a>
+    <a href="#how">03·获取方法</a>
+    <a href="#tool">04·工具剖析</a>
+    <a href="#report">05·产物解读</a>
+  </nav>
+  <button class="theme-btn" id="themeBtn" aria-label="切换主题">◐ theme</button>
+</div>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<!-- ============================ HERO ============================ -->
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow" style="color:var(--muted)">L2&nbsp;SWIMLANE&nbsp;·&nbsp;后处理性能分析工具</div>
+    <h1>关键路径<span class="en">The critical path of a device execution</span></h1>
+    <p class="lead">
+      一次 kernel 运行的时间，究竟消耗于<strong>有效计算</strong>，还是消耗于<strong>等待</strong>？
+      关键路径提取出决定总时长的那条任务链，并对其逐段归因。本文档系统阐述这一概念，
+      并剖析 <code>critical_path.py</code> 的实现原理及其全部产物。
+    </p>
+    <div class="meta">
+      <span class="chip">纯后处理 · <b>不占设备</b></span>
+      <span class="chip">复杂度 <b>O(N log N)</b></span>
+      <span class="chip">输入 <b>--enable-l2-swimlane</b></span>
+      <span class="chip">两条路径 <b>static / observed</b></span>
+    </div>
+
+    <figure class="reveal" style="margin-top:34px">
+      <div class="figframe">
+        <div class="head">
+          <span class="t">worked example · makespan = 100 µs</span>
+          <span class="s">悬停任务可查看明细；金色链条为 <b>observed</b> 关键路径</span>
+        </div>
+        <div class="figbody">
+          <div class="scroll"><svg id="hero-swim" role="img" aria-label="示例泳道图，金色链条标出关键路径"></svg></div>
+          <div class="legend" style="margin-top:14px">
+            <span class="it"><span class="sw" style="background:color-mix(in srgb,var(--compute) 24%,var(--surface));border:1.4px solid var(--compute)"></span>关键路径上的任务</span>
+            <span class="it"><span class="sw" style="background:var(--idle)"></span>其它任务（有余量 / slack）</span>
+            <span class="it"><span class="sw line"></span>observed 关键路径链条</span>
+          </div>
+        </div>
+      </div>
+    </figure>
+  </div>
+</header>
+
+<!-- ============================ 00 背景 ============================ -->
+<section id="bg">
+  <div class="wrap">
+    <div class="eyebrow"><span class="num">00</span> 导论 · Introduction</div>
+    <div class="prose">
+      <h2>什么是关键路径，为什么要找它</h2>
+      <p>
+        任何由相互依赖的任务组成的系统里，有些任务必须等另一些先完成。把「谁依赖谁」画成一张
+        <strong>有向无环图（DAG）</strong>，其中<strong>时长加权最长的那条依赖链</strong>就是
+        <strong>关键路径</strong>——它的长度决定了整件事最快能多久完成，因为链上各步只能依次发生、无法并行压缩。
+      </p>
+    </div>
+    <figure class="reveal" style="max-width:none">
+      <div class="figframe">
+        <div class="head">
+          <span class="t">关键路径 = 依赖网络里的最长链</span>
+          <span class="s">左：依赖 DAG，金色为最长链；右：对应执行时间线，关键链填满 makespan，<code>D</code> 有余量</span>
+        </div>
+        <div class="figbody"><div class="scroll"><svg id="concept" role="img" aria-label="关键路径概念图：依赖网络与执行时间线"></svg></div></div>
+      </div>
+      <figcaption>
+        五个任务，时长标在节点内。最长链 <code>A→B→C→E</code>（2+3+4+2 = <b>11</b>）即<b>关键路径</b>，它决定了 makespan = 11。
+        <code>D</code> 不在链上：它在 <code>[2, 9]</code> 区间内可自由浮动（<b>slack = 5</b>）而不影响总时长。
+      </figcaption>
+    </figure>
+    <div class="prose">
+      <p>
+        由此得到关键路径最重要的两条性质：链上的任务<strong>没有余量（slack）</strong>——任一变慢，makespan 立刻变长；
+        链外的任务<strong>有余量</strong>——像 <code>D</code>，推迟或适度变慢都不影响总时长。
+      </p>
+      <h3 style="margin-top:1.5em">为什么性能分析离不开它</h3>
+      <p>
+        因为关键路径就是<strong>时间真正花掉的地方</strong>，也就是<strong>性能提升点之所在</strong>：
+        只有压缩关键路径上的任务，makespan 才会缩短；优化链外任务只是消耗它们本就有的余量，端到端毫无变化。
+        换言之，关键路径把「该优化谁」从成百上千个任务里直接圈了出来——这就是我们要找它的全部理由。
+      </p>
+      <p>
+        落到 Ascend kernel 执行上：一次运行由成百上千个任务组成（<strong>Host</strong> 下发、<strong>AICPU</strong>
+        调度、<strong>AICore</strong> 执行），端到端只给一个「耗时 0.7 ms」，既不区分计算与等待、也不指出该优化谁。
+        <strong>L2 swimlane</strong> 让每个任务的 <code>start / end</code> 可观测，而 <code>critical_path.py</code>
+        据此把那条决定性的关键链自动重建出来。
+      </p>
+      <div class="note">
+        <span class="ic">记号</span>
+        <p><strong>makespan</strong> ＝ <code>max(end) − min(start)</code>，即设备墙钟总时长；全文百分比均以其为分母。</p>
+      </div>
+      <h3 style="margin-top:1.7em">谱系：从项目调度到 DAG 最长路径</h3>
+    </div>
+    <figure class="reveal" style="max-width:none">
+      <div class="lineage">
+        <div class="lin"><div class="yr">1958 · PERT</div><div class="tt">计划评审技术</div><div class="ds">美国海军 Polaris 计划；活动网络 + 概率工期</div></div>
+        <div class="lin"><div class="yr">1956–59 · CPM</div><div class="tt">关键路径法</div><div class="ds">DuPont（Walker）· Remington Rand（Kelley）；确定工期，前向-后向遍历</div></div>
+        <div class="lin"><div class="yr">图论</div><div class="tt">DAG 最长路径</div><div class="ds">拓扑序 + DP，<b>O(V+E)</b>；一般图则 NP-hard</div></div>
+        <div class="lin"><div class="yr">调度理论</div><div class="tt">RCPSP</div><div class="ds">资源约束项目调度，<b>强 NP-hard</b></div></div>
+        <div class="lin here"><div class="yr">本工具</div><div class="tt">后验重建</div><div class="ds">从已实现调度回溯关键路径，<b>O(N log N)</b></div></div>
+      </div>
+      <figcaption>关键路径法源于 1950 年代中后期的大型工程排期；其数学内核是<b>有向无环图（DAG）上的时长加权最长路径</b>。</figcaption>
+    </figure>
+
+    <div class="prose">
+      <h3 style="margin-top:1.7em">为什么「最长路径」可以高效求解</h3>
+      <p>
+        一般图上的最长（简单）路径是 <b>NP-hard</b>（可由 Hamilton 路径归约）；但任务图是
+        <b>DAG</b>——无环使拓扑序存在，沿拓扑序一遍动态规划即得精确最长路径，复杂度 <b>O(V+E)</b>。
+        这既是经典 CPM 可解的原因，也是本工具能廉价重建关键路径的根本。
+      </p>
+    </div>
+    <figure class="reveal" style="max-width:none">
+      <div class="figframe"><div class="figbody scroll">
+        <table class="ctable">
+          <thead><tr><th>问题</th><th>复杂度</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>一般图最长路径</td><td class="cx np">NP-hard</td><td>可由 Hamilton 路径归约</td></tr>
+            <tr><td>DAG 最长路径（＝ CPM）</td><td class="cx poly">O(V + E)</td><td>拓扑排序 + 动态规划</td></tr>
+            <tr><td>资源约束调度 RCPSP</td><td class="cx np">强 NP-hard</td><td>有限核下求最优排程</td></tr>
+            <tr class="mine"><td>本工具：后验重建</td><td class="cx poly">O(N log N)</td><td>不求解 RCPSP，只从已发生的调度回溯</td></tr>
+          </tbody>
+        </table>
+      </div></div>
+    </figure>
+
+    <div class="prose">
+      <h3 style="margin-top:1.7em">形式化：定义与递推</h3>
+      <p>
+        记任务图 <code>G = (V, E)</code> 为 DAG，<code>d(v) ≥ 0</code> 为任务时长，
+        <code>pred(v)</code> / <code>succ(v)</code> 为前驱 / 后继集。<b>前向遍历</b>给出最早时刻，
+        <b>后向遍历</b>给出最晚时刻，二者之差即时差（slack）。
+      </p>
+    </div>
+    <figure class="reveal" style="max-width:none">
+      <div class="fgrid">
+        <div class="fcard">
+          <div class="lab">前向遍历 · 最早</div>
+          <div class="fx">ES(v) = max<sub>u∈pred(v)</sub> EF(u) <span class="dim">(ES(源)=0)</span><br>EF(v) = ES(v) + d(v)<br>T<sub>∞</sub> = max<sub>v</sub> EF(v) = CPM</div>
+          <div class="ds">EF(v) 展开即「以 v 结尾的最长加权路径」；其全局最大 = 无限核 makespan（延迟下界）。</div>
+        </div>
+        <div class="fcard">
+          <div class="lab">后向遍历 · 最晚</div>
+          <div class="fx">LF(v) = min<sub>w∈succ(v)</sub> LS(w) <span class="dim">(LF(汇)=T<sub>∞</sub>)</span><br>LS(v) = LF(v) − d(v)</div>
+          <div class="ds">在不推迟整体完成的前提下，v 最晚可以开始 / 结束的时刻。</div>
+        </div>
+        <div class="fcard">
+          <div class="lab">时差与关键集</div>
+          <div class="fx">TF(v) = LS(v) − ES(v)<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= LF(v) − EF(v)<br>关键路径 ⊆ { v : TF(v) = 0 }</div>
+          <div class="ds">TF(v) 为 v 的可推迟余量；时差为零的任务串成关键路径。</div>
+        </div>
+      </div>
+    </figure>
+
+    <div class="prose">
+      <h3 style="margin-top:1.7em">算法（伪代码）</h3>
+      <p>
+        DAG 最长路径 = <b>拓扑排序</b> + <b>一遍动态规划</b>，均为 <code>O(V+E)</code>，回溯即得关键路径。
+        下面两段分别对应 <code>critical_path.py</code> 的 <code>topo_order</code> 与 <code>static_cpm</code>。
+      </p>
+    </div>
+    <figure class="reveal" style="max-width:none">
+      <div class="algogrid">
+        <div class="algo">
+          <div class="ahead">Topological-Sort(G = (V, E))  ▸ Kahn, O(V+E)</div>
+          <pre><code><span class="kw">for each</span> v ∈ V:  indeg[v] ← |pred(v)|
+Q ← { v : indeg[v] = 0 };   L ← ⟨⟩
+<span class="kw">while</span> Q ≠ ∅:
+    u ← Q.pop();   L.append(u)
+    <span class="kw">for each</span> edge u→w:
+        indeg[w] ← indeg[w] − 1
+        <span class="kw">if</span> indeg[w] = 0:  Q.push(w)
+<span class="kw">if</span> |L| &lt; |V|:  <span class="cm">error「图中存在环」</span>
+<span class="kw">return</span> L</code></pre>
+        </div>
+        <div class="algo">
+          <div class="ahead">Critical-Path(G, d)  ▸ 前向 DP + 回溯</div>
+          <pre><code>L ← Topological-Sort(G)
+<span class="kw">for each</span> v <span class="kw">in</span> L:                 <span class="cm">▷ 按拓扑序</span>
+    EF[v]    ← d[v] + max{ EF[u] : u→v }  <span class="cm">// max ∅ = 0</span>
+    pred*[v] ← argmax{ EF[u] : u→v }
+sink ← argmax_v EF[v];   CPM ← EF[sink]   <span class="cm">// = T∞</span>
+
+P ← ⟨⟩;   v ← sink                    <span class="cm">▷ 回溯关键路径</span>
+<span class="kw">while</span> v ≠ nil:  P.prepend(v);  v ← pred*[v]
+<span class="kw">return</span> CPM, P</code></pre>
+        </div>
+      </div>
+      <figcaption>
+        两段均为 <code>O(V+E)</code>：拓扑排序保证求 <code>EF[v]</code> 时其前驱已算完；<code>pred*</code> 记录取到最大值的前驱，
+        便于回溯出关键路径本身。这正是「DAG 最长路径可多项式求解」在代码层面的体现。
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ============================ 01 什么是关键路径 ============================ -->
+<section id="what">
+  <div class="wrap">
+    <div class="eyebrow"><span class="num">01</span> 定义与示例 · Definition</div>
+    <div class="prose">
+      <h2>总时长由最长的依赖链决定，而非最繁忙的计算核</h2>
+      <p>
+        把导论里的概念落到真实 kernel 图上。下图是一次 decode 前向的依赖 DAG——同样地，
+        <strong>决定总时长的是最长依赖链，而不是最繁忙的那个核</strong>：某个核可能一直在算，
+        但若它算的都是有余量的任务，加速它也不会让 makespan 变短。
+      </p>
+
+      <figure class="reveal">
+        <div class="figframe">
+          <div class="head">
+            <span class="t">依赖 DAG · 时长加权最长链</span>
+            <span class="s">金色为关键路径；节点内标注时长。判据是<b>总时长最大</b>的链，而非节点数最多的链</span>
+          </div>
+          <div class="figbody">
+            <div class="scroll"><svg id="dag" role="img" aria-label="任务依赖图，金色标出时长加权最长路径"></svg></div>
+          </div>
+        </div>
+        <figcaption>
+          图中从 <code>qkv</code> 出发存在两条分支。上支
+          <code>qkv→qk→softmax→pv→out_proj</code> 累计 <b>84 µs</b>，为最长链；下支经
+          <code>ff</code> 较短。<b>关键路径即这条 84 µs 的链</b>：即便计算核无限，
+          该链上的任务仍只能依次执行，故 84 µs 为理论上的延迟下界。
+          此处所示为「仅考虑数据依赖」的最长链，对应工具中的 <b>static</b> 路径；实际运行还受核竞争影响，
+          所得 <b>observed</b> 路径可能不同（<a href="#tool">见第 04 节</a>），本页两处金色链条分别对应这两条路径。
+        </figcaption>
+      </figure>
+
+      <p>
+        软件构建、任务调度、流水线编排本质上都是同一个问题：识别并压缩这条主线。
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 为什么需要 ============================ -->
+<section id="why">
+  <div class="wrap">
+    <div class="eyebrow"><span class="num">02</span> 分析动机 · Motivation</div>
+    <div class="prose">
+      <h2>关键路径明确指示优化投入的方向</h2>
+      <p>
+        性能优化中的常见失误，是优化了并不处于关键路径上的部分——投入大量精力，端到端时长却毫无改变。
+        关键路径给出两条基本原则：
+      </p>
+      <ul>
+        <li><strong>唯有压缩关键路径上的时间，makespan 方能缩短。</strong>路径之外的任务存在余量，
+          对其优化只是消耗余量，并不改变总时长。</li>
+        <li><strong>沿关键路径，makespan 可被精确切分为两类时间</strong>——
+          <span class="tterm t-compute">compute</span>（有效计算）与
+          <span class="tterm t-data">stall</span>（等待）。二者的比例直接表明该 workload
+          属于<strong>算力受限</strong>还是<strong>调度 / 依赖受限</strong>，二者的应对方式截然不同。</li>
+      </ul>
+    </div>
+
+    <figure class="reveal" style="max-width:none">
+      <div class="card">
+        <div class="decomp" id="decomp"></div>
+        <div class="legend" style="margin-top:18px">
+          <span class="it"><span class="sw" style="background:var(--compute)"></span>compute 计算</span>
+          <span class="it"><span class="sw" style="background:var(--data-wait)"></span>data-wait 等数据</span>
+          <span class="it"><span class="sw" style="background:var(--core-wait)"></span>core-wait 等核</span>
+          <span class="it"><span class="sw" style="background:var(--front-gap)"></span>front-gap 启动</span>
+          <span class="it"><span class="sw" style="background:color-mix(in srgb,var(--path) 55%,var(--surface))"></span>static CPM 依赖链（每段 = 1 个任务）</span>
+        </div>
+      </div>
+      <figcaption>
+        每个案例给出两条对齐的柱：上条是 makespan（compute + stall = 100%）；下条金色是
+        <b>static CPM 依赖链</b>——它的<b>长度</b>为 CPM%（到 100% 的灰色部分即可并行掉的余量），
+        它的<b>分段数</b>为关键路径上的任务数。<b>算力受限</b>与<b>依赖受限</b>的 compute/CPM 数字几乎一样，
+        区别只在下条金链是<b>少数大块</b>（几个重算子 → 优化算子）还是<b>一长串小块</b>（串行深度大 → 缩短链）；
+        <b>资源受限</b>则是金链很短（依赖只要求这么点）、makespan 却被 core-wait 撑满（→ 加核 / 改调度）。
+      </figcaption>
+    </figure>
+
+    <div class="prose">
+      <div class="note gold">
+        <span class="ic">要点</span>
+        <p>该工具的核心价值可概括为：<strong>将一次运行归结为「compute 与 stall」「observed 与 static」
+        两组对比</strong>，据此判断应优化算子实现，还是应调整依赖 / 调度，使优化决策有据可依。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 03 如何得到 ============================ -->
+<section id="how">
+  <div class="wrap">
+    <div class="eyebrow"><span class="num">03</span> 获取方法 · Pipeline</div>
+    <div class="prose">
+      <h2>先在设备侧采集两类产物，再离线重建</h2>
+      <p>
+        关键路径并非在设备上直接测得，而是通过<strong>后处理计算</strong>得到。须先执行一次带
+        profiling 的 on-device 运行，获取<strong>时序</strong>与<strong>依赖图</strong>两类原始数据，
+        再交由 <code>critical_path.py</code> 重建。后处理环节不涉及设备，亦无需 <code>task-submit</code>。
+      </p>
+    </div>
+
+    <div class="pipe reveal" style="margin:26px 0">
+      <div class="pstep">
+        <div class="pn">STEP 1 · 采集</div>
+        <h4>on-device 运行</h4>
+        <p>带 <code>--enable-l2-swimlane</code>（时序）与 <code>--enable-dep-gen</code>（依赖图）跑一次。</p>
+        <div class="art"><span>本机须经 task-submit 获取设备</span></div>
+      </div>
+      <div class="pstep">
+        <div class="pn">STEP 2 · 产物</div>
+        <h4>产物落盘（三类文件）</h4>
+        <p>每个 rank / device 目录下生成一组文件，构成工具的全部输入。</p>
+        <div class="art">
+          <span>l2_swimlane_records.json</span><span>deps.json</span><span>name_map.json</span>
+        </div>
+      </div>
+      <div class="pstep">
+        <div class="pn">STEP 3 · 建图</div>
+        <h4>build_graph</h4>
+        <p>将时间片折叠为逐任务时序，并建立<strong>数据依赖</strong>与<strong>同核资源</strong>两类前驱。</p>
+        <div class="art"><span>hb_pred</span><span>core_prev</span></div>
+      </div>
+      <div class="pstep">
+        <div class="pn">STEP 4 · 求路径</div>
+        <h4>两条关键路径 + 报告</h4>
+        <p>计算 <span class="tterm t-path">static CPM</span> 与 <b>observed</b> 两条路径，并输出 <code>.md</code> 报告。</p>
+        <div class="art"><span>critical_path_report.md</span></div>
+      </div>
+    </div>
+
+    <div class="prose">
+      <h3>为何需要两类产物</h3>
+      <p>
+        <code>l2_swimlane_records.json</code> 仅包含<strong>时序</strong>——每个
+        <code>(task, core-block)</code> 的执行时间片，而<strong>不含依赖</strong>（设备热路径有意不记录 fanout）。
+        依赖来自独立的 <code>deps.json</code>（由 <code>dep_gen</code> 离线重放生产者→消费者边生成）。
+        <code>name_map.json</code> 负责将 <code>callable_id</code> 映射为可读的 kernel 名称。
+        工具将三者<strong>按 task_id 连接</strong>（deps 中为字符串、swimlane 中为整数，统一归一化为字符串以避免静默漏连），
+        由此同时获得任务的执行时刻与任务间的依赖关系。
+      </p>
+      <div class="note gold">
+        <span class="ic">注意</span>
+        <p><strong>一处落盘细节：</strong>SceneTest 采集写出的名称映射文件名为
+        <code>name_map_&lt;case&gt;.json</code>，而工具做目录发现时找的是字面量
+        <code>name_map.json</code>。因此在运行前通常须将其<strong>重命名或复制为
+        <code>name_map.json</code></strong>，并置于与 <code>l2_swimlane_records.json</code> 相同的目录，
+        工具方能发现该 rank。</p>
+      </div>
+
+      <pre><code><span class="tok-c"># STEP 1 — 采集（本机经 task-submit 获取设备）</span>
+task-submit --device auto --run <span class="tok-s">"python &lt;case&gt;.py -p a2a3 -d 0 --enable-l2-swimlane --enable-dep-gen"</span>
+
+<span class="tok-c"># STEP 4 — 纯后处理，指向输出目录即可（自动发现所有 rank）</span>
+python tools/critical_path.py <span class="tok-p">build_output/&lt;case&gt;</span> <span class="tok-k">--stdout</span></code></pre>
+      <div class="note">
+        <span class="ic">说明</span>
+        <p>工具<strong>递归发现</strong>每一个同时包含上述三个文件的目录，一个目录对应一个
+        rank / device。因此既可指向单个 <code>dfx_outputs/rank0/d0</code>，也可指向整棵运行目录树。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 04 工具剖析 ============================ -->
+<section id="tool">
+  <div class="wrap">
+    <div class="eyebrow"><span class="num">04</span> 工具剖析 · Anatomy</div>
+    <div class="prose">
+      <h2>建图之后，两条路径刻画不同的约束</h2>
+      <p>
+        <code>build_graph</code> 为每个 rank 构建一张 <code>RankGraph</code>，完成三项工作：
+      </p>
+      <ul>
+        <li><strong>逐任务时序。</strong>同一 task 可能被拆分到多个 core-block 上并行执行，取所有分片的
+          <code>min(start)</code> 与 <code>max(end)</code>，得到该任务的 <code>start / end / dur</code>。</li>
+        <li><strong>数据依赖前驱 <code>hb_pred</code>（happens-before）。</strong>遍历 <code>deps.json</code>
+          的每条 <code>p→s</code> 边，仅当 <code>end[p] ≤ start[s] + tol</code> <em>且</em>
+          <code>start[p] &lt; start[s]</code>（严格更早开始）时保留；严格开始条件保证<strong>保留图无环</strong>（见下方引理）。</li>
+        <li><strong>同核资源前驱 <code>core_prev</code>。</strong>任务落在某核上时，该核的空闲时刻
+          决定其能否更早开始。按核对时间片排序，以<strong>运行最大 end</strong>（running-max，可正确处理流水 / 重叠分片）
+          确定其落核前该核被占用的最晚结束时刻。</li>
+      </ul>
+      <p>
+        基于 <code>hb_pred</code>（数据）与 <code>core_prev</code>（资源）两类前驱，工具计算出两条用途不同的路径。
+        二者的区别，正是理解 static 与 observed 的关键所在。
+      </p>
+    </div>
+
+    <div class="two reveal">
+      <div class="pane static">
+        <span class="tag">A · static_cpm</span>
+        <h3>静态 CPM · 依赖受限的延迟下界</h3>
+        <p>
+          <strong>仅考虑数据依赖，并假设计算核无限。</strong>在 happens-before DAG 上执行经典的
+          最长时长加权路径算法（Critical Path Method）：拓扑排序后以 DP 求各任务的最早完成时间，回溯得最长链。
+        </p>
+        <p>
+          它给出<strong>任何调度都无法低于</strong>的延迟下界——因为链上的数据依赖无法回避。
+          CPM 越接近 makespan，表明瓶颈越在于<strong>依赖链本身</strong>；进一步加速只能通过重构依赖图（拆分、消除串行）实现。
+        </p>
+        <div class="formula">finish[v] = max(finish[p] for p in hb_pred[v]) + dur[v]</div>
+        <p class="thline">理论：无资源约束的<b>先验</b>关键路径 = DAG 最长路径，多项式 <code>O(V+E)</code> 可解。</p>
+      </div>
+      <div class="pane observed">
+        <span class="tag">B · observed_path</span>
+        <h3>观测路径 · 实际执行的归因链</h3>
+        <p>
+          <strong>从最后完成的任务反向回溯。</strong>每一步在当前任务的候选前驱
+          （数据依赖 <code>hb_pred</code> 与同核资源 <code>core_prev</code>）中，选取<strong>结束最晚、
+          对其开始约束最紧</strong>者作为主导前驱，并记录相应的停顿类别。
+        </p>
+        <p>
+          该链<strong>依据实际执行过程得出</strong>，因此<strong>可能同时包含</strong>数据等待<em>与</em>资源串行化
+          （不同于 static CPM 仅沿数据依赖边；具体包含哪些取决于 workload），且其各段能对整个 makespan <strong>精确切分覆盖</strong>。
+        </p>
+        <div class="formula">cand = hb_pred ∪ core_prev → 取 end 最大者 → {data-wait | core-wait | front-gap}</div>
+        <p class="thline">理论：有资源约束调度的<b>后验</b>关键路径；主动求解即 <b>RCPSP（强 NP-hard）</b>，此处不求解，而是从已实现调度回溯重建。</p>
+      </div>
+    </div>
+
+    <h3 class="prose" style="margin-top:2.2em">理论保证</h3>
+    <div class="thmgrid reveal">
+      <div class="thm gold">
+        <div class="h">引理 · 保留图无环</div>
+        <div class="c">保留边 <code>p→s</code> 要求 <code>start(p) &lt; start(s)</code>。</div>
+        <div class="pf"><b>证.</b> 若存在环 v₁→…→v_k→v₁，则 start(v₁) &lt; … &lt; start(v₁)，矛盾 ⇒ 保留图无环，拓扑序存在，DP 与反向回溯均良定义。</div>
+      </div>
+      <div class="thm">
+        <div class="h">定理 · 静态 CPM 精确且多项式</div>
+        <div class="c">拓扑序上一遍 <code>EF</code>-DP 即得精确最长加权路径，<code>O(V+E)</code>。</div>
+        <div class="pf"><b>要点.</b> 拓扑序保证求 EF(v) 时其所有前驱已算完；DAG 的无环性把一般图 NP-hard 的最长路径降为线性可解。</div>
+      </div>
+      <div class="thm">
+        <div class="h">定理 · 精确铺分 tiling</div>
+        <div class="c">沿 observed 路径，Σ(gapᵢ + effᵢ) = t₁ − t₀ = makespan。</div>
+        <div class="pf"><b>证.</b> 每步 gapᵢ + effᵢ 恰把 frontier 从前值推进到 max(frontier, eᵢ)；望远镜求和得 frontier 末 − frontier 初 = t₁ − t₀。故 compute + stall 恒等于 makespan（<code>tiling check</code> 必为 <code>exact</code>）。</div>
+      </div>
+      <div class="thm">
+        <div class="h">复杂度</div>
+        <div class="c">总体 <code>≈ O(N log N)</code>，纯后处理、不占设备。</div>
+        <div class="pf">主导项为每核时间片排序 <code>O(R log R)</code>；建图、拓扑排序、两次 DP / 回溯均为 <code>O(V+E)</code>。R 为分片数，可略大于任务数 N。</div>
+      </div>
+    </div>
+
+    <div class="prose">
+      <h3>三类停顿的定义</h3>
+      <p>observed 路径上的每一段停顿均被归类，此即报告中 <code>stall kind</code> 的来源：</p>
+      <ul>
+        <li><span class="tterm t-data">data-wait</span>——受阻于上游生产者，即<strong>等待数据</strong>。</li>
+        <li><span class="tterm t-core">core-wait</span>——受阻于计算核被占用，即<strong>资源串行化</strong>（数据已就绪，但无空闲核可用）。</li>
+        <li><span class="tterm t-front">front-gap</span>——回溯至无任何前驱的链首，即首个任务之前的<strong>启动 / 派发延迟</strong>。</li>
+      </ul>
+    </div>
+
+    <h3 class="prose" style="margin-top:2.4em">同一数据下两条路径的对比</h3>
+    <figure class="reveal" style="max-width:none">
+      <div class="figframe">
+        <div class="head">
+          <span class="t">static vs observed · 同一 workload</span>
+          <span class="s">两条时间轴采用同一比例尺，直接对比 84 µs 与 100 µs</span>
+        </div>
+        <div class="figbody">
+          <div class="scroll"><svg id="compare" role="img" aria-label="静态CPM与观测路径的时间轴对比"></svg></div>
+        </div>
+      </div>
+      <figcaption>
+        <b>static CPM</b> 为纯数据链 <code>qkv→qk→softmax→pv→out_proj</code>，在无限核下顺序排布、无空隙 = <b>84 µs</b>
+        的延迟下界。<b>observed</b> 为实际的 100 µs：它<b>不含 softmax</b>（softmax 提前完成，未阻塞后继），
+        却<b>多出 ff</b>——因为 ff 实际占用了 <code>pv</code> 所需的计算核，经由 <span class="tterm t-core">core-wait</span>
+        推迟了 pv 的开始。两者相差的 <b>16 µs</b>，即数据下界之外的调度与资源开销。
+      </figcaption>
+    </figure>
+
+    <h3 class="prose" style="margin-top:2.4em">observed 路径对 makespan 的精确切分</h3>
+    <div class="prose">
+      <p>
+        沿 observed 路径执行一次<strong>前沿扫描（frontier sweep）</strong>：维护一个已覆盖到的时间点
+        <code>frontier</code>。对路径上每个任务 <code>[s, e]</code>，
+        <code>s</code> 之前的空档计为 <span class="tterm t-data">stall</span>，
+        该任务未与前段重叠的净时长计为 <span class="tterm t-compute">compute</span>，随后将 <code>frontier</code> 前推至 <code>e</code>。
+        由于该链连续，各段的 <code>compute + stall</code> 之和<strong>恰好等于 makespan</strong>——
+        报告中的 <code>tiling check</code> 即用于校验此等式（结果应为 <code>exact</code>）。
+      </p>
+    </div>
+    <figure class="reveal" style="max-width:none">
+      <div class="figframe">
+        <div class="head">
+          <span class="t">frontier sweep · makespan = compute + stall</span>
+          <span class="s">滚动至视图内自动演示；悬停可查看各段归属</span>
+        </div>
+        <div class="figbody">
+          <div class="scroll"><svg id="tiling" role="img" aria-label="observed路径切分为compute与stall并精确铺满makespan"></svg></div>
+          <div class="legend" style="margin-top:14px">
+            <span class="it"><span class="sw" style="background:var(--compute)"></span>compute</span>
+            <span class="it"><span class="sw" style="background:var(--data-wait)"></span>data-wait</span>
+            <span class="it"><span class="sw" style="background:var(--core-wait)"></span>core-wait</span>
+            <span class="it"><span class="sw" style="background:var(--front-gap)"></span>front-gap</span>
+          </div>
+        </div>
+      </div>
+      <figcaption id="tiling-cap">
+        makespan 100 µs ＝ compute <b>92 µs（92%）</b> ＋ stall <b>8 µs（8%）</b>；其中 data-wait 6 µs、core-wait 2 µs。
+        注意 <code>ff</code> 的 14 µs 全部计入 <b>compute</b>：该时段计算核在执行真实任务，而非空闲等待，故其虽推迟了 pv，却不计为 stall。
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ============================ 05 读懂产物 ============================ -->
+<section id="report">
+  <div class="wrap">
+    <div class="eyebrow"><span class="num">05</span> 产物解读 · The report</div>
+    <div class="prose">
+      <h2><code>critical_path_report.md</code> 的结构与解读</h2>
+      <p>
+        工具在被分析目录下生成 <code>critical_path_report.md</code>，每个 rank 一节，包含三个部分：
+        <strong>概览</strong>、<strong>按 kernel family 汇总</strong>与<strong>逐任务清单</strong>。
+        下方为上文示例对应的报告（数值与前述各图一致）：
+      </p>
+    </div>
+
+    <figure class="reveal" style="max-width:none">
+      <div class="report">
+        <div class="rhead"><span class="fn">critical_path_report.md</span> · rank <span style="color:var(--code-ink)">dfx_outputs/rank0/d0</span></div>
+        <div class="rbody"><pre><code><span class="h1"># Critical-path report (L2 swimlane)</span>
+
+<span class="rline">## Rank `dfx_outputs/rank0/d0`</span>
+<span class="rline">- tasks: <span class="num">8</span> | happens-before edges: <span class="num">6</span></span>
+<span class="rline">- <span class="lbl">makespan</span>: <span class="num">0.100</span> ms</span>                              <span class="anno">← 本次运行墙钟总跨度（分母）</span>
+<span class="rline">- <span class="lbl">static CPM path</span>: <span class="num">0.084</span> ms (<span class="num">84.0%</span> of makespan) over <span class="num">5</span> tasks</span>  <span class="anno">← 依赖下界：无限核亦无法低于 84µs</span>
+<span class="rline">- <span class="lbl">observed critical path</span>: <span class="num">5</span> tasks</span>
+<span class="rline">  - compute: <span class="num">0.092</span> ms (<span class="num">92.0%</span>)</span>                     <span class="anno">← 有效计算</span>
+<span class="rline">  - stall (runtime scheduling): <span class="num">0.008</span> ms (<span class="num">8.0%</span>)</span>        <span class="anno">← 等待</span>
+<span class="rline">    - <span class="kind-d">data-wait</span>: <span class="num">0.006</span> ms (<span class="num">6.0%</span>)</span>
+<span class="rline">    - <span class="kind-c">core-wait</span>: <span class="num">0.002</span> ms (<span class="num">2.0%</span>)</span>
+<span class="rline">  - tiling check: compute+stall = 5000 ticks vs makespan 5000 ticks (<span class="ok">exact</span>)</span>  <span class="anno">← 切分覆盖校验</span>
+
+<span class="rline">### Time on the observed critical path, by kernel family</span>
+<span class="rline">| kernel family | compute ms | % makespan | stall ms | # on path |</span>
+<span class="rline">| qkv       | <span class="num">0.020</span> | <span class="num">20.0%</span> | 0.000 | 1 |</span>
+<span class="rline">| pv        | <span class="num">0.020</span> | <span class="num">20.0%</span> | <span class="kind-c">0.002</span> | 1 |</span>
+<span class="rline">| out_proj  | <span class="num">0.020</span> | <span class="num">20.0%</span> | <span class="kind-d">0.002</span> | 1 |</span>
+<span class="rline">| qk        | <span class="num">0.018</span> | <span class="num">18.0%</span> | <span class="kind-d">0.004</span> | 1 |</span>
+<span class="rline">| ff        | <span class="num">0.014</span> | <span class="num">14.0%</span> | 0.000 | 1 |</span>
+
+<span class="rline">### Observed critical path — all 5 tasks</span>
+<span class="rline">| # | kernel   | task µs | compute µs (%mk) | stall µs (%mk) | stall kind |</span>
+<span class="rline">| 0 | qkv      |  20.0 | 20.0 (20.00%) |  0.0 (0.00%) |           |</span>
+<span class="rline">| 1 | qk       |  18.0 | 18.0 (18.00%) |  4.0 (4.00%) | <span class="kind-d">data-wait</span> |</span>
+<span class="rline">| 2 | ff       |  14.0 | 14.0 (14.00%) |  0.0 (0.00%) |           |</span>
+<span class="rline">| 3 | pv       |  20.0 | 20.0 (20.00%) |  2.0 (2.00%) | <span class="kind-c">core-wait</span> |</span>
+<span class="rline">| 4 | out_proj |  20.0 | 20.0 (20.00%) |  2.0 (2.00%) | <span class="kind-d">data-wait</span> |</span></code></pre></div>
+      </div>
+      <figcaption>
+        <b>kernel family</b> 由 <code>_family()</code> 将 <code>gate_0_aic</code>、<code>hc_pre_fused_3_aic</code>
+        一类名称去除尾部 block 序号与 <code>_aic/_aiv</code> 后缀，归并为族名（<code>gate</code>、<code>hc_pre_fused</code>），
+        以便识别关键路径上开销最高的算子族。<code>--top</code> 控制该表的行数。
+      </figcaption>
+    </figure>
+
+    <div class="prose">
+      <h3>报告解读要点</h3>
+      <ul>
+        <li><strong>首先关注 stall%。</strong>较低（如本例 8%）表明算力受限、调度良好，进一步加速须从算子实现入手；
+          较高则须进一步区分为 <span class="tterm t-data">data-wait</span> 或 <span class="tterm t-core">core-wait</span>。</li>
+        <li><strong>其次关注 static CPM% 与 makespan 的差距。</strong>二者接近表明依赖链即瓶颈，加核无益，应重构依赖图；
+          差距较大（CPM ≪ makespan）表明并行度未被充分利用，问题在于调度 / 资源。</li>
+        <li><strong>再逐行查看 family 表。</strong>关键路径上开销最高的若干算子族，即为收益最高的优化目标。</li>
+        <li><strong>务必确认 <code>tiling check = exact</code>。</strong>该项确保 compute 与 stall 的切分完整无遗漏。</li>
+      </ul>
+
+      <h3>参数速查</h3>
+      <div class="glo" style="margin-bottom:22px">
+        <div class="row"><div class="term">build_dir</div><div class="def">位置参数：待分析目录，或任意含 <code>l2_swimlane_records.json</code> 的目录 / 文件。</div></div>
+        <div class="row"><div class="term">--report</div><div class="def">报告文件名，写在 <code>build_dir</code> 下（默认 <code>critical_path_report.md</code>）。</div></div>
+        <div class="row"><div class="term">--top</div><div class="def">kernel-family 表格行数（默认 25）。</div></div>
+        <div class="row"><div class="term">--tol</div><div class="def">判定「先于…完成」的 tick 容差（默认 2），用于吸收 tick 级并列。</div></div>
+        <div class="row"><div class="term">--stdout</div><div class="def">额外把<b>整份 Markdown 报告</b>回显到 stdout。注意：每 rank 一行的摘要<b>无论是否加此参数都会打印</b>。</div></div>
+      </div>
+
+      <pre><code><span class="tok-c"># 分析一次 --enable-l2-swimlane 运行的输出目录</span>
+python tools/critical_path.py <span class="tok-p">&lt;run-dir&gt;</span> \
+    <span class="tok-k">--report</span> critical_path_report.md \  <span class="tok-c"># 报告文件名</span>
+    <span class="tok-k">--top</span> 25 \                          <span class="tok-c"># family 表行数</span>
+    <span class="tok-k">--tol</span> 2 \                            <span class="tok-c"># “已完成”判定容差</span>
+    <span class="tok-k">--stdout</span>                            <span class="tok-c"># 额外回显整份报告（每 rank 摘要始终打印）</span></code></pre>
+    </div>
+
+    <h3 class="prose">名词表</h3>
+    <div class="glo reveal">
+      <div class="row"><div class="term">makespan</div><div class="def">本次运行的墙钟总跨度 = <code>max(end) − min(start)</code>。全文百分比的分母。</div></div>
+      <div class="row"><div class="term">static CPM</div><div class="def">仅考虑数据依赖、假设无限核时的最长加权路径——依赖受限的延迟下界。</div></div>
+      <div class="row"><div class="term">observed</div><div class="def">从最后完成的任务反向回溯得到的实际归因链；含数据等待与资源串行化，其切分精确覆盖 makespan。</div></div>
+      <div class="row"><div class="term">hb_pred</div><div class="def">happens-before 前驱：时间前向的数据依赖边（生产者→消费者）。</div></div>
+      <div class="row"><div class="term">core_prev</div><div class="def">同核资源前驱：某任务落核前，该核被占用的最晚结束者。</div></div>
+      <div class="row"><div class="term">data-wait / core-wait / front-gap</div><div class="def">三类停顿：等待上游数据 / 等待计算核空闲 / 首个任务前的启动派发延迟。</div></div>
+      <div class="row"><div class="term">tick → µs</div><div class="def">设备时钟周期换算：<code>ticks / clock_freq_hz × 1e6</code>（a2a3 为 50 MHz，a5 为 1 GHz）。</div></div>
+      <div class="row"><div class="term">rank</div><div class="def">一个含三件套（records + deps + name_map）的目录，对应一个 device；工具自动递归发现全部 rank。</div></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span class="mono">critical_path.py · L2-swimlane 关键路径分析</span>
+    <span class="mono">纯后处理 · O(N log N) · 不占设备</span>
+    <span class="mono">tools/critical_path.md · tools/README.md</span>
+  </div>
+</footer>
+
+<!-- ==================================================================== -->
+<script>
+(function () {
+  "use strict";
+  var RM = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------- theme toggle ---------- */
+  var btn = document.getElementById("themeBtn");
+  btn.addEventListener("click", function () {
+    var root = document.documentElement;
+    var cur = root.getAttribute("data-theme");
+    if (!cur) {
+      cur = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    root.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+    // redraw svg diagrams so color-mix-derived fills update where needed
+    setTimeout(drawAll, 0);
+  });
+
+  /* ---------- shared worked-example dataset (µs) ---------- */
+  var MK = 100; // makespan
+  var TASKS = {
+    T0: { nm: "qkv",      lane: "A", s: 0,  e: 20 },
+    T1: { nm: "qk",       lane: "A", s: 24, e: 42 },
+    M:  { nm: "ff",       lane: "A", s: 42, e: 56 },
+    T2: { nm: "softmax",  lane: "B", s: 44, e: 50 },
+    T3: { nm: "pv",       lane: "A", s: 58, e: 78 },
+    T4: { nm: "out_proj", lane: "B", s: 80, e: 100 },
+    N0: { nm: "norm",     lane: "B", s: 2,  e: 16, off: true },
+    G0: { nm: "gate",     lane: "B", s: 18, e: 40, off: true }
+  };
+  // observed critical path (as-executed blame chain) with gap kinds
+  var OBS = [
+    { id: "T0", kind: "front-gap" },
+    { id: "T1", kind: "data-wait" },
+    { id: "M",  kind: "core-wait" },
+    { id: "T3", kind: "core-wait" },
+    { id: "T4", kind: "data-wait" }
+  ];
+  var CRIT = { T0: 1, T1: 1, M: 1, T3: 1, T4: 1 };
+  var LANES = ["A", "B"];
+
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function el(name, attrs, txt) {
+    var n = document.createElementNS(SVGNS, name);
+    if (attrs) for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (txt != null) n.textContent = txt;
+    return n;
+  }
+
+  /* ---------- tooltip ---------- */
+  var tip = document.getElementById("tip");
+  function showTip(html, x, y) {
+    tip.innerHTML = html; tip.style.left = x + "px"; tip.style.top = y + "px"; tip.style.opacity = "1";
+  }
+  function hideTip() { tip.style.opacity = "0"; }
+  function bindTip(node, html) {
+    node.addEventListener("mousemove", function (ev) { showTip(html, ev.clientX, ev.clientY); });
+    node.addEventListener("mouseleave", hideTip);
+  }
+
+  /* ============================ Swimlane ============================ */
+  function drawConcept() {
+    var svg = document.getElementById("concept"); if (!svg) return;
+    svg.textContent = "";
+    var W = 900, H = 300, NW = 64, NH = 34;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W); svg.setAttribute("height", H); svg.style.minWidth = "660px";
+    var CN = {
+      A: { d: 2, nx: 20,  ny: 140, crit: 1 },
+      B: { d: 3, nx: 135, ny: 92,  crit: 1 },
+      C: { d: 4, nx: 250, ny: 92,  crit: 1 },
+      D: { d: 2, nx: 135, ny: 188, crit: 0 },
+      E: { d: 2, nx: 360, ny: 140, crit: 1 }
+    };
+    var CE = [["A", "B", 1], ["B", "C", 1], ["C", "E", 1], ["A", "D", 0], ["D", "E", 0]];
+    var SCH = { A: [0, 2], B: [2, 5], C: [5, 9], D: [2, 4], E: [9, 11] };
+    var MK = 11;
+
+    svg.appendChild(el("text", { x: 20, y: 30, class: "panel-t" }, "依赖网络 — 最长链即关键路径"));
+    svg.appendChild(el("text", { x: 486, y: 30, class: "panel-t" }, "执行时间线 — 关键链填满 makespan"));
+    svg.appendChild(el("line", { x1: 446, y1: 44, x2: 446, y2: H - 26, class: "cc-div" }));
+
+    CE.forEach(function (e) {
+      var a = { x: CN[e[0]].nx + NW, y: CN[e[0]].ny }, b = { x: CN[e[1]].nx, y: CN[e[1]].ny };
+      var mx = (a.x + b.x) / 2;
+      svg.appendChild(el("path", { d: "M" + a.x + " " + a.y + " C" + mx + " " + a.y + " " + mx + " " + b.y + " " + (b.x - 7) + " " + b.y, class: "cc-edge" + (e[2] ? " crit" : "") }));
+      svg.appendChild(el("path", { d: "M" + b.x + " " + b.y + " l-8 -4 l0 8 z", class: "cc-ah" + (e[2] ? " crit" : "") }));
+    });
+    Object.keys(CN).forEach(function (id) {
+      var n = CN[id];
+      var g = el("g", { class: "cc-node" + (n.crit ? " crit" : "") });
+      g.appendChild(el("rect", { x: n.nx, y: n.ny - NH / 2, width: NW, height: NH, rx: 8 }));
+      g.appendChild(el("text", { x: n.nx + NW / 2, y: n.ny - 2, "text-anchor": "middle", class: "cc-nm" }, id));
+      g.appendChild(el("text", { x: n.nx + NW / 2, y: n.ny + 12, "text-anchor": "middle", class: "cc-du" }, "d=" + n.d));
+      bindTip(g, "<b>" + id + "</b> · d=" + n.d + (n.crit ? "<br>on 关键路径（无余量）" : "<br><span style='color:#8a93a4'>off path · slack 5</span>"));
+      svg.appendChild(g);
+    });
+    svg.appendChild(el("text", { x: 20, y: H - 10, class: "cc-cap gold" }, "关键路径 A→B→C→E = 2+3+4+2 = 11"));
+
+    var x0 = 486, PXU = 34;
+    var sx = function (t) { return x0 + t * PXU; };
+    var rowY = { A: 66, B: 98, C: 130, D: 162, E: 194 };
+    for (var t = 0; t <= MK; t++) {
+      if (t % 2 === 0 || t === MK) {
+        svg.appendChild(el("line", { x1: sx(t), y1: 52, x2: sx(t), y2: 214, class: "cc-grid" }));
+        svg.appendChild(el("text", { x: sx(t), y: 228, "text-anchor": "middle", class: "cc-tick" }, t));
+      }
+    }
+    svg.appendChild(el("rect", { x: sx(4), y: rowY.D - 9, width: (9 - 4) * PXU, height: 18, rx: 3, class: "cc-slack" }));
+    svg.appendChild(el("text", { x: (sx(4) + sx(9)) / 2, y: rowY.D + 4, "text-anchor": "middle", class: "cc-slacktx" }, "slack 5"));
+    Object.keys(SCH).forEach(function (id) {
+      var s = SCH[id], n = CN[id];
+      var bx = sx(s[0]), bw = (s[1] - s[0]) * PXU;
+      var g = el("g", { class: "cc-bar" + (n.crit ? " crit" : "") });
+      g.appendChild(el("rect", { x: bx, y: rowY[id] - 11, width: bw, height: 22, rx: 4 }));
+      g.appendChild(el("text", { x: bx + bw / 2, y: rowY[id] + 4, "text-anchor": "middle" }, id));
+      bindTip(g, "<b>" + id + "</b> · [" + s[0] + ", " + s[1] + "]" + (n.crit ? " · 关键（无余量）" : "<br>可浮动至 9 · slack 5"));
+      svg.appendChild(g);
+    });
+    svg.appendChild(el("line", { x1: sx(0), y1: 212, x2: sx(MK), y2: 212, class: "cc-mk" }));
+    svg.appendChild(el("text", { x: (sx(0) + sx(MK)) / 2, y: H - 10, "text-anchor": "middle", class: "cc-cap gold" }, "makespan = 11 = 关键路径长度"));
+  }
+
+  function drawSwim() {
+    var svg = document.getElementById("hero-swim");
+    if (!svg) return;
+    svg.textContent = "";
+    var padL = 66, padR = 22, padT = 30, padB = 22, LH = 50, GAP = 14, PXU = 8.8;
+    var chartW = MK * PXU;
+    var W = padL + chartW + padR;
+    var H = padT + LANES.length * LH + (LANES.length - 1) * GAP + padB;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W); svg.setAttribute("height", H); svg.style.minWidth = Math.round(W) + "px";
+    var sx = function (t) { return padL + t * PXU; };
+    var laneY = function (l) { var i = LANES.indexOf(l); return padT + i * (LH + GAP); };
+
+    // lane backgrounds + labels
+    LANES.forEach(function (l) {
+      svg.appendChild(el("rect", { x: padL, y: laneY(l), width: chartW, height: LH, rx: 7, class: "lane-bg" }));
+      svg.appendChild(el("text", { x: 10, y: laneY(l) + LH / 2 - 2, class: "lane-label" }, "Core " + l));
+      svg.appendChild(el("text", { x: 10, y: laneY(l) + LH / 2 + 12, class: "lane-sub" }, l === "A" ? "AIC" : "AIV"));
+    });
+    // time grid + axis
+    for (var t = 0; t <= MK; t += 20) {
+      svg.appendChild(el("line", { x1: sx(t), y1: padT - 6, x2: sx(t), y2: H - padB, class: "grid-line" }));
+      svg.appendChild(el("text", { x: sx(t), y: padT - 12, "text-anchor": "middle", class: "axis-tick" }, t + "µs"));
+    }
+
+    // bars
+    Object.keys(TASKS).forEach(function (id) {
+      var d = TASKS[id]; var isC = CRIT[id];
+      var g = el("g", { class: "bar " + (isC ? "bar-crit" : "bar-idle") });
+      var x = sx(d.s), w = Math.max(2, (d.e - d.s) * PXU), y = laneY(d.lane) + 10, h = LH - 20;
+      g.appendChild(el("rect", { x: x, y: y, width: w, height: h, rx: 5 }));
+      if (w > 22) {
+        var lbl = el("text", { x: x + w / 2, y: isC ? y + 12 : y + h / 2 + 4, "text-anchor": "middle" }, d.nm);
+        if (d.nm.length * 6.6 > w - 6) { lbl.setAttribute("textLength", Math.max(10, w - 8)); lbl.setAttribute("lengthAdjust", "spacingAndGlyphs"); }
+        g.appendChild(lbl);
+      }
+      var oi = OBS.filter(function (o) { return o.id === id; })[0];
+      var kindTxt = oi ? "<br>on path · gap: <b>" + oi.kind + "</b>" : "<br><span style='color:#8a93a4'>off path (has slack)</span>";
+      bindTip(g, "<b>" + d.nm + "</b> · Core " + d.lane + "<br>[" + d.s + ", " + d.e + "] µs · dur " + (d.e - d.s) + "µs" + kindTxt);
+      svg.appendChild(g);
+    });
+
+    // observed critical-path thread
+    var pts = OBS.map(function (o) {
+      var d = TASKS[o.id];
+      return { x: sx((d.s + d.e) / 2), y: laneY(d.lane) + LH / 2 + 7 };
+    });
+    var dstr = pts.map(function (p, i) { return (i ? "L" : "M") + p.x.toFixed(1) + " " + p.y.toFixed(1); }).join(" ");
+    var under = el("path", { d: dstr, class: "thread-under" });
+    var thread = el("path", { d: dstr, class: "thread" });
+    svg.appendChild(under); svg.appendChild(thread);
+    pts.forEach(function (p) { svg.appendChild(el("circle", { cx: p.x, cy: p.y, r: 3, class: "thread-node" })); });
+
+    // draw-on animation
+    if (!RM && thread.getTotalLength) {
+      var len = thread.getTotalLength() || 1;
+      thread.style.strokeDasharray = len; thread.style.strokeDashoffset = len;
+      under.style.strokeDasharray = len; under.style.strokeDashoffset = len;
+      onReveal(svg, function () {
+        // Commit the hidden state (offset = len) with a forced reflow, then flip
+        // to offset = 0 on a later frame. Without this, when drawAll() runs after
+        // the DOM is already parsed the observer fires before first paint and the
+        // browser coalesces both styles, skipping the transition entirely.
+        void thread.getBoundingClientRect();
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () {
+            thread.style.transition = under.style.transition = "stroke-dashoffset 1.4s ease";
+            thread.style.strokeDashoffset = under.style.strokeDashoffset = "0";
+          });
+        });
+      });
+    }
+  }
+
+  /* ============================ DAG ============================ */
+  var DAG_NODES = {
+    T0: { nm: "qkv", du: 20, col: 0, row: 1 },
+    T1: { nm: "qk", du: 18, col: 1, row: 0 },
+    M:  { nm: "ff", du: 14, col: 1, row: 2 },
+    T2: { nm: "softmax", du: 6, col: 2, row: 0 },
+    T3: { nm: "pv", du: 20, col: 3, row: 1 },
+    T4: { nm: "out_proj", du: 20, col: 4, row: 1 }
+  };
+  var DAG_EDGES = [
+    ["T0", "T1", 1], ["T0", "M", 0], ["T1", "T2", 1],
+    ["T2", "T3", 1], ["M", "T4", 0], ["T3", "T4", 1]
+  ];
+  function drawDAG() {
+    var svg = document.getElementById("dag"); if (!svg) return;
+    svg.textContent = "";
+    var padL = 24, padT = 26, COLW = 168, ROWH = 74, NW = 118, NH = 46;
+    var maxCol = 4, maxRow = 2;
+    var W = padL * 2 + maxCol * COLW + NW;
+    var H = padT * 2 + maxRow * ROWH + NH;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W); svg.setAttribute("height", H); svg.style.minWidth = Math.round(W) + "px";
+    var cx = function (c) { return padL + c * COLW; };
+    var cy = function (r) { return padT + r * ROWH; };
+    var nodeC = function (id) { var n = DAG_NODES[id]; return { x: cx(n.col) + NW / 2, y: cy(n.row) + NH / 2 }; };
+
+    // edges (draw first)
+    DAG_EDGES.forEach(function (e) {
+      var a = { x: cx(DAG_NODES[e[0]].col) + NW, y: cy(DAG_NODES[e[0]].row) + NH / 2 };
+      var b = { x: cx(DAG_NODES[e[1]].col), y: cy(DAG_NODES[e[1]].row) + NH / 2 };
+      var mx = (a.x + b.x) / 2;
+      var d = "M" + a.x + " " + a.y + " C" + mx + " " + a.y + " " + mx + " " + b.y + " " + (b.x - 7) + " " + b.y;
+      svg.appendChild(el("path", { d: d, class: "dag-edge" + (e[2] ? " cpm" : "") }));
+      // arrowhead
+      var ah = el("path", { d: "M" + b.x + " " + b.y + " l-8 -4 l0 8 z", class: "arrow-h" + (e[2] ? " cpm" : "") });
+      svg.appendChild(ah);
+    });
+    // nodes
+    Object.keys(DAG_NODES).forEach(function (id) {
+      var n = DAG_NODES[id];
+      var isCpm = (id !== "M"); // CPM path excludes ff
+      var g = el("g", { class: "dag-node" + (isCpm ? " cpm" : "") });
+      g.appendChild(el("rect", { x: cx(n.col), y: cy(n.row), width: NW, height: NH, rx: 9 }));
+      g.appendChild(el("text", { x: cx(n.col) + NW / 2, y: cy(n.row) + 20, "text-anchor": "middle", class: "nm" }, n.nm));
+      g.appendChild(el("text", { x: cx(n.col) + NW / 2, y: cy(n.row) + 35, "text-anchor": "middle", class: "du" }, n.du + " µs"));
+      svg.appendChild(g);
+    });
+  }
+
+  /* ============================ Static vs Observed compare ============================ */
+  function drawCompare() {
+    var svg = document.getElementById("compare"); if (!svg) return;
+    svg.textContent = "";
+    var padL = 92, padR = 40, padT = 20, PXU = 6.4, ROWH = 46, GAP = 26;
+    var chartW = MK * PXU;
+    var W = padL + chartW + padR;
+    var H = padT + 2 * ROWH + GAP + 46;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W); svg.setAttribute("height", H); svg.style.minWidth = Math.round(W) + "px";
+    var sx = function (t) { return padL + t * PXU; };
+
+    // gridlines at 0,20,...100 + the 84 floor
+    for (var t = 0; t <= MK; t += 20) {
+      svg.appendChild(el("line", { x1: sx(t), y1: padT, x2: sx(t), y2: padT + 2 * ROWH + GAP, class: "grid-line" }));
+      svg.appendChild(el("text", { x: sx(t), y: H - 10, "text-anchor": "middle", class: "axis-tick" }, t + "µs"));
+    }
+
+    // Row 1: STATIC — data chain packed back-to-back (unlimited cores) = 84
+    var staticChain = [["qkv", 20], ["qk", 18], ["softmax", 6], ["pv", 20], ["out_proj", 20]];
+    var y1 = padT;
+    svg.appendChild(el("text", { x: 8, y: y1 + ROWH / 2 - 2, class: "lane-label" }, "static CPM"));
+    svg.appendChild(el("text", { x: 8, y: y1 + ROWH / 2 + 13, class: "axis-tick" }, "∞ cores"));
+    var acc = 0;
+    staticChain.forEach(function (c) {
+      var x = sx(acc), w = c[1] * PXU;
+      var g = el("g", { class: "bar bar-crit" });
+      g.appendChild(el("rect", { x: x, y: y1 + 8, width: w - 2, height: ROWH - 16, rx: 5 }));
+      if (w > 26) g.appendChild(el("text", { x: x + w / 2, y: y1 + ROWH / 2 + 4, "text-anchor": "middle" }, c[0]));
+      bindTip(g, "<b>" + c[0] + "</b> · " + c[1] + "µs<br>数据依赖链 · 无资源竞争");
+      svg.appendChild(g);
+      acc += c[1];
+    });
+    // floor marker at 84
+    svg.appendChild(el("line", { x1: sx(84), y1: y1 - 2, x2: sx(84), y2: y1 + 2 * ROWH + GAP, stroke: "var(--path)", "stroke-width": 1.5, "stroke-dasharray": "4 3" }));
+    svg.appendChild(el("text", { x: sx(84) - 4, y: y1 - 6, "text-anchor": "end", class: "axis-tick", fill: "var(--path)" }, "floor 84µs"));
+
+    // Row 2: OBSERVED — the real chain across time with gaps
+    var y2 = padT + ROWH + GAP;
+    svg.appendChild(el("text", { x: 8, y: y2 + ROWH / 2 - 2, class: "lane-label" }, "observed"));
+    svg.appendChild(el("text", { x: 8, y: y2 + ROWH / 2 + 13, class: "axis-tick" }, "as-run"));
+    OBS.forEach(function (o) {
+      var d = TASKS[o.id];
+      var x = sx(d.s), w = (d.e - d.s) * PXU;
+      var g = el("g", { class: "bar bar-crit" });
+      g.appendChild(el("rect", { x: x, y: y2 + 8, width: Math.max(2, w - 2), height: ROWH - 16, rx: 5 }));
+      if (w > 26) g.appendChild(el("text", { x: x + w / 2, y: y2 + ROWH / 2 + 4, "text-anchor": "middle" }, d.nm));
+      bindTip(g, "<b>" + d.nm + "</b> · [" + d.s + ", " + d.e + "]µs<br>gap: <b>" + o.kind + "</b>");
+      svg.appendChild(g);
+    });
+    // makespan marker at 100
+    svg.appendChild(el("text", { x: sx(100) + 4, y: y2 - 6, "text-anchor": "start", class: "axis-tick", fill: "var(--brand)" }, "makespan 100µs"));
+  }
+
+  /* ============================ Tiling (frontier sweep) ============================ */
+  function computeTiling() {
+    var frontier = 0, segs = [];
+    OBS.forEach(function (o) {
+      var d = TASKS[o.id];
+      var gap = Math.max(0, d.s - frontier);
+      var eff = Math.max(0, d.e - Math.max(d.s, frontier));
+      if (gap > 0) segs.push({ w: gap, kind: o.kind, label: "" });
+      segs.push({ w: eff, kind: "compute", label: d.nm });
+      frontier = Math.max(frontier, d.e);
+    });
+    return segs;
+  }
+  function drawTiling() {
+    var svg = document.getElementById("tiling"); if (!svg) return;
+    svg.textContent = "";
+    var padL = 12, padR = 12, padT = 24, PXU = 8.4, BH = 58;
+    var chartW = MK * PXU;
+    var W = padL + chartW + padR;
+    var H = padT + BH + 40;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W); svg.setAttribute("height", H); svg.style.minWidth = Math.round(W) + "px";
+    var sx = function (t) { return padL + t * PXU; };
+
+    for (var t = 0; t <= MK; t += 10) {
+      svg.appendChild(el("text", { x: sx(t), y: H - 12, "text-anchor": "middle", class: "axis-tick" }, t));
+    }
+    svg.appendChild(el("text", { x: sx(0), y: padT - 8, class: "axis-tick" }, "t0"));
+    svg.appendChild(el("text", { x: sx(MK), y: padT - 8, "text-anchor": "end", class: "axis-tick" }, "makespan = " + MK + "µs"));
+
+    var segs = computeTiling();
+    var acc = 0, order = 0;
+    segs.forEach(function (s) {
+      var x = sx(acc), w = s.w * PXU;
+      var cls = "seg seg-" + s.kind;
+      var g = el("g", { class: cls });
+      var r = el("rect", { x: x, y: padT, width: Math.max(0.5, w), height: BH, rx: 3 });
+      g.appendChild(r);
+      if (w > 24 && s.kind === "compute") g.appendChild(el("text", { x: x + w / 2, y: padT + BH / 2 + 4, "text-anchor": "middle", class: "seg-label" }, s.label));
+      bindTip(g, (s.kind === "compute" ? "<b>compute</b> · " + s.label : "<b>" + s.kind + "</b> stall") + "<br>" + s.w.toFixed(0) + "µs");
+      // reveal animation: start collapsed
+      if (!RM) { r.style.opacity = "0"; g.dataset.order = order++; }
+      svg.appendChild(g);
+      acc += s.w;
+    });
+
+    if (!RM) {
+      onReveal(svg, function () {
+        var gs = svg.querySelectorAll(".seg");
+        gs.forEach(function (g, i) {
+          setTimeout(function () {
+            var r = g.querySelector("rect"); if (r) { r.style.transition = "opacity .35s ease"; r.style.opacity = "1"; }
+          }, 90 * i);
+        });
+      });
+    }
+  }
+
+  /* ============================ Decomposition bars (why) ============================ */
+  var DCASES = [
+    { nm: "算力受限 · compute-bound", verdict: "→ 优化算子实现（更快的 kernel）",
+      bar: [["compute", 94], ["data", 4], ["core", 2]], cpm: 94, tasks: 3,
+      read: "关键路径 = 少数几个大算子；CPM≈makespan，加核也快不了" },
+    { nm: "依赖受限 · dependency-bound", verdict: "→ 缩短依赖链（融合 / 并行 / 去假依赖）",
+      bar: [["compute", 97], ["data", 3]], cpm: 96, tasks: 14,
+      read: "关键路径 = 一长串小算子（串行深度大）；CPM≈makespan" },
+    { nm: "资源受限 · resource-bound", verdict: "→ 加核 / 改调度",
+      bar: [["compute", 60], ["core", 34], ["data", 6]], cpm: 30, tasks: 2,
+      read: "依赖只要求 30%，却跑满 100%；core-wait 高 = 并行度没吃满" }
+  ];
+  function drawDecomp() {
+    var host = document.getElementById("decomp"); if (!host) return;
+    host.textContent = "";
+    DCASES.forEach(function (c) {
+      var wrap = document.createElement("div"); wrap.className = "dcase";
+      var dh = document.createElement("div"); dh.className = "dh";
+      dh.innerHTML = '<span class="nm">' + c.nm + '</span><span class="verdict">' + c.verdict + '</span>';
+      wrap.appendChild(dh);
+
+      // Row 1 — makespan (compute + stall)
+      var r1 = document.createElement("div"); r1.className = "drow";
+      r1.innerHTML = '<span class="rlab">makespan</span>';
+      var bar = document.createElement("div"); bar.className = "dbar";
+      c.bar.forEach(function (s) {
+        var seg = document.createElement("div"); seg.className = "dseg " + s[0];
+        seg.style.flexBasis = "0%"; seg.dataset.basis = s[1];
+        seg.textContent = s[1] >= 14 ? s[1] + "%" : "";
+        seg.title = s[0] + " " + s[1] + "%";
+        bar.appendChild(seg);
+      });
+      r1.appendChild(bar); wrap.appendChild(r1);
+
+      // Row 2 — static CPM dependency chain, split into its tasks
+      var r2 = document.createElement("div"); r2.className = "drow";
+      r2.innerHTML = '<span class="rlab">static CPM<br>依赖链 · ' + c.tasks + ' 个任务</span>';
+      var track = document.createElement("div"); track.className = "cpmtrack";
+      var fill = document.createElement("div"); fill.className = "cpmfill"; fill.dataset.w = c.cpm;
+      fill.title = "static CPM = " + c.cpm + "% of makespan · " + c.tasks + " tasks on the chain";
+      for (var i = 0; i < c.tasks; i++) {
+        var t = document.createElement("div"); t.className = "ctask"; fill.appendChild(t);
+      }
+      track.appendChild(fill);
+      var head = document.createElement("div"); head.className = "cpmhead";
+      head.textContent = (100 - c.cpm) >= 16 ? "可并行余量 " + (100 - c.cpm) + "%" : "";
+      track.appendChild(head);
+      r2.appendChild(track); wrap.appendChild(r2);
+
+      var rd = document.createElement("div"); rd.className = "dread"; rd.textContent = c.read;
+      wrap.appendChild(rd);
+      host.appendChild(wrap);
+    });
+    // animate on reveal
+    var animate = function () {
+      host.querySelectorAll(".dseg").forEach(function (seg) { seg.style.flexBasis = seg.dataset.basis + "%"; });
+      host.querySelectorAll(".cpmfill").forEach(function (f) { f.style.width = f.dataset.w + "%"; });
+    };
+    if (RM) animate(); else onReveal(host, animate);
+  }
+
+  /* ---------- reveal helper ---------- */
+  function onReveal(node, fn) {
+    var target = node.closest ? (node.closest("figure") || node.closest(".card") || node) : node;
+    if (!("IntersectionObserver" in window)) { fn(); return; }
+    var io = new IntersectionObserver(function (ents) {
+      ents.forEach(function (en) { if (en.isIntersecting) { fn(); io.disconnect(); } });
+    }, { threshold: 0.25 });
+    io.observe(target);
+  }
+
+  /* ---------- generic .reveal fade-in ---------- */
+  function initReveal() {
+    var items = document.querySelectorAll(".reveal");
+    if (!("IntersectionObserver" in window)) { items.forEach(function (i) { i.classList.add("in"); }); return; }
+    var io = new IntersectionObserver(function (ents) {
+      ents.forEach(function (en) { if (en.isIntersecting) { en.target.classList.add("in"); io.unobserve(en.target); } });
+    }, { threshold: 0.12 });
+    items.forEach(function (i) { io.observe(i); });
+  }
+
+  /* ---------- scrollspy ---------- */
+  function initSpy() {
+    var links = Array.prototype.slice.call(document.querySelectorAll("#nav a"));
+    var map = {}; links.forEach(function (a) { map[a.getAttribute("href").slice(1)] = a; });
+    var secs = Array.prototype.slice.call(document.querySelectorAll("section[id]"));
+    if (!("IntersectionObserver" in window)) return;
+    var io = new IntersectionObserver(function (ents) {
+      ents.forEach(function (en) {
+        if (en.isIntersecting) {
+          links.forEach(function (a) { a.classList.remove("active"); });
+          if (map[en.target.id]) map[en.target.id].classList.add("active");
+        }
+      });
+    }, { rootMargin: "-45% 0px -50% 0px" });
+    secs.forEach(function (s) { io.observe(s); });
+  }
+
+  function drawAll() { drawConcept(); drawSwim(); drawDAG(); drawCompare(); drawTiling(); }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    drawAll(); drawDecomp(); initReveal(); initSpy();
+  });
+  // DOMContentLoaded may have fired already in the artifact wrapper
+  if (document.readyState !== "loading") { drawAll(); drawDecomp(); initReveal(); initSpy(); }
+})();
+</script>

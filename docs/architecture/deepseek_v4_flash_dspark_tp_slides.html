@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>TP 能力优先接入 DSpark Decode</title>
+  <style>
+    :root {
+      --bg: #06111f;
+      --panel: rgba(14, 31, 50, 0.88);
+      --panel-strong: #10263c;
+      --line: rgba(156, 184, 207, 0.22);
+      --text: #eef7ff;
+      --muted: #9cb2c6;
+      --cyan: #43d9d1;
+      --cyan-soft: rgba(67, 217, 209, 0.14);
+      --blue: #69a8ff;
+      --blue-soft: rgba(105, 168, 255, 0.14);
+      --amber: #ffbf69;
+      --amber-soft: rgba(255, 191, 105, 0.14);
+      --green: #78df9b;
+      --red: #ff7f87;
+      --shadow: 0 26px 80px rgba(0, 0, 0, 0.38);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Inter", "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      z-index: -2;
+      width: 44vw;
+      height: 44vw;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.18;
+      pointer-events: none;
+    }
+
+    body::before { top: -20vw; left: -10vw; background: #0dd5c8; }
+    body::after { right: -16vw; bottom: -20vw; background: #367eff; }
+
+    .deck {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      padding: clamp(28px, 4.6vh, 58px) clamp(34px, 5vw, 84px) clamp(56px, 7vh, 84px);
+      opacity: 0;
+      transform: translateX(22px);
+      overflow: auto;
+    }
+
+    .slide.active {
+      display: flex;
+      flex-direction: column;
+      animation: enter 360ms ease forwards;
+    }
+
+    .slide-frame {
+      display: flex;
+      flex: 1;
+      min-height: 100%;
+      width: 100%;
+      flex-direction: column;
+    }
+
+    @keyframes enter {
+      to { opacity: 1; transform: translateX(0); }
+    }
+
+    .slide::before {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      z-index: -1;
+      border: 1px solid rgba(156, 184, 207, 0.09);
+      border-radius: 28px;
+      background:
+        linear-gradient(135deg, rgba(255,255,255,0.025), transparent 42%),
+        radial-gradient(circle at 88% 14%, rgba(67,217,209,0.08), transparent 24%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      color: var(--cyan);
+      font-size: clamp(12px, 1.25vw, 17px);
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 30px;
+      height: 3px;
+      border-radius: 3px;
+      background: var(--cyan);
+      box-shadow: 0 0 18px var(--cyan);
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      max-width: 1000px;
+      margin-bottom: 18px;
+      font-size: clamp(42px, 6.4vw, 92px);
+      line-height: 1.04;
+      letter-spacing: -0.045em;
+    }
+
+    h2 {
+      margin-bottom: clamp(22px, 3.5vh, 42px);
+      font-size: clamp(31px, 4.4vw, 64px);
+      line-height: 1.1;
+      letter-spacing: -0.035em;
+    }
+
+    h3 {
+      margin-bottom: 10px;
+      font-size: clamp(18px, 2vw, 28px);
+      line-height: 1.25;
+    }
+
+    p, li, td, th {
+      font-size: clamp(14px, 1.45vw, 21px);
+      line-height: 1.55;
+    }
+
+    .lead {
+      max-width: 920px;
+      color: var(--muted);
+      font-size: clamp(20px, 2.25vw, 32px);
+      line-height: 1.45;
+    }
+
+    .accent { color: var(--cyan); }
+    .blue { color: var(--blue); }
+    .amber { color: var(--amber); }
+    .green { color: var(--green); }
+    .muted { color: var(--muted); }
+
+    code, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.9em;
+    }
+
+    code {
+      padding: 0.14em 0.42em;
+      border: 1px solid rgba(105,168,255,0.2);
+      border-radius: 7px;
+      color: #b9d7ff;
+      background: rgba(105,168,255,0.1);
+    }
+
+    .title-slide {
+      justify-content: center;
+    }
+
+    .title-slide .slide-frame { justify-content: center; }
+
+    .title-slide .hero-line {
+      width: min(650px, 64vw);
+      height: 6px;
+      margin: 20px 0 24px;
+      border-radius: 8px;
+      background: linear-gradient(90deg, var(--cyan), var(--blue), transparent);
+    }
+
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(8, 22, 37, 0.68);
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .pill::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 10px var(--cyan);
+    }
+
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+      display: grid;
+      gap: clamp(14px, 1.8vw, 24px);
+      width: 100%;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      position: relative;
+      padding: clamp(18px, 2vw, 30px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, rgba(18,42,65,0.86), rgba(9,24,40,0.86));
+      box-shadow: 0 12px 30px rgba(0,0,0,0.18);
+    }
+
+    .card.cyan { border-color: rgba(67,217,209,0.35); background: linear-gradient(145deg, var(--cyan-soft), rgba(9,24,40,0.9)); }
+    .card.blue { border-color: rgba(105,168,255,0.35); background: linear-gradient(145deg, var(--blue-soft), rgba(9,24,40,0.9)); color: var(--text); }
+    .card.amber { border-color: rgba(255,191,105,0.35); background: linear-gradient(145deg, var(--amber-soft), rgba(9,24,40,0.9)); color: var(--text); }
+
+    .card .label {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: clamp(11px, 1vw, 14px);
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .card .big {
+      color: var(--text);
+      font-size: clamp(32px, 4.5vw, 66px);
+      font-weight: 850;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+
+    .card p:last-child { margin-bottom: 0; }
+
+    .flow {
+      display: flex;
+      align-items: stretch;
+      gap: 12px;
+      width: 100%;
+      margin: auto 0;
+    }
+
+    .flow-node {
+      flex: 1;
+      display: flex;
+      min-height: 150px;
+      padding: 20px;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      text-align: center;
+      background: rgba(14, 31, 50, 0.86);
+    }
+
+    .flow-node strong {
+      font-size: clamp(21px, 2.4vw, 34px);
+      line-height: 1.2;
+    }
+
+    .flow-node span {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: clamp(13px, 1.2vw, 17px);
+      line-height: 1.4;
+    }
+
+    .arrow {
+      display: flex;
+      align-items: center;
+      color: var(--cyan);
+      font-size: clamp(24px, 3vw, 46px);
+      font-weight: 300;
+    }
+
+    .formula {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: clamp(10px, 1.5vw, 20px);
+      margin: auto 0 28px;
+      font-weight: 800;
+    }
+
+    .formula .number {
+      display: flex;
+      min-width: 150px;
+      padding: 20px 25px;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      border: 1px solid rgba(67,217,209,0.34);
+      border-radius: 18px;
+      background: var(--cyan-soft);
+      font-size: clamp(40px, 5vw, 72px);
+      line-height: 1;
+    }
+
+    .formula .number small {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: clamp(12px, 1.15vw, 17px);
+      font-weight: 600;
+    }
+
+    .formula .op {
+      color: var(--muted);
+      font-size: clamp(28px, 3.5vw, 52px);
+    }
+
+    .callout {
+      display: flex;
+      gap: 16px;
+      padding: 18px 22px;
+      border-left: 4px solid var(--cyan);
+      border-radius: 4px 16px 16px 4px;
+      color: #d8e7f5;
+      background: rgba(67,217,209,0.09);
+      font-size: clamp(16px, 1.55vw, 22px);
+      line-height: 1.5;
+    }
+
+    .callout.warning { border-left-color: var(--amber); background: var(--amber-soft); }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(8, 22, 37, 0.68);
+    }
+
+    th, td {
+      padding: clamp(11px, 1.25vw, 18px);
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--cyan);
+      background: rgba(67,217,209,0.08);
+      font-size: clamp(12px, 1.1vw, 16px);
+      letter-spacing: 0.03em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .layout-flow {
+      display: grid;
+      grid-template-columns:
+        minmax(0, 1fr) 24px minmax(0, 1fr) 24px minmax(0, 1fr)
+        24px minmax(0, 1fr) 24px minmax(0, 1fr) 24px minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      margin: auto 0;
+    }
+
+    .layout-flow .stage {
+      min-height: 108px;
+      padding: 14px 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+    }
+
+    .layout-flow .stage b { font-size: clamp(14px, 1.4vw, 20px); }
+    .layout-flow .stage small { margin-top: 7px; color: var(--muted); font-size: clamp(10px, 0.9vw, 13px); line-height: 1.35; }
+    .layout-flow .connector { color: var(--cyan); font-size: clamp(18px, 2vw, 30px); text-align: center; }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .chip {
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: #c7d7e6;
+      background: rgba(255,255,255,0.03);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: clamp(11px, 1vw, 14px);
+    }
+
+    .status-columns {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+    }
+
+    .status-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .status-list li {
+      position: relative;
+      padding: 10px 8px 10px 34px;
+      border-bottom: 1px solid rgba(156,184,207,0.12);
+    }
+
+    .status-list li:last-child { border-bottom: 0; }
+    .status-list li::before {
+      position: absolute;
+      left: 4px;
+      top: 10px;
+      font-weight: 900;
+    }
+    .done li::before { content: "✓"; color: var(--green); }
+    .todo li::before { content: "→"; color: var(--amber); }
+
+    .timeline {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 14px;
+      align-items: stretch;
+      margin: auto 0;
+    }
+
+    .milestone {
+      position: relative;
+      z-index: 1;
+      padding: 22px 17px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+    }
+
+    .milestone::after {
+      content: "";
+      position: absolute;
+      z-index: -1;
+      left: 50%;
+      top: -24px;
+      width: calc(100% + 14px);
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), rgba(67,217,209,0.18));
+    }
+
+    .milestone:first-child::after { left: 50%; width: 50%; }
+    .milestone .pr { color: var(--cyan); font-size: clamp(23px, 2.5vw, 36px); font-weight: 900; }
+    .milestone p { margin: 12px 0 0; color: var(--muted); font-size: clamp(12px, 1.15vw, 16px); line-height: 1.45; }
+
+    .summary {
+      display: grid;
+      gap: 18px;
+      max-width: 1120px;
+      margin: auto 0;
+    }
+
+    .summary-item {
+      display: grid;
+      grid-template-columns: 58px 1fr;
+      gap: 18px;
+      align-items: start;
+      padding: 18px 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+    }
+
+    .summary-item .index {
+      display: flex;
+      width: 48px;
+      height: 48px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 14px;
+      color: var(--bg);
+      background: var(--cyan);
+      font-size: 23px;
+      font-weight: 900;
+    }
+
+    .summary-item p { margin: 2px 0 0; font-size: clamp(18px, 2vw, 28px); font-weight: 700; line-height: 1.4; }
+
+    .footer {
+      position: fixed;
+      left: clamp(34px, 5vw, 84px);
+      right: clamp(34px, 5vw, 84px);
+      bottom: 18px;
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: rgba(156,178,198,0.72);
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    .progress-track {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 40;
+      height: 4px;
+      background: rgba(255,255,255,0.06);
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--cyan), var(--blue));
+      box-shadow: 0 0 16px var(--cyan);
+      transition: width 250ms ease;
+    }
+
+    .controls {
+      position: fixed;
+      right: 24px;
+      top: 20px;
+      z-index: 50;
+      display: flex;
+      gap: 8px;
+      opacity: 0.5;
+      transition: opacity 180ms ease;
+    }
+
+    .controls:hover { opacity: 1; }
+
+    button {
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      color: var(--text);
+      background: rgba(8,22,37,0.8);
+      cursor: pointer;
+      font-size: 17px;
+    }
+
+    button:hover { border-color: var(--cyan); background: var(--cyan-soft); }
+
+    .overview {
+      overflow: auto;
+      padding: 28px;
+    }
+
+    .overview .deck {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 24px;
+      width: auto;
+      height: auto;
+    }
+
+    .overview .slide,
+    .overview .slide.active {
+      position: relative;
+      display: flex;
+      aspect-ratio: 16 / 9;
+      min-height: 0;
+      padding: 18px;
+      opacity: 1;
+      transform: none;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #081828;
+      cursor: pointer;
+      animation: none;
+    }
+
+    .overview .slide-frame {
+      min-height: 217%;
+      width: 217%;
+      transform: scale(0.46);
+      transform-origin: top left;
+    }
+    .overview .slide::before { display: none; }
+    .overview .footer, .overview .controls, .overview .progress-track { display: none; }
+
+    .hint {
+      position: absolute;
+      right: 30px;
+      bottom: 48px;
+      color: rgba(156,178,198,0.55);
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px), (max-height: 680px) {
+      .grid-4 { grid-template-columns: repeat(2, 1fr); }
+      .layout-flow { grid-template-columns: 1fr; }
+      .layout-flow .connector { transform: rotate(90deg); }
+      .timeline { grid-template-columns: repeat(3, 1fr); }
+      .slide { padding-top: 30px; }
+    }
+
+    @media (max-width: 680px) {
+      .grid-2, .grid-3, .status-columns { grid-template-columns: 1fr; }
+      .flow { flex-direction: column; }
+      .arrow { justify-content: center; transform: rotate(90deg); }
+      .timeline { grid-template-columns: 1fr 1fr; }
+      .footer .footer-title { display: none; }
+    }
+
+    @media print {
+      @page { size: 16in 9in; margin: 0; }
+      html, body { overflow: visible; background: white; color: #102030; }
+      body::before, body::after, .controls, .footer, .progress-track, .hint { display: none !important; }
+      .deck { width: auto; height: auto; }
+      .slide, .slide.active {
+        position: relative;
+        display: flex !important;
+        width: 100vw;
+        height: 100vh;
+        padding: 4.5vh 5vw;
+        opacity: 1 !important;
+        transform: none !important;
+        overflow: hidden;
+        color: #102030;
+        page-break-after: always;
+        break-after: page;
+      }
+      .slide::before { border-color: #d7e0e7; background: #f8fbfd; }
+      .card, .flow-node, table, .stage, .milestone, .summary-item { color: #102030; background: #f4f8fb !important; box-shadow: none; }
+      .muted, .card p, .flow-node span, .milestone p { color: #536a7c !important; }
+      code { color: #155fa0; background: #eaf3fb; }
+    }
+  </style>
+</head>
+<body>
+<aside style="position:relative;z-index:10000;padding:10px 16px;background:#eef2f7;color:#17212b;font:14px/1.6 sans-serif">学习资料归档 · 2026-09-15 · <a style="color:#1459a0" href="../README.md">返回阅读索引</a><br>来源：<code>pypto-lib/local_archive/20260817-main-cleanup/docs/models/deepseek_v4_flash_dspark_tp_slides.html</code>；实现与实验结论按原文时间阅读。</aside>
+
+  <main class="deck" id="deck">
+    <section class="slide title-slide active" data-title="封面">
+      <div class="slide-frame">
+      <div class="eyebrow">Internal Training · DeepSeek-V4-Flash</div>
+      <h1>TP 能力优先接入<br><span class="accent">DSpark Decode</span></h1>
+      <div class="hero-line"></div>
+      <p class="lead">从 <b class="blue">512 个验证位置</b> 到 <b class="accent">四卡协同计算</b></p>
+      <div class="meta-row">
+        <span class="pill">目标模型：V4-Flash</span>
+        <span class="pill">部署形态：TP4</span>
+        <span class="pill">内容基线：77c78c9964</span>
+        <span class="pill">2026-08-12</span>
+      </div>
+      <div class="hint">← → 翻页 · O 总览 · F 全屏 · P 打印</div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="DSpark 与 TP">
+      <div class="slide-frame">
+      <div class="eyebrow">01 · 两个独立维度</div>
+      <h2>DSpark 与 TP，解决的不是同一个问题</h2>
+      <div class="grid-2" style="margin:auto 0 24px">
+        <article class="card cyan">
+          <div class="label">DSpark · Speculative Decoding</div>
+          <div class="big accent">少调几次</div>
+          <h3 style="margin-top:18px">决定一次提出、验证多少个位置</h3>
+          <p class="muted">草稿器先给候选，主模型批量验证，减少主模型调用轮次。</p>
+        </article>
+        <article class="card blue">
+          <div class="label">TP · Tensor Parallel</div>
+          <div class="big blue">多卡分担</div>
+          <h3 style="margin-top:18px">决定一次模型计算怎样分到多卡</h3>
+          <p class="muted">按组件选择 token 归属、权重复制、权重分片和通信边界。</p>
+        </article>
+      </div>
+      <div class="callout"><b>结论：</b>普通 Decode 也可以使用 TP；当前只是优先对齐 DSpark Decode 的真实部署形态。</div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="DSpark 验证">
+      <div class="slide-frame">
+      <div class="eyebrow">02 · Proposal → Verify</div>
+      <h2>DSpark：一次提出 7 个，主模型验证 8 个位置</h2>
+      <div class="flow">
+        <div class="flow-node" style="border-color:rgba(67,217,209,.35)">
+          <strong class="accent">草稿器</strong>
+          <span>向前提出最多 7 个候选 token</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="flow-node" style="border-color:rgba(105,168,255,.35)">
+          <strong class="blue">主模型</strong>
+          <span>一次计算 1 + 7 = 8 个位置</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="flow-node" style="border-color:rgba(255,191,105,.35)">
+          <strong class="amber">连续接受</strong>
+          <span>首个不匹配后，不再接受后续草稿</span>
+        </div>
+      </div>
+      <div class="grid-2" style="margin-top:24px">
+        <div class="callout"><span><b>验证 8 个</b>不等于一定输出 8 个；实际接受数取决于匹配结果。</span></div>
+        <div class="callout warning"><span>#947 已有独立草稿器算子，但草稿、验证、接受与状态尚未串成完整闭环。</span></div>
+      </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="关键形状">
+      <div class="slide-frame">
+      <div class="eyebrow">03 · Shape First</div>
+      <h2>用四个数字锁定整个数据流</h2>
+      <div class="formula">
+        <div class="number">64<small>个请求</small></div>
+        <div class="op">×</div>
+        <div class="number">8<small>个验证位置 / 请求</small></div>
+        <div class="op">=</div>
+        <div class="number">512<small>四卡组满容量行</small></div>
+        <div class="op">÷ 4 =</div>
+        <div class="number">128<small>每卡满容量行</small></div>
+      </div>
+      <div class="callout">
+        <span><b>512 / 128 是配置的满容量形状。</b>运行时有效行数可以更小；“归属”也不等于整层始终只看本卡行。</span>
+      </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="组件布局">
+      <div class="slide-frame">
+      <div class="eyebrow">04 · Per-component Layout</div>
+      <h2>TP 不是把每个组件都简单切成四份</h2>
+      <table>
+        <thead><tr><th>组件</th><th>目标或既有布局</th><th>为什么</th></tr></thead>
+        <tbody>
+          <tr><td>Query 后半段、Attention sink</td><td><b>复制</b></td><td>本卡 128 行需要计算全部 64 heads</td></tr>
+          <tr><td>KV 相关投影</td><td><b>复制</b></td><td>根据完整 token 流建立 KV</td></tr>
+          <tr><td>O-A / O-B</td><td><b class="accent">TP4 分片</b></td><td>8 个输出组，每卡持有 2 组</td></tr>
+          <tr><td>共享专家</td><td><b>复制权重，本地 token</b></td><td>避免再引入一次结果合并</td></tr>
+          <tr><td>词表输出</td><td><b>复用 lm_head 分片</b></td><td>由自身 <code>--tp</code> 控制，不由 <code>config.TP</code> 推断</td></tr>
+        </tbody>
+      </table>
+      <div class="callout" style="margin-top:20px"><span><code>config.py</code> 只保留 <code>TP / DP / EP</code>；具体布局由组件代码和张量形状表达。</span></div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="TP4 数据流">
+      <div class="slide-frame">
+      <div class="eyebrow">05 · Target Decode Dataflow</div>
+      <h2>一层 Decode：三次布局转换，回到本卡 128 行</h2>
+      <div class="pill" style="align-self:flex-start;margin:-18px 0 18px">目标布局 · 高层 Decode 尚未接线</div>
+      <div class="layout-flow">
+        <div class="stage"><b>本卡 Hidden</b><small>128 × 4096<br>本卡 token</small></div>
+        <div class="connector">→</div>
+        <div class="stage"><b>Hidden 收集</b><small>每卡看到<br>512 × 4096</small></div>
+        <div class="connector">→</div>
+        <div class="stage"><b>本卡 Attention</b><small>128 行<br>全部 64 heads</small></div>
+        <div class="connector">→</div>
+        <div class="stage"><b>结果互换</b><small>512 行<br>本卡 16 heads</small></div>
+        <div class="connector">→</div>
+        <div class="stage"><b>O-A / O-B</b><small>512 行<br>本卡部分和</small></div>
+        <div class="connector">→</div>
+        <div class="stage"><b>求和并返回</b><small>128 × 4096<br>本卡完整结果</small></div>
+      </div>
+      <div class="grid-3" style="margin-top:26px">
+        <div class="card"><div class="label">Query</div><h3>本卡 128 行</h3><p class="muted">保留全部 64 heads</p></div>
+        <div class="card"><div class="label">KV</div><h3>完整 512 行</h3><p class="muted">先收集，再建立 KV</p></div>
+        <div class="card"><div class="label">Output</div><h3>先按组，再按 token</h3><p class="muted">分片计算后恢复 token 归属</p></div>
+      </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="三次通信">
+      <div class="slide-frame">
+      <div class="eyebrow">06 · Communication Boundaries</div>
+      <h2>三次跨卡操作，各自解决一种布局变化</h2>
+      <div class="grid-3" style="margin:auto 0 24px">
+        <article class="card cyan">
+          <div class="label">01 · AllGather-like</div>
+          <h3>Hidden 收集</h3>
+          <p><b>128 行 → 512 行</b></p>
+          <p class="muted">只复制，不求和。让每张卡获得完整 KV 输入。</p>
+        </article>
+        <article class="card blue">
+          <div class="label">02 · AllToAll-like</div>
+          <h3>Attention 结果互换</h3>
+          <p><b>本卡 token → 本卡输出组</b></p>
+          <p class="muted">只重排，不求和。将归属轴从 token 换成 head 输出组。</p>
+        </article>
+        <article class="card amber">
+          <div class="label">03 · ReduceScatter-like</div>
+          <h3>输出部分和合并</h3>
+          <p><b>512 行部分和 → 128 行结果</b></p>
+          <p class="muted">FP32 求和后按 token 返回，再转换为 BF16。</p>
+        </article>
+      </div>
+      <div class="callout"><b>通用原则：</b>通信发生在数据布局改变的地方，而不是因为某个算子名字里有 TP。</div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="O Projection">
+      <div class="slide-frame">
+      <div class="eyebrow">07 · Sharded O Projection</div>
+      <h2>O Projection：把 64 个 head 融合回 4096 维 Hidden</h2>
+      <div class="flow" style="gap:8px">
+        <div class="flow-node"><strong>64 heads</strong><span>每 8 个 head 一组</span></div>
+        <div class="arrow">→</div>
+        <div class="flow-node"><strong>8 groups</strong><span>四卡平分，每卡 2 组</span></div>
+        <div class="arrow">→</div>
+        <div class="flow-node"><strong>O-A</strong><span>每组 4096 → 1024</span></div>
+        <div class="arrow">→</div>
+        <div class="flow-node"><strong>O-B</strong><span>本卡 2048 → 4096</span></div>
+      </div>
+      <div class="grid-2" style="margin-top:24px">
+        <div class="card cyan"><div class="label">本卡计算</div><div class="big">[512, 4096]</div><p class="muted">满容量 FP32 部分和</p></div>
+        <div class="card blue"><div class="label">四卡合并</div><div class="big">Σ 4 ranks</div><p class="muted">完整 Attention 输出，再返回本卡 128 行</p></div>
+      </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="代码入口">
+      <div class="slide-frame">
+      <div class="eyebrow">08 · Commit 77c78c9964</div>
+      <h2><code>decode_o_proj.py</code>：统一代码入口，不改变数学关系</h2>
+      <div class="grid-2">
+        <article class="card cyan">
+          <div class="label">本地完整路径</div>
+          <h3><code>decode_o_proj_tp1</code></h3>
+          <p class="muted">本地 token、完整输出组；无跨卡通信。</p>
+        </article>
+        <article class="card blue">
+          <div class="label">TP4 基础路径</div>
+          <h3>通信 + 分片投影</h3>
+          <div class="chips">
+            <span class="chip">kv_token_allgather_step</span>
+            <span class="chip">attention_token_head_all_to_all_step</span>
+            <span class="chip">decode_sharded_o_projection</span>
+            <span class="chip">o_projection_reduce_scatter_step</span>
+          </div>
+        </article>
+      </div>
+      <div class="grid-2" style="margin-top:20px">
+        <div class="callout"><span><b>#945：</b>删除 SP 和组件级 TP 常量；配置只保留 <code>TP / DP / EP</code>。</span></div>
+        <div class="callout warning"><span>同文件不等于动态切换：当前 TP4 形状仍由 <code>config.TP = 4</code> 静态推导。</span></div>
+      </div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="实现状态">
+      <div class="slide-frame">
+      <div class="eyebrow">09 · Current Boundary</div>
+      <h2>组件已经更多，但仍不是端到端 DSpark Decode</h2>
+      <div class="status-columns">
+        <article class="card">
+          <h3 class="green">已完成 / 可独立验证</h3>
+          <ul class="status-list done">
+            <li>TP4 三个通信边界</li>
+            <li>分片 O-A / A8 / O-B 及 Golden</li>
+            <li>SWA / HCA / CSA 的统一 heads seam</li>
+            <li><code>dspark_proj</code> 与 context KV</li>
+            <li>DSpark block Attention 与 Markov head</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3 class="amber">仍需接入 / 组合</h3>
+          <ul class="status-list todo">
+            <li>三个 target Attention wrapper 接入 TP4 输出路径</li>
+            <li>权重布局、窗口生命周期与分布式启动</li>
+            <li>target <code>decode_layer.py</code> / <code>decode_fwd.py</code></li>
+            <li>置信度调度、验证、接受与跨轮状态</li>
+            <li>端到端精度和性能闭环</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout warning" style="margin-top:20px"><b>准确表述：</b>基础组件已对账，不等于完整功能已经打通，更不等于端到端性能已经达标。</div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="演进路径">
+      <div class="slide-frame">
+      <div class="eyebrow">10 · Implementation Timeline</div>
+      <h2>从部署形状，到边界，再到代码收敛</h2>
+      <div class="timeline">
+        <article class="milestone"><div class="pr">#924</div><p>拆开 Query 与 KV 分支，允许本地 Query 和完整 KV 使用不同行数。</p></article>
+        <article class="milestone"><div class="pr">#928</div><p>落地 S = 8，建立 64 × 8 = 512 行的验证形状。</p></article>
+        <article class="milestone"><div class="pr">#931</div><p>建立四卡 Attention 通信、输出投影和 heads seam 基础。</p></article>
+        <article class="milestone"><div class="pr">#947</div><p>加入独立 DSpark 草稿器算子，但尚未形成完整循环。</p></article>
+        <article class="milestone"><div class="pr">#945</div><p>统一 TP 术语，将通信和分片投影收敛到 <code>decode_o_proj.py</code>。</p></article>
+      </div>
+      <div class="callout" style="margin-top:26px">方向变化：从“每个组件都加一个 TP 参数”，转向“按真实部署布局选择复制、分片与通信”。</div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="总结">
+      <div class="slide-frame">
+      <div class="eyebrow">11 · Takeaways</div>
+      <h2>记住三句话</h2>
+      <div class="summary">
+        <div class="summary-item"><div class="index">1</div><p>DSpark 决定一次验证多少个位置；TP 决定这次主模型计算怎样分到多卡。</p></div>
+        <div class="summary-item"><div class="index">2</div><p>TP 的工程核心是组件间的数据布局和通信边界，不是把所有维度简单除以四。</p></div>
+        <div class="summary-item"><div class="index">3</div><p>四卡 Attention 基础和独立草稿器算子已经存在；端到端接入、对账与性能仍待完成。</p></div>
+      </div>
+      <div class="meta-row" style="margin-top:28px">
+        <span class="pill">Issue #905</span>
+        <span class="pill">PR #931</span>
+        <span class="pill">PR #947</span>
+        <span class="pill">PR #945</span>
+      </div>
+      <div class="callout" style="margin-top:20px">扩展阅读：<a href="deepseek_v4_flash_dspark_vs_mtp.html">DSpark 与 MTP：结合当前代码理解两条推测解码路径</a>（滚动式 HTML，含多张流程图）。</div>
+      </div>
+    </section>
+  </main>
+
+  <div class="controls" aria-label="演示控制">
+    <button id="prev" title="上一页（←）" aria-label="上一页">←</button>
+    <button id="overview" title="总览（O）" aria-label="总览">▦</button>
+    <button id="fullscreen" title="全屏（F）" aria-label="全屏">⛶</button>
+    <button id="next" title="下一页（→）" aria-label="下一页">→</button>
+  </div>
+  <div class="footer">
+    <span class="footer-title">TP 能力优先接入 DSpark Decode</span>
+    <span id="counter">1 / 12</span>
+  </div>
+  <div class="progress-track"><div class="progress-bar" id="progress"></div></div>
+
+  <script>
+    (() => {
+      const slides = [...document.querySelectorAll('.slide')];
+      const counter = document.getElementById('counter');
+      const progress = document.getElementById('progress');
+      let current = Math.max(0, Math.min(slides.length - 1, Number(location.hash.slice(1)) - 1 || 0));
+      let overview = false;
+
+
+      function show(index, updateHash = true) {
+        current = Math.max(0, Math.min(slides.length - 1, index));
+        slides.forEach((slide, i) => slide.classList.toggle('active', i === current));
+        counter.textContent = `${current + 1} / ${slides.length}`;
+        progress.style.width = `${((current + 1) / slides.length) * 100}%`;
+        document.title = `${current + 1}. ${slides[current].dataset.title} · TP × DSpark`;
+        if (updateHash) history.replaceState(null, '', `#${current + 1}`);
+      }
+
+      function move(delta) {
+        if (overview) toggleOverview(false);
+        show(current + delta);
+      }
+
+      function toggleOverview(force) {
+        overview = typeof force === 'boolean' ? force : !overview;
+        document.body.classList.toggle('overview', overview);
+        if (!overview) show(current, false);
+      }
+
+      function toggleFullscreen() {
+        if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+        else document.exitFullscreen?.();
+      }
+
+      document.getElementById('prev').addEventListener('click', () => move(-1));
+      document.getElementById('next').addEventListener('click', () => move(1));
+      document.getElementById('overview').addEventListener('click', () => toggleOverview());
+      document.getElementById('fullscreen').addEventListener('click', toggleFullscreen);
+
+      slides.forEach((slide, index) => slide.addEventListener('click', () => {
+        if (overview) { current = index; toggleOverview(false); }
+      }));
+
+      document.addEventListener('keydown', (event) => {
+        if (['ArrowRight', 'PageDown', ' ', 'Enter'].includes(event.key)) { event.preventDefault(); move(1); }
+        if (['ArrowLeft', 'PageUp', 'Backspace'].includes(event.key)) { event.preventDefault(); move(-1); }
+        if (event.key === 'Home') show(0);
+        if (event.key === 'End') show(slides.length - 1);
+        if (event.key.toLowerCase() === 'o' || event.key === 'Escape' && overview) toggleOverview();
+        if (event.key.toLowerCase() === 'f') toggleFullscreen();
+        if (event.key.toLowerCase() === 'p') window.print();
+      });
+
+      let touchStart = null;
+      document.addEventListener('touchstart', (event) => { touchStart = event.changedTouches[0].clientX; }, { passive: true });
+      document.addEventListener('touchend', (event) => {
+        if (touchStart === null) return;
+        const delta = event.changedTouches[0].clientX - touchStart;
+        if (Math.abs(delta) > 55) move(delta < 0 ? 1 : -1);
+        touchStart = null;
+      }, { passive: true });
+
+      window.addEventListener('hashchange', () => show(Number(location.hash.slice(1)) - 1 || 0, false));
+      show(current, false);
+    })();
+  </script>
+</body>
+</html>

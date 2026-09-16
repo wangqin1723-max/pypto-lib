@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>DSpark 与 MTP：结合当前代码理解两条推测解码路径</title>
+  <style>
+    :root {
+      --bg: #f6f8fc;
+      --paper: rgba(255, 255, 255, .92);
+      --paper-solid: #ffffff;
+      --ink: #17213b;
+      --muted: #64708a;
+      --line: #dce3ef;
+      --blue: #2c67e8;
+      --blue-soft: #eaf1ff;
+      --purple: #7b4ce2;
+      --purple-soft: #f0ebff;
+      --green: #16845f;
+      --green-soft: #e8f7f1;
+      --amber: #b66c0b;
+      --amber-soft: #fff4df;
+      --red: #bf3c52;
+      --red-soft: #ffedf0;
+      --shadow: 0 18px 55px rgba(29, 45, 85, .10);
+      --radius: 20px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1220;
+        --paper: rgba(22, 29, 49, .92);
+        --paper-solid: #161d31;
+        --ink: #edf2ff;
+        --muted: #aab5ce;
+        --line: #303a55;
+        --blue: #80a8ff;
+        --blue-soft: #182a50;
+        --purple: #b39aff;
+        --purple-soft: #2d2452;
+        --green: #60d6ac;
+        --green-soft: #153c32;
+        --amber: #ffc66d;
+        --amber-soft: #46331a;
+        --red: #ff93a5;
+        --red-soft: #47232c;
+        --shadow: 0 18px 55px rgba(0, 0, 0, .28);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 3%, rgba(44, 103, 232, .12), transparent 28rem),
+        radial-gradient(circle at 90% 18%, rgba(123, 76, 226, .10), transparent 30rem),
+        var(--bg);
+      font-family: var(--sans);
+      line-height: 1.72;
+    }
+    a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    code {
+      padding: .12rem .35rem;
+      border: 1px solid var(--line);
+      border-radius: .38rem;
+      background: var(--blue-soft);
+      font-family: var(--mono);
+      font-size: .88em;
+    }
+    .page { width: min(1440px, 100%); margin: 0 auto; padding: 0 24px 72px; }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      margin: 24px 0;
+      padding: clamp(32px, 6vw, 78px);
+      border: 1px solid var(--line);
+      border-radius: 30px;
+      background:
+        linear-gradient(125deg, rgba(44, 103, 232, .14), rgba(123, 76, 226, .09) 55%, transparent),
+        var(--paper);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "MTP  ↔  DSpark";
+      position: absolute;
+      right: -18px;
+      bottom: -36px;
+      color: rgba(44, 103, 232, .07);
+      font-weight: 900;
+      font-size: clamp(46px, 9vw, 132px);
+      letter-spacing: -.06em;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid rgba(44, 103, 232, .28);
+      border-radius: 999px;
+      color: var(--blue);
+      background: var(--blue-soft);
+      font-size: .8rem;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .hero h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 960px;
+      margin: 20px 0 14px;
+      font-size: clamp(2.3rem, 5.6vw, 5rem);
+      line-height: 1.06;
+      letter-spacing: -.045em;
+    }
+    .hero .lead { position: relative; z-index: 1; max-width: 900px; margin: 0; color: var(--muted); font-size: 1.12rem; }
+    .hero-meta { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+    .pill { padding: 7px 11px; border: 1px solid var(--line); border-radius: 999px; background: var(--paper-solid); color: var(--muted); font-size: .82rem; }
+
+    .layout { display: grid; grid-template-columns: 248px minmax(0, 1fr); gap: 26px; align-items: start; }
+    .toc {
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: 0 10px 30px rgba(29, 45, 85, .06);
+      backdrop-filter: blur(12px);
+    }
+    .toc strong { display: block; margin: 4px 8px 10px; font-size: .78rem; letter-spacing: .1em; color: var(--muted); }
+    .toc a { display: block; margin: 2px 0; padding: 8px 10px; border-radius: 10px; color: var(--muted); text-decoration: none; font-size: .88rem; line-height: 1.35; }
+    .toc a:hover, .toc a.active { color: var(--blue); background: var(--blue-soft); }
+    main { min-width: 0; }
+    section {
+      scroll-margin-top: 18px;
+      margin-bottom: 26px;
+      padding: clamp(24px, 4vw, 46px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: 0 12px 38px rgba(29, 45, 85, .06);
+    }
+    section h2 { margin: 0 0 10px; font-size: clamp(1.55rem, 3vw, 2.25rem); line-height: 1.18; letter-spacing: -.025em; }
+    section h3 { margin: 30px 0 10px; font-size: 1.13rem; }
+    section > p:first-of-type { color: var(--muted); }
+    .section-kicker { margin: 0 0 8px; color: var(--blue); font-size: .77rem; font-weight: 850; letter-spacing: .1em; text-transform: uppercase; }
+
+    .verdict {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .verdict-card { position: relative; overflow: hidden; min-height: 190px; padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--paper-solid); }
+    .verdict-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 5px; background: var(--blue); }
+    .verdict-card.dspark::before { background: var(--purple); }
+    .verdict-card .big { margin: 4px 0 8px; font-size: 1.65rem; font-weight: 900; letter-spacing: -.03em; }
+    .verdict-card p { margin: 0; color: var(--muted); }
+    .status-line { display: flex; gap: 8px; align-items: center; margin-top: 18px; font-size: .86rem; font-weight: 750; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+    .dot.partial { background: var(--amber); box-shadow: 0 0 0 4px var(--amber-soft); }
+
+    .callout { margin: 18px 0 0; padding: 16px 18px; border-left: 4px solid var(--blue); border-radius: 0 12px 12px 0; background: var(--blue-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+
+    .flow {
+      margin: 22px 0;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(160deg, var(--paper-solid), color-mix(in srgb, var(--blue-soft) 28%, var(--paper-solid)));
+      overflow: auto;
+    }
+    .flow-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .flow-title strong { font-size: 1rem; }
+    .flow-title span { color: var(--muted); font-size: .78rem; }
+    .flow-row { display: flex; align-items: stretch; gap: 10px; min-width: 760px; }
+    .node {
+      position: relative;
+      flex: 1 1 0;
+      min-width: 124px;
+      padding: 16px 13px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--blue);
+      border-radius: 14px;
+      background: var(--paper-solid);
+      text-align: center;
+      box-shadow: 0 8px 20px rgba(29, 45, 85, .06);
+    }
+    .node.purple { border-top-color: var(--purple); }
+    .node.green { border-top-color: var(--green); background: var(--green-soft); }
+    .node.missing { border: 2px dashed var(--amber); background: var(--amber-soft); box-shadow: none; }
+    .node.future { border: 2px dashed var(--red); background: var(--red-soft); box-shadow: none; }
+    .node b { display: block; margin-bottom: 4px; line-height: 1.3; }
+    .node small { display: block; color: var(--muted); line-height: 1.42; }
+    .node code { display: inline-block; margin-top: 7px; font-size: .71rem; }
+    .arrow { display: grid; place-items: center; flex: 0 0 22px; color: var(--blue); font-size: 1.35rem; font-weight: 900; }
+    .arrow.wide { flex-basis: 58px; padding: 0 4px; font-size: .73rem; line-height: 1.25; text-align: center; }
+    .arrow.down { transform: rotate(90deg); margin: 8px auto; }
+    .loop-note { margin: 15px 0 0; text-align: center; color: var(--muted); font-size: .84rem; }
+    .loop-note b { color: var(--green); }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 14px; color: var(--muted); font-size: .78rem; }
+    .legend i { display: inline-block; width: 18px; height: 10px; margin-right: 6px; border: 2px solid var(--green); border-radius: 4px; vertical-align: -1px; background: var(--green-soft); }
+    .legend i.partial { border-style: dashed; border-color: var(--amber); background: var(--amber-soft); }
+    .legend i.missing { border-style: dashed; border-color: var(--red); background: var(--red-soft); }
+
+    .branch-flow { display: grid; grid-template-columns: 160px 42px 1fr; gap: 14px; align-items: center; }
+    .branch-origin { padding: 18px; border-radius: 16px; color: white; background: linear-gradient(135deg, var(--blue), var(--purple)); text-align: center; font-weight: 850; }
+    .fork { display: grid; align-self: stretch; place-items: center; font-size: 1.6rem; color: var(--muted); }
+    .branch-lines { display: grid; gap: 12px; }
+    .branch { display: grid; grid-template-columns: 120px 1fr; align-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: var(--paper-solid); }
+    .branch b { align-self: stretch; display: grid; place-items: center; padding: 16px; color: var(--blue); background: var(--blue-soft); }
+    .branch.dspark b { color: var(--purple); background: var(--purple-soft); }
+    .branch span { padding: 14px 16px; color: var(--muted); }
+
+    .compare { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 22px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; font-size: .92rem; }
+    .compare th, .compare td { padding: 14px 16px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    .compare tr:last-child th, .compare tr:last-child td { border-bottom: 0; }
+    .compare thead th { background: var(--blue-soft); color: var(--blue); }
+    .compare thead th:last-child { background: var(--purple-soft); color: var(--purple); }
+    .compare tbody th { width: 18%; color: var(--muted); background: color-mix(in srgb, var(--paper-solid) 85%, var(--blue-soft)); }
+
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .card { padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--paper-solid); }
+    .card h3 { margin-top: 0; }
+    .number-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+    .metric { padding: 17px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper-solid); }
+    .metric b { display: block; color: var(--blue); font-size: 1.65rem; line-height: 1.1; }
+    .metric small { color: var(--muted); }
+
+    .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 20px; }
+    .status-card { padding: 18px; border: 1px solid var(--line); border-radius: 15px; background: var(--paper-solid); }
+    .status-card .tag { display: inline-block; margin-bottom: 10px; padding: 4px 8px; border-radius: 999px; color: var(--green); background: var(--green-soft); font-size: .73rem; font-weight: 850; }
+    .status-card.partial .tag { color: var(--amber); background: var(--amber-soft); }
+    .status-card.missing .tag { color: var(--red); background: var(--red-soft); }
+    .status-card h3 { margin: 0 0 6px; font-size: 1rem; }
+    .status-card p { margin: 0; color: var(--muted); font-size: .86rem; }
+
+    details { margin: 10px 0; border: 1px solid var(--line); border-radius: 14px; background: var(--paper-solid); }
+    summary { cursor: pointer; padding: 15px 18px; font-weight: 780; }
+    details > div { padding: 0 18px 18px; color: var(--muted); }
+    .file-list { list-style: none; margin: 12px 0 0; padding: 0; }
+    .file-list li { margin: 8px 0; padding: 10px 12px; border-left: 3px solid var(--blue); border-radius: 0 8px 8px 0; background: var(--blue-soft); }
+    .file-list.purple li { border-left-color: var(--purple); background: var(--purple-soft); }
+    .file-list a { font-family: var(--mono); font-size: .86rem; }
+    .file-list span { display: block; margin-top: 2px; color: var(--muted); font-size: .82rem; }
+
+    .takeaway { display: grid; grid-template-columns: 50px 1fr; gap: 14px; align-items: start; margin: 12px 0; padding: 17px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper-solid); }
+    .takeaway .n { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; color: white; background: linear-gradient(135deg, var(--blue), var(--purple)); font-weight: 900; }
+    .takeaway p { margin: 0; }
+    .footer { padding: 22px 4px 0; color: var(--muted); text-align: center; font-size: .82rem; }
+    .top-link { position: fixed; right: 20px; bottom: 20px; z-index: 5; display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid var(--line); border-radius: 50%; color: var(--ink); background: var(--paper); box-shadow: var(--shadow); text-decoration: none; backdrop-filter: blur(10px); }
+
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .toc { position: static; max-height: none; display: flex; overflow-x: auto; white-space: nowrap; }
+      .toc strong { display: none; }
+      .toc a { flex: 0 0 auto; }
+      .status-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 700px) {
+      .page { padding-inline: 12px; }
+      .hero { margin-top: 12px; padding: 28px 22px 44px; }
+      .verdict, .two-col, .status-grid { grid-template-columns: 1fr; }
+      .number-strip { grid-template-columns: 1fr 1fr; }
+      section { padding: 23px 18px; }
+      .branch-flow { grid-template-columns: 1fr; }
+      .fork { min-height: 28px; }
+      .branch { grid-template-columns: 90px 1fr; }
+      .compare { display: block; overflow-x: auto; white-space: normal; }
+      .top-link { display: none; }
+    }
+    @media print {
+      :root { --bg: white; --paper: white; --paper-solid: white; --ink: #111827; --muted: #4b5563; --line: #d1d5db; }
+      body { background: white; }
+      .page { max-width: none; padding: 0; }
+      .hero, section { box-shadow: none; break-inside: avoid; }
+      .layout { display: block; }
+      .toc, .top-link { display: none; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body id="top">
+<aside style="position:relative;z-index:10000;padding:10px 16px;background:#eef2f7;color:#17212b;font:14px/1.6 sans-serif">学习资料归档 · 2026-09-15 · <a style="color:#1459a0" href="../README.md">返回阅读索引</a><br>来源：<code>pypto-lib/local_archive/20260817-main-cleanup/docs/models/deepseek_v4_flash_dspark_vs_mtp.html</code>；实现与实验结论按原文时间阅读。</aside>
+
+  <div class="page">
+    <header class="hero">
+      <span class="eyebrow">DeepSeek-V4-Flash · code-driven guide</span>
+      <h1>DSpark 与 MTP<br>到底是什么关系？</h1>
+      <p class="lead">
+        这是一份结合当前仓库代码、issue #905/#935 与上游实现的滚动式说明页。两者是不同的推测解码运行方式，但并非毫无关系：DeepSeek-V4 DSpark 的三层草稿骨干就存放在 checkpoint 的 <code>mtp.0/1/2</code> 命名空间中。
+      </p>
+      <div class="hero-meta">
+        <span class="pill">代码基线：本地 main · 77c78c9</span>
+        <span class="pill">MTP：B=4 · S=2 · T=8</span>
+        <span class="pill">DSpark：B=64 · S=8 · T=512 · TP=4</span>
+        <span class="pill">DSpark 骨干：mtp.0 → mtp.1 → mtp.2</span>
+        <span class="pill">更新：2026-08-13</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav class="toc" aria-label="文章目录">
+        <strong>CONTENTS</strong>
+        <a href="#answer">先给结论</a>
+        <a href="#common-loop">共同框架</a>
+        <a href="#comparison">核心区别</a>
+        <a href="#mtp-flow">MTP 代码闭环</a>
+        <a href="#mtp-layer">MTP 层内部</a>
+        <a href="#dspark-flow">DSpark 组件图</a>
+        <a href="#tp4-flow">DSpark TP4 验证侧</a>
+        <a href="#status">完成度边界</a>
+        <a href="#reading">代码阅读顺序</a>
+        <a href="#faq">容易混淆的点</a>
+        <a href="#summary">一句话复述</a>
+      </nav>
+
+      <main>
+        <section id="answer">
+          <p class="section-kicker">01 · direct answer</p>
+          <h2>先更正：运行方式不同，但预测层并不是完全分开的</h2>
+          <p>MTP-1 与 DSpark 是两种不同的推测解码运行契约；DeepSeek-V4 DSpark 又复用了 MTP 命名的预测层作为自己的草稿骨干。因此不能说“完全无关”，也不能把它们串成“MTP 先逐 token 生成，DSpark 再验证”。</p>
+
+          <div class="verdict">
+            <article class="verdict-card">
+              <div class="eyebrow">传统 MTP · 当前 MTP=1</div>
+              <div class="big">一层预测，一轮产生一枚草稿</div>
+              <p>当前本地 MTP 路径使用一个额外预测层，生成一枚草稿，下一轮由主模型验证。它的运行形状是 <code>[tail, draft]</code>，不是七位置块。</p>
+              <div class="status-line"><span class="dot"></span>当前仓库：已有代码级组合闭环</div>
+            </article>
+            <article class="verdict-card dspark">
+              <div class="eyebrow" style="color:var(--purple);background:var(--purple-soft);border-color:color-mix(in srgb,var(--purple) 35%,transparent)">DSpark · 当前最多 7 个草稿</div>
+              <div class="big">三层预测骨干属于 DSpark 内部</div>
+              <p><code>mtp.0/1/2</code> 三层依次处理同一个七位置候选块，中间不产生 token。第三层之后统一得到基础 logits，再由 Markov Head 从左到右采样七枚草稿。</p>
+              <div class="status-line"><span class="dot partial"></span>当前仓库：组件已加入，端到端仍在集成</div>
+            </article>
+          </div>
+
+          <div class="callout warn"><b>你的图接近了，但有四处要改：</b>① issue #905 是 43 层 V4-Flash，不是 61 层 Pro；② Prediction Layer 1/2/3 之间没有 Token+2/+3/+4；③ 三个 Prediction Layer 本身就是 DSpark 的重型并行骨干，不应在后面再放一个独立 DSpark 盒子；④ DSpark 负责提议，真正决定哪些 token 可接受的仍是下一次完整主模型验证。</div>
+
+          <table class="compare">
+            <thead><tr><th>同一套 DSpark 拓扑</th><th>当前 #905 / 本地代码</th><th>你画的 61 层场景</th></tr></thead>
+            <tbody>
+              <tr><th>目标模型</th><td>V4-Flash · 43 层</td><td>V4-Pro · 61 层</td></tr>
+              <tr><th>提供 hidden 的层</th><td>40、41、42</td><td>58、59、60</td></tr>
+              <tr><th>DSpark 草稿骨干</th><td colspan="2"><code>mtp.0 → mtp.1 → mtp.2</code>；三个层处理同一个候选块，层间不采样 token。</td></tr>
+            </tbody>
+          </table>
+
+          <div class="flow">
+            <div class="flow-title"><strong>关键关系图 · DeepSeek-V4-Flash DSpark 的正确一轮</strong><span>模型契约；当前本地尚未全部接线</span></div>
+            <div class="flow-row">
+              <div class="node"><b>已提交上下文</b><small>上一轮接受的 token</small></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>43 层主模型</b><small>产生 anchor，并保留第 40/41/42 层 hidden</small></div>
+              <div class="arrow">→</div>
+              <div class="node purple"><b>DSpark 输入准备</b><small>三层 hidden 投影；构造 [anchor, noise × 6]</small></div>
+            </div>
+            <div class="arrow down">→</div>
+            <div class="flow-row">
+              <div class="node purple"><b>Prediction Layer 0</b><small><code>mtp.0</code> · 整个 7 行块<br>不采样 token</small></div>
+              <div class="arrow">→</div>
+              <div class="node purple"><b>Prediction Layer 1</b><small><code>mtp.1</code> · 整个 7 行块<br>不采样 token</small></div>
+              <div class="arrow">→</div>
+              <div class="node purple"><b>Prediction Layer 2</b><small><code>mtp.2</code> · 整个 7 行块<br>不采样 token</small></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>统一输出头</b><small>一次得到 7 个位置的 base logits</small></div>
+            </div>
+            <div class="arrow down">→</div>
+            <div class="flow-row">
+              <div class="node purple"><b>Markov 顺序采样</b><small>anchor → draft1 → … → draft7</small></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>候选前缀</b><small>固定 7 枚；可选置信度只负责裁剪长度</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>下一次 43 层主模型</b><small>并行验证 1 + 7 个位置</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>接受连续正确前缀</b><small>首个不一致之后不再接受</small></div>
+            </div>
+            <p class="loop-note">主模型既出现在 DSpark 前面，也出现在后面：前一次提供 <b>anchor + hidden</b>，下一次完成权威验证，然后循环继续。若讲 V4-Pro，只需把图中的 43 层与 40/41/42 改成 61 层与 58/59/60。</p>
+          </div>
+        </section>
+
+        <section id="common-loop">
+          <p class="section-kicker">02 · shared mental model</p>
+          <h2>先看共同框架：两条路径都在做“先猜、再验”</h2>
+          <p>如果先忽略草稿器内部差异，MTP 与 DSpark 都可以放进下面这个通用循环。</p>
+
+          <div class="flow">
+            <div class="flow-title"><strong>流程图 1 · 推测解码的共同循环</strong><span>算法视角</span></div>
+            <div class="flow-row">
+              <div class="node"><b>已有上下文</b><small>已提交 token 与缓存</small></div>
+              <div class="arrow">→</div>
+              <div class="node purple"><b>草稿器先提议</b><small>MTP 或 DSpark</small></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>主模型批量验证</b><small>一次看多个位置</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>接受连续前缀</b><small>遇到首个不一致即停止</small></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>更新状态</b><small>进入下一轮</small></div>
+            </div>
+            <p class="loop-note">更新后的状态 <b>↺</b> 回到“已有上下文”；加速来自一次主模型调用可能提交多个 token，而不是保证每轮全部接受。</p>
+          </div>
+
+          <div class="branch-flow">
+            <div class="branch-origin">同一个<br>V4-Flash<br>主模型</div>
+            <div class="fork">⇢</div>
+            <div class="branch-lines">
+              <div class="branch"><b>MTP-1</b><span>一个 MTP 预测层产生 1 枚草稿；当前本地闭环按 <code>[tail, draft]</code> 运行。</span></div>
+              <div class="branch dspark"><b>DSpark</b><span>checkpoint 的 <code>mtp.0/1/2</code> 组成三层块草稿骨干，再由 Markov Head 采样 7 枚草稿。</span></div>
+            </div>
+          </div>
+          <p class="loop-note"><b>它们是可替换的运行方式，不是先运行 MTP-1、再运行 DSpark 的串联关系。</b></p>
+        </section>
+
+        <section id="comparison">
+          <p class="section-kicker">03 · side-by-side</p>
+          <h2>核心区别：草稿怎样来，当前代码又走到哪里</h2>
+          <p>下面只描述这个仓库当前采用的配置与实现，不把“理论上可扩展”误写成“代码已经支持”。</p>
+
+          <table class="compare">
+            <thead>
+              <tr><th>比较项</th><th>MTP 路径</th><th>DSpark 路径</th></tr>
+            </thead>
+            <tbody>
+              <tr><th>共同目标</th><td colspan="2">减少昂贵主模型 Decode 的调用轮数；最终 token 仍由同一个 V4-Flash 主模型验证。</td></tr>
+              <tr><th>当前草稿数</th><td>1 枚；<code>DECODE_SEQ = 2</code></td><td>最多 7 枚；<code>DECODE_SEQ = 1 + 7 = 8</code></td></tr>
+              <tr><th>checkpoint 关系</th><td>当前 MTP-1 使用一个额外预测层。</td><td>DSpark 的三层草稿骨干存放在 <code>mtp.0/1/2</code> 命名空间；这是权重/架构复用，不是运行时先执行 MTP-1。</td></tr>
+              <tr><th>草稿器输入</th><td>已提交 token 的 embedding，加上主模型保存/输出的隐藏状态。</td><td>主模型第 40/41/42 层 hidden、anchor/noise query block，以及三层各自的上下文 KV。</td></tr>
+              <tr><th>草稿器主干</th><td>投影融合 → 一层滑窗 Attention → MoE → 输出头。</td><td>main projection → 三个完整 Attention+MoE 草稿层 → 输出头 → Markov 顺序采样。</td></tr>
+              <tr><th>何时产生 token</th><td>一层 MTP 运行结束后产生一枚草稿。</td><td>三个预测层之间不产生 token；第三层之后先并行得到 7 组基础 logits，Markov Head 再顺序得到 7 枚草稿。</td></tr>
+              <tr><th>位置关系</th><td>当前只验证 1 枚草稿，接受计数是 1 或 2。</td><td>面向 7 个草稿查询行；主模型目标验证宽度是 8。</td></tr>
+              <tr><th>当前组合入口</th><td><code>decode_fwd_mtp_l2</code> 已顺序连接主模型、验证、下一草稿和状态提交；但该融合文件没有独立 runner / golden。</td><td>没有等价的 DSpark <code>decode_fwd</code> 闭环入口。</td></tr>
+              <tr><th>当前 TP 重点</th><td>这份工作不是以改造 MTP 路径为主。</td><td>先打通主模型验证侧 <code>T=512, TP=4</code> 的跨卡数据边界。</td></tr>
+            </tbody>
+          </table>
+
+          <div class="number-strip">
+            <div class="metric"><b>4</b><small>MTP 每卡请求数</small></div>
+            <div class="metric"><b>8</b><small>MTP 每步总行数</small></div>
+            <div class="metric"><b>512</b><small>DSpark 四卡验证行数</small></div>
+            <div class="metric"><b>128</b><small>DSpark 每卡归属行数</small></div>
+          </div>
+        </section>
+
+        <section id="mtp-flow">
+          <p class="section-kicker">04 · MTP composed path</p>
+          <h2>MTP：当前代码已经形成“下一轮还能继续”的组合闭环</h2>
+          <p>关键不只是有一个 MTP 算子，而是 <code>decode_fwd_mtp_l2()</code> 明确按顺序调用了五段逻辑。</p>
+
+          <div class="flow">
+            <div class="flow-title"><strong>流程图 2 · MTP 一次融合 Decode 的真实调用顺序</strong><span>当前代码调用图</span></div>
+            <div class="flow-row">
+              <div class="node green"><b>读取设备状态</b><small>装入上一轮 tail + draft</small><code>prepare_decode_from_device_state</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>主模型 Decode</b><small>处理 B=4、S=2，共 8 行</small><code>decode_fwd_inline</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>验证并打包</b><small>接受计数为 1 或 2</small><code>verify_and_pack_mtp_tokens</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>生成下一草稿</b><small>运行额外 MTP 层</small><code>mtp_decode_layer_inline</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>提交设备状态</b><small>保存新 tail + next draft</small><code>advance_decode_device_state</code></div>
+            </div>
+            <p class="loop-note">上述五步都位于 <b>decode_fwd_mtp_l2()</b> 内；最后写回的状态可以直接供下一次融合调用使用。</p>
+          </div>
+
+          <div class="two-col">
+            <article class="card">
+              <h3>草稿命中</h3>
+              <p><code>draft == main0</code> 时，提交窗口变成 <code>[main0, main1]</code>，<code>accepted_counts = 2</code>。</p>
+            </article>
+            <article class="card">
+              <h3>草稿未命中</h3>
+              <p>提交窗口变成 <code>[old_tail, main0]</code>，<code>accepted_counts = 1</code>；错误草稿不会进入已提交状态。</p>
+            </article>
+          </div>
+
+          <div class="callout"><b>读代码时要注意：</b><code>decode_fwd.py</code> 只是主模型前向；真正把“主模型 + 草稿验证 + 下一草稿 + 状态”组合起来的是 <code>decode_fwd_mtp.py</code>。后者是可导入的代码级组合入口，但没有自己的 <code>main</code>、tensor specs 或端到端 golden；请求 slot 的首次初始化、释放和 Prefill→Decode 交接仍由 serving 负责。</div>
+        </section>
+
+        <section id="mtp-layer">
+          <p class="section-kicker">05 · inside the MTP layer</p>
+          <h2>MTP 草稿器内部：像额外的一层模型，而不是简单查表</h2>
+          <p><code>mtp_decode_layer_inline()</code> 会把当前 token 表示与主模型隐藏状态结合，再完整走过一层 Attention 与 MoE。</p>
+
+          <div class="flow">
+            <div class="flow-title"><strong>流程图 3 · MTP 额外预测层</strong><span>当前代码调用图</span></div>
+            <div class="flow-row">
+              <div class="node"><b>已提交 token</b><small>lookup embedding</small><code>lookup_embedding</code></div>
+              <div class="arrow">+</div>
+              <div class="node"><b>主模型隐藏状态</b><small>按接受结果打包历史</small><code>pack_mtp_hidden</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>投影融合</b><small>e_proj(norm(embed)) + h_proj(norm(hidden))</small><code>mtp_projection</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>滑窗 Attention</b><small>维护 MTP 自己的 KV cache</small><code>attention_swa</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>MoE + 输出头</b><small>hc_head → norm → lm_head</small><code>lm_head_with_sampling</code></div>
+            </div>
+            <p class="loop-note">输出是一枚 <b>next draft</b>，由设备状态模块保存，供下一轮主模型验证。</p>
+          </div>
+
+          <p>因此，当前 MTP=1 的“1”描述的是每轮主模型验证的草稿数量，不表示 MTP 只做一个小线性层。草稿模型本身仍包含投影、Attention、MoE 和词表输出。</p>
+        </section>
+
+        <section id="dspark-flow">
+          <p class="section-kicker">06 · DSpark component map</p>
+          <h2>DSpark：三层 MTP 命名的预测层，都位于 DSpark 草稿器内部</h2>
+          <p>下图把“上游/issue #935 的完整模型契约”映射到“当前本地已有的叶子算子”。绿色实线框表示当前有独立可测试的实现；虚线框表示三层组合、采样或服务闭环仍待接线。</p>
+
+          <div class="flow">
+            <div class="flow-title"><strong>流程图 4 · DSpark 草稿器内部组成与当前缺口</strong><span>模型契约 × 当前 tracked tree</span></div>
+            <div class="flow-row">
+              <div class="node"><b>上下文支路</b><small>主模型 3 层隐藏状态</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>隐藏状态融合</b><small>[T, 3×4096] → [T, 4096]</small><code>dspark_proj.py</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>草稿上下文 KV</b><small>专用投影、RoPE、分页滑窗缓存</small><code>dspark_context_kv.py</code></div>
+            </div>
+            <div class="arrow down">→</div>
+            <div class="flow-row">
+              <div class="node green"><b>Anchor / Noise Embedding</b><small>BF16 hidden + FP32 HC</small><code>lookup_embedding.py</code></div>
+              <div class="arrow">→</div>
+              <div class="node missing"><b>mtp.0 草稿层</b><small>HC → block Attention → MoE<br>组合尚未落地</small></div>
+              <div class="arrow">→</div>
+              <div class="node missing"><b>mtp.1 草稿层</b><small>同一个 7 行块；独立 KV cache<br>组合尚未落地</small></div>
+              <div class="arrow">→</div>
+              <div class="node missing"><b>mtp.2 草稿层</b><small>同一个 7 行块；独立 KV cache<br>组合尚未落地</small></div>
+            </div>
+            <p class="loop-note"><code>dspark_attention.py</code> 已实现每一层所需的 7 行非因果块 Attention；<code>moe.py</code> 等叶子算子也存在，但当前 HEAD 没有把三层按 <code>mtp.0/1/2</code> 组合起来。</p>
+            <div class="arrow down">→</div>
+            <div class="flow-row">
+              <div class="node missing"><b>HC Head / Norm / LM Head</b><small>一次产生 [B, 7, vocab] base logits</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>Markov bias 叶子算子</b><small>token → rank-256 → vocab bias</small><code>markov_head.py</code></div>
+              <div class="arrow">→</div>
+              <div class="node missing"><b>7 步顺序采样循环</b><small>base logits + Markov bias → draft1…7</small></div>
+            </div>
+            <div class="arrow down">→</div>
+            <div class="flow-row">
+              <div class="node future"><b>主模型 8 位置验证</b><small>权威验证者；1 个基准位置 + 7 个草稿位置</small></div>
+              <div class="arrow">→</div>
+              <div class="node future"><b>连续接受前缀</b><small>处理首个不一致位置</small></div>
+              <div class="arrow">→</div>
+              <div class="node future"><b>请求状态更新</b><small>提交 token、更新缓存、进入下一轮</small></div>
+            </div>
+            <div class="legend"><span><i></i>已有独立实现</span><span><i class="partial"></i>需要组合/补齐</span><span><i class="missing"></i>当前目录没有端到端接线</span></div>
+          </div>
+
+          <div class="callout warn"><b>边界说明：</b>PR #947 只加入了可复用叶子算子；issue #935 才明确提出把 <code>mtp.0/1/2</code> 三层骨干和 Markov 顺序采样组合起来。当前本地 <code>main@77c78c9</code> 仍没有这条三层组合入口。因此“预测层属于 DSpark”是模型契约，“三层已经在本地跑通”则不是当前事实。</div>
+        </section>
+
+        <section id="tp4-flow">
+          <p class="section-kicker">07 · target verifier TP4</p>
+          <h2>你的 TP 工作位于哪里：DSpark 之后的主模型验证侧</h2>
+          <p>DSpark 改变了主模型的验证形状：<code>64 请求 × 8 位置 = 512 行</code>。当前 <code>decode_o_proj.py</code> 为四卡 Attention 验证路径建立了三次布局转换和分片输出投影。</p>
+
+          <div class="flow">
+            <div class="flow-title"><strong>流程图 5 · 四卡主模型 Attention 数据流</strong><span>目标布局与已实现基础步骤</span></div>
+            <div class="flow-row">
+              <div class="node"><b>每卡归属 128 行</b><small>本卡 token hidden</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>收集 hidden</b><small>每卡都得到 512 行，供 KV 路径使用</small><code>kv_token_allgather_step</code></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>本卡 Attention</b><small>128 行 × 全部 64 heads</small></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>重排 head 结果</b><small>512 行 × 本卡 2 个输出组</small><code>attention_token_head_all_to_all_step</code></div>
+              <div class="arrow">→</div>
+              <div class="node green"><b>分片输出投影</b><small>得到 512 行 FP32 局部贡献</small><code>decode_sharded_o_projection</code></div>
+            </div>
+            <div class="arrow down">→</div>
+            <div class="flow-row">
+              <div class="node green"><b>求和并按 token 返回</b><small>四份贡献求和，每卡取回 128 行</small><code>o_projection_reduce_scatter_step</code></div>
+              <div class="arrow">→</div>
+              <div class="node"><b>后续本地计算</b><small>残差、路由、专家等</small></div>
+              <div class="arrow">→</div>
+              <div class="node missing"><b>接入实际高层层函数</b><small>当前兼容 wrapper 仍走本地输出投影</small></div>
+            </div>
+          </div>
+
+          <div class="flow">
+            <div class="flow-title"><strong>流程图 6 · 三次跨卡操作改变的不是同一个维度</strong><span>布局变化视角</span></div>
+            <div class="flow-row">
+              <div class="node"><b>按 token 分</b><small>每卡 128 行</small></div>
+              <div class="arrow wide">收集<br>→</div>
+              <div class="node"><b>token 全量复制</b><small>每卡看 512 行</small></div>
+              <div class="arrow wide">重排<br>→</div>
+              <div class="node purple"><b>按输出组分</b><small>每卡 2 组 × 512 行</small></div>
+              <div class="arrow wide">投影<br>→</div>
+              <div class="node"><b>局部贡献</b><small>每卡 [512, 4096] FP32</small></div>
+              <div class="arrow wide">求和返回<br>→</div>
+              <div class="node green"><b>回到按 token 分</b><small>每卡 128 行 BF16</small></div>
+            </div>
+          </div>
+
+          <div class="callout"><b>准确说法：</b>这些函数实现的是 all-gather、all-to-all、reduce-scatter 的<strong>通信语义</strong>，底层代码使用分布式窗口、<code>pld.tensor.put</code>、通知与屏障实现；不要把它们描述成直接调用了同名集合通信 API。</div>
+        </section>
+
+        <section id="status">
+          <p class="section-kicker">08 · implementation boundary</p>
+          <h2>当前完成度：哪些可以说“有了”，哪些还不能说“打通了”</h2>
+          <p>这里把 MTP 与 DSpark 放到同一张工程状态图里，避免用文件数量判断能力是否完整。</p>
+
+          <div class="status-grid">
+            <article class="status-card"><span class="tag">已组合</span><h3>MTP 验证与状态闭环</h3><p>主模型、单草稿验证、下一草稿和设备状态已在一个 L2 入口内顺序连接；融合入口本身没有独立 runner / golden。</p></article>
+            <article class="status-card"><span class="tag">已有算子</span><h3>DSpark 草稿器组件</h3><p>主隐藏投影、上下文 KV、块 Attention、Markov head 和 embedding 支持均有独立实现。</p></article>
+            <article class="status-card"><span class="tag">已有基础</span><h3>DSpark 验证侧 TP4 边界</h3><p>三种通信语义和分片 O Projection 已实现，并有独立 fixture / golden。</p></article>
+            <article class="status-card partial"><span class="tag">仍需接线</span><h3>DSpark 草稿器完整执行</h3><p>还需要 logits 组合、采样/调度、候选打包，以及把独立算子连接起来。</p></article>
+            <article class="status-card missing"><span class="tag">尚无闭环</span><h3>DSpark 提议—验证—接受—状态</h3><p>当前目录没有等价于 <code>decode_fwd_mtp_l2</code> 的完整组合入口。</p></article>
+            <article class="status-card partial"><span class="tag">仍需集成</span><h3>TP4 实际 Decode 层调用</h3><p>SWA/HCA/CSA 兼容 wrapper 仍直接走完整本地输出投影；高层 Decode 尚未切到新路径。</p></article>
+          </div>
+
+          <div class="callout warn"><b>因此现在可以做什么测量？</b>可以独立验证组件精度、通信边界和分片投影；在高层执行路径接线、分片权重加载与分布式启动完成前，不能把这些结果称为“端到端 DSpark Decode TP4 性能”。</div>
+        </section>
+
+        <section id="reading">
+          <p class="section-kicker">09 · code reading map</p>
+          <h2>结合当前代码，建议按这两条路线阅读</h2>
+          <p>先读配置锁定形状，再读组合入口或组件边界。不要从单个名字推断整个目录的能力。</p>
+
+          <details open>
+            <summary>MTP：从闭环入口向下读</summary>
+            <div>
+              <ul class="file-list">
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_mtp/config.py">models/deepseek_v4_flash_mtp/config.py</a><span>确认当前 B=4、S=2、T=8。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_mtp/decode_fwd_mtp.py">decode_fwd_mtp.py</a><span>重点看 <code>decode_fwd_mtp_l2()</code> 的五段调用顺序。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_mtp/decode_mtp_verify.py">decode_mtp_verify.py</a><span>看草稿命中/未命中时怎样打包两行提交窗口。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_mtp/decode_device_state.py">decode_device_state.py</a><span>看 tail、draft 与请求状态怎样跨轮保留。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_mtp/decode_mtp.py">decode_mtp.py</a><span>看额外 MTP 层：embedding → projection → SWA → MoE → head。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_mtp/mtp_projection.py">mtp_projection.py</a><span>看 embedding 分支与主模型 hidden 分支怎样相加融合。</span></li>
+              </ul>
+            </div>
+          </details>
+
+          <details open>
+            <summary>DSpark：先读组件，再读 TP4 验证边界</summary>
+            <div>
+              <ul class="file-list purple">
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/config.py">models/deepseek_v4_flash_dspark/config.py</a><span>确认 B=64、草稿数 7、S=8、T=512、TP=4。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/dspark_proj.py">dspark_proj.py</a><span>3 个目标层 hidden 拼接投影并 RMSNorm。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/dspark_context_kv.py">dspark_context_kv.py</a><span>把目标 hidden 写入草稿器自己的分页滑窗 KV。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/dspark_attention.py">dspark_attention.py</a><span>7 个草稿查询行的块 Attention 与本地 O Projection。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/markov_head.py">markov_head.py</a><span>token embedding 到 full-vocab logits bias。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/decode_o_proj.py">decode_o_proj.py</a><span>三次跨卡语义、分片输出投影与各自独立的测试入口。</span></li>
+                <li><a href="https://github.com/hw-native-sys/pypto-lib/blob/c9ec1d9836ae647a6de36fc4a4500ed2507abb7c/models/deepseek_v4_flash_dspark/decode_sparse_attn_swa.py">decode_sparse_attn_swa.py</a><span>先看 <code>*_heads</code> 与 <code>*_local_o_proj</code> 的拆分边界；HCA/CSA 同理。</span></li>
+              </ul>
+            </div>
+          </details>
+
+          <div class="callout"><b>本地工作区提醒：</b>目录里若存在未跟踪的旧文件（例如名字仍带旧并行缩写的 collectives / sharded projection 文件），不要把它们当作当前 <code>HEAD</code> 的正式实现。当前提交中的正式统一入口是 <code>decode_o_proj.py</code>。</div>
+        </section>
+
+        <section id="faq">
+          <p class="section-kicker">10 · common confusions</p>
+          <h2>四个最容易讲错的点</h2>
+
+          <details open><summary>1. MTP 与 DSpark 到底是分开还是包含关系？</summary><div>从运行方式看，它们是可替换的两种 speculative method；从 DeepSeek-V4 DSpark 的模型内部看，DSpark 又包含三层存放在 <code>mtp.0/1/2</code> 下的预测骨干。准确说法是“运行契约不同，但 DSpark 复用了 MTP 命名/训练出来的预测层”，不是“完全无关”。</div></details>
+          <details open><summary>2. 三个 Prediction Layer 是否分别生成三枚 token？</summary><div>不是。三个层依次变换同一个七位置 hidden block，中间没有 LM Head 和 token 采样。第三层完成后，统一输出头一次产生七个位置的基础 logits；随后 Markov Head 才从 anchor 开始顺序采样七枚草稿。</div></details>
+          <details><summary>3. DSpark 是否负责判断哪些 token 真正可接受？</summary><div>不是。可选 Confidence Head / scheduler 只能裁剪“值得送去验证”的候选长度；真正比较候选并接受连续正确前缀的是下一次完整主模型前向及 rejection sampler。issue #905 当前固定形状仍是主模型验证 <code>1 + 7 = 8</code> 个位置。</div></details>
+          <details><summary>4. 为什么这里是 43 层，不是 61 层？</summary><div>当前 issue #905 与 <code>models/deepseek_v4_flash_dspark/</code> 使用的是 V4-Flash：<code>FLASH.num_hidden_layers = 43</code>，DSpark 取第 40、41、42 层 hidden。61 层属于 V4-Pro preset，是另一模型目录和工作点。</div></details>
+          <details><summary>5. TP 是不是只有 DSpark Decode 才需要？</summary><div>不是。TP 解决的是一次模型计算怎样分给多张卡，普通 Decode、MTP 或 DSpark 都可能使用。当前优先 DSpark，只是因为真实部署点带来了明确的 <code>T=512, TP=4</code> 验证形状。</div></details>
+          <details><summary>6. 独立算子精度通过，能不能直接测端到端性能？</summary><div>可以测该算子的局部性能，但端到端结论需要真实高层调用、跨卡窗口与信号、分片权重加载、请求状态、草稿接受逻辑全部进入同一条执行路径。当前 DSpark 目录还没有满足这个条件。</div></details>
+
+          <h3>这个结论从哪里来？</h3>
+          <ul class="file-list purple">
+            <li><a href="https://github.com/hw-native-sys/pypto-lib/issues/905">Issue #905 · P6</a><span>明确写明 DSpark 是 block drafter、不是 serial MTP，但权重位于 checkpoint 的 <code>mtp.*</code> 命名空间。</span></li>
+            <li><a href="https://github.com/hw-native-sys/pypto-lib/issues/935">Issue #935 · DSpark drafter contract</a><span>明确规定三层骨干使用 <code>mtp.0/1/2</code>，第三层之后再由 Markov Head 顺序产生七枚 token。</span></li>
+            <li><a href="https://github.com/vllm-project/vllm-ascend/blob/ac19e1e/vllm_ascend/models/deepseek_v4_dspark.py">vLLM Ascend · deepseek_v4_dspark.py</a><span>构造三层 DSpark decoder，并把 checkpoint 的 <code>mtp.{stage}</code> 权重映射进 DSpark 模型。</span></li>
+            <li><a href="https://github.com/vllm-project/vllm-ascend/blob/ac19e1e/vllm_ascend/spec_decode/llm_base_proposer.py#L1160-L1200">vLLM Ascend · DSpark sampling loop</a><span>先得到整块 base logits，再循环执行 Markov bias 与 argmax，产生七枚草稿。</span></li>
+            <li><a href="https://arxiv.org/html/2607.05147#S3">DSpark 论文 · Figure 1 / §3</a><span>主模型先给 anchor，DSpark 提议候选块，最后仍由主模型验证。</span></li>
+          </ul>
+        </section>
+
+        <section id="summary">
+          <p class="section-kicker">11 · talk track</p>
+          <h2>如果只给领导讲 60 秒，可以这样说</h2>
+
+          <div class="takeaway"><div class="n">1</div><p><b>MTP-1 与 DSpark 是不同运行方式，但不是完全无关。</b>DSpark 使用 checkpoint 中 <code>mtp.0/1/2</code> 三层预测权重作为七位置块草稿骨干；三层之间不产生 token。</p></div>
+          <div class="takeaway"><div class="n">2</div><p><b>当前代码的 MTP 组合更完整。</b><code>decode_fwd_mtp_l2()</code> 已把主模型验证、下一草稿和设备状态更新串起来（但融合文件没有独立 runner / golden）；DSpark 已有独立草稿器算子，但还没有提议—验证—接受—状态的端到端入口。</p></div>
+          <div class="takeaway"><div class="n">3</div><p><b>当前 TP 工作优先服务 DSpark 的主模型验证形状。</b>四卡共同处理 512 个验证位置，通过 hidden 收集、Attention 结果重排、分片输出投影和结果求和，把最终结果归还给每卡 128 个 token 行。</p></div>
+
+          <p style="margin-top:24px">需要演示 TP4 数据流时，可继续打开<a href="deepseek_v4_flash_dspark_tp_slides.html">配套幻灯片 HTML</a>；需要逐页口头说明时，可参考<a href="deepseek_v4_flash_dspark_tp_training_script.md">中文培训讲稿</a>。</p>
+        </section>
+      </main>
+    </div>
+
+    <footer class="footer">基于当前本地代码生成 · 流程图中的“已有”仅代表仓库实现状态，不代表生产部署完成度。</footer>
+  </div>
+  <a class="top-link" href="#top" aria-label="回到顶部">↑</a>
+
+  <script>
+    const links = [...document.querySelectorAll('.toc a')];
+    const sections = links.map(link => document.querySelector(link.getAttribute('href'))).filter(Boolean);
+    const observer = new IntersectionObserver(entries => {
+      const visible = entries.filter(entry => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      links.forEach(link => link.classList.toggle('active', link.getAttribute('href') === `#${visible.target.id}`));
+    }, { rootMargin: '-15% 0px -70% 0px', threshold: [0, .1, .5] });
+    sections.forEach(section => observer.observe(section));
+  </script>
+</body>
+</html>
