@@ -723,33 +723,45 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--boundary-missing-slot-fixture", action="store_true", default=False)
+    cases = ("ordinary", "missing-state-slot")
+    parser.add_argument("--case", choices=("all", *cases), default="all", help="Default: validate every fixture.")
     args = parser.parse_args()
+    selected = cases if args.case == "all" else (args.case,)
+    if args.compile_only:
+        selected = selected[:1]
+    runtime_dir = None
 
-    result = run(
-        compile_only=args.compile_only,
-        fn=compressor_test,
-        specs=(build_boundary_missing_slot_specs(args.start_pos) if args.boundary_missing_slot_fixture
-               else build_tensor_specs(args.start_pos)),
-        golden_fn=golden_compressor,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.sim or args.platform.endswith("sim"),
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        # Precision reference: AscendC torch.ops.custom.compressor —
-        # ops-transformer/experimental/attention/compressor/tests/pytest/compressor_golden.py
-        compare_fn={
-            "kv":            compare_compressor_kv,
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "cmp_kv_cache":   ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    import torch
+
+    for case in selected:
+        print(f"[CASE] {case}", flush=True)
+        torch.manual_seed(0)
+        result = run(
+            compile_only=args.compile_only,
+            fn=compressor_test,
+            specs=(build_boundary_missing_slot_specs(args.start_pos) if case == "missing-state-slot"
+                   else build_tensor_specs(args.start_pos)),
+            golden_fn=golden_compressor,
+            runtime_dir=runtime_dir,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.platform.removesuffix("sim"),
+                execution_mode=args.sim or args.platform.endswith("sim"),
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            # Precision reference: AscendC torch.ops.custom.compressor —
+            # ops-transformer/experimental/attention/compressor/tests/pytest/compressor_golden.py
+            compare_fn={
+                "kv":            compare_compressor_kv,
+                "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                "cmp_kv_cache":   ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+        runtime_dir = str(result.work_dir)

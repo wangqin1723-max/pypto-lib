@@ -176,7 +176,7 @@ if __package__:
 else:
     from decode_csa import TOK_O_ROWS
 
-FWD_NUM_LAYERS = _parse_int_argv("--test-layers", 43)
+FWD_NUM_LAYERS = _parse_int_argv("--test-layers", 5)
 if FWD_NUM_LAYERS not in (5, 43):
     raise ValueError("--test-layers must be 5 or 43")
 # Distinct MoE expert banks the layers cycle through. TP replicates all 256
@@ -2554,7 +2554,7 @@ def _golden_forward_attention(layer, kind):
 
 
 def golden_decode_fwd(tensors):
-    """Independent Torch composition of all 43 layers, mutable caches and the head."""
+    """Independent Torch composition of the selected layers, mutable caches and the head."""
     import torch
 
     if __package__:
@@ -2902,7 +2902,7 @@ def main():
     )
     parser.add_argument(
         "--test-layers", type=int, default=FWD_NUM_LAYERS, choices=[5, 43],
-        help="forward layers for this test; 5 covers SWA, CSA and HCA, 43 is the full model",
+        help="forward layers; default 5 covers SWA, CSA and HCA; use 43 for the full model",
     )
     parser.add_argument(
         "-d",

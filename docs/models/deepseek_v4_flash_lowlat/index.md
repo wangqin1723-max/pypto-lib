@@ -94,9 +94,10 @@ accuracy or an official DSpark tolerance. These checks do not establish output
 quality on SpeedBench, MT-Bench, long contexts, or other workloads.
 The full-forward command uses up to 32 CPU threads for the Torch reference
 unless `PYPTO_GOLDEN_NUM_THREADS` is explicitly set.
-Device CI runs `--test-layers 5`, covering two SWA layers followed by CSA,
-HCA, and CSA plus the output head. The default remains the full 43-layer
-forward; the five-layer result is not full-model qualification.
+The default forward smoke runs five layers: two SWA layers followed by CSA,
+HCA, and CSA plus the output head. Both PR and daily CI use this default.
+Use `--test-layers 43 --full` for the full-model numerical comparison; the
+five-layer smoke result confirms execution only.
 
 The standalone CSA fixture permits at most 5% of points to exceed `3e-3` under
 `ratio_reldiff`'s combined absolute/relative rule and retains its worst-point cap
@@ -195,6 +196,24 @@ and declare `# ci: devices=2`. Only the multi-layer `decode_fwd.py` and
 run with `-p a2a3 --sim`, including their original golden and state comparisons.
 Both pull-request and daily selectors honor these markers.
 
+PR and daily device sweeps share the same runner, platform arguments, logging
+environment, disabled benchmarking (`PYPTO_BENCH=0`), 3600-second queue wait
+and 900-second execution budget per entry. Workflows select entries and
+allocate their declared device counts; workload defaults belong to Python.
+
+The standalone `decode_sparse_attn_swa.py` default validates ordinary, causal,
+short-window and unmapped-window fixtures, including poisoned unmapped cache
+pages and all-unmapped rows. The causal fixture uses the supported eight-token
+shape with per-query visible prefixes and an amplified future cache row.
+`decode_compressor_ratio128.py` validates both
+the ordinary fixture and a compression boundary whose current state slot is
+missing. Each case uses the existing golden and comparators; any case failure
+fails the entry. These defaults apply on both devices and simulators.
+Use `--case` to isolate one fixture for replay or profiling; SWA saved golden
+replay requires an explicit case. `--compile-only` compiles once. The ratio-4
+and indexer compressor defaults already span two token-indexed compression
+boundaries in their eight-token windows and compare their outputs and caches.
+
 The composed `decode_swa.py`, `decode_hca.py`, and `decode_csa.py` entries use
 two physical TP ranks by default and declare `# ci: devices=2`. Each rank
 processes its consecutive head groups. CSA assigns four logical tokens per
@@ -211,10 +230,12 @@ The native TP8 request profiles retain their existing flat projection-weight
 inputs. Their attention call sites create singleton group views without
 copying or changing the public request parameter shapes.
 
-`decode_fwd.py` executes all 43 layers without computing or comparing a golden
-by default. Device CI selects five layers with `--test-layers 5`, retaining
-the same execution-only mode and covering SWA, CSA and HCA. Use `--full` to opt into the independent Torch
-comparison or a complete saved reference. It includes embedding, request-derived metadata,
+`decode_fwd.py` executes five layers without computing or comparing a golden
+by default, covering SWA, CSA and HCA in both PR and daily CI.
+Use `--full` to compare the selected layers against the independent Torch
+reference or a complete saved reference for that scope.
+Use `--test-layers 43 --full` for the complete model, including embedding
+and request-derived metadata,
 2 SWA / 21 CSA / 20 HCA attention layers, 43 TP MoE layers, HC head,
 final RMSNorm, vocabulary-sharded logits and sampling. All eight mutable
 cache/state pools and the four public outputs are compared by the existing
@@ -237,15 +258,17 @@ reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
 
-- Default execution and `--smoke` execute all 43 layers without a numerical
+- Default execution and `--smoke` execute five layers without a numerical
   comparison. They permit generated inputs or input-only replay and report
   no correctness verdict. Saved expected outputs require explicit `--full`.
-- `--full` runs the complete-forward comparison. The generated bounded fixture
+- `--full` compares the selected layers; `--test-layers 43 --full` compares
+  the complete forward. The generated bounded fixture
   starts at position 121 and uses one shared MoE bank unless `--moe-banks` is
   supplied. This is synthetic correctness coverage, not qualification of a
   real checkpoint or community equivalence.
 - A real checkpoint comparison requires the actual weights and original FP32
-  scales for all 43 layers (`--moe-banks 43`), matching inputs/state and the
+  scales for all 43 layers (`--test-layers 43 --moe-banks 43`), matching
+  inputs/state and the
   precision contract above. Shared random banks cannot stand in for them.
 - `--full --input-data` replays complete `in/` and `out/` tensors, which take
   precedence over the locally computed Torch reference. Partial numerical
@@ -272,13 +295,13 @@ for replay. In `--full` mode, it also saves expected outputs. For example:
 
 ```bash
 # Complete 43-layer numerical fixture; 16384 is a supported Indexer context.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --full
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --test-layers 43 --full
 # Generate the complete program without computing a Torch reference.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --compile-only
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --test-layers 43 --compile-only
 # Default execution-only smoke, without a correctness verdict.
 python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
 # Replay a complete snapshot with matching checkpoint and execution layout.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --moe-banks 43 --full --input-data <reference>/data
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --test-layers 43 --moe-banks 43 --full --input-data <reference>/data
 ```
 
 ## Validation

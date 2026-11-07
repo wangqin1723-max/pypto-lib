@@ -556,6 +556,8 @@ def build_tensor_specs(
 
     def init_swa_lens():
         lens = torch.full((T,), WIN, dtype=torch.int32)
+        if causal_regression_fixture:
+            lens = torch.tensor([WIN - (S - 1) + (t % S) for t in range(T)], dtype=torch.int32)
         if short_window_fixture:
             lens.fill_(17)
         return lens
@@ -644,12 +646,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression.")
-    parser.add_argument("--short-window-fixture", action="store_true", default=False,
-                        help="Use a short-window topk row with valid prefix + -1 padding.")
-    parser.add_argument("--unmapped-window-fixture", action="store_true", default=False,
-                        help="Exercise unmapped pages in a visible SWA window.")
+    cases = ("ordinary", "causal", "short-window", "unmapped-window")
+    parser.add_argument("--case", choices=("all", *cases), default="all", help="Default: validate every fixture.")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
@@ -659,35 +657,44 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    if args.golden_data and args.case == "all":
+        parser.error("--golden-data requires an explicit --case matching the saved fixture")
+    selected = cases if args.case == "all" else (args.case,)
+    if args.compile_only:
+        selected = selected[:1]
+    runtime_dir = None
 
     print(f"TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
-    result = run(
-        compile_only=args.compile_only,
-        fn=sparse_attn_test,
-        specs=build_tensor_specs(
-            args.causal_regression_fixture,
-            args.short_window_fixture,
-            args.unmapped_window_fixture,
-        ),
-        golden_fn=golden_sparse_attn,
-        golden_data=args.golden_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.sim or args.platform.endswith("sim"),
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_dep_gen=args.enable_dep_gen,
-            enable_pmu=args.enable_pmu,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    import torch
+
+    for case in selected:
+        print(f"[CASE] {case}", flush=True)
+        torch.manual_seed(0)
+        result = run(
+            compile_only=args.compile_only,
+            fn=sparse_attn_test,
+            specs=build_tensor_specs(case == "causal", case == "short-window", case == "unmapped-window"),
+            golden_fn=golden_sparse_attn,
+            golden_data=args.golden_data,
+            runtime_dir=runtime_dir,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.platform.removesuffix("sim"),
+                execution_mode=args.sim or args.platform.endswith("sim"),
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                enable_dep_gen=args.enable_dep_gen,
+                enable_pmu=args.enable_pmu,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={
+                "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+        runtime_dir = str(result.work_dir)
